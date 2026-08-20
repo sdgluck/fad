@@ -9,6 +9,8 @@ use fad::scan::walk::ScanOpts;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
+mod common;
+
 fn fixture(root: &Path) {
     let mk = |rel: &str, size: usize| {
         let p = root.join(rel);
@@ -116,7 +118,8 @@ fn confirm_modal_states_the_whole_truth() {
 fn snapshot_round_trips_and_keeps_the_users_place() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
-    unsafe { std::env::set_var("FAD_CACHE_DIR", dir.path().join("cache")) };
+    let _env = common::env_lock();
+    common::isolate(dir.path());
 
     let mut app = app_for(dir.path());
     let root = app.tree.root();
@@ -145,7 +148,8 @@ fn a_snapshot_of_another_directory_is_rejected() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     fixture(a.path());
-    unsafe { std::env::set_var("FAD_CACHE_DIR", a.path().join("cache")) };
+    let _env = common::env_lock();
+    common::isolate(a.path());
 
     let app = app_for(a.path());
     fad::cache::save(&app.tree).unwrap();

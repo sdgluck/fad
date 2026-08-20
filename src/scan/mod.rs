@@ -1,6 +1,6 @@
 pub mod dir;
 pub mod meta;
-pub mod platform;
+pub mod cloud;
 pub mod walk;
 
 use std::path::{Path, PathBuf};

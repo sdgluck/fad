@@ -54,20 +54,38 @@ const BUILD_DIRS: &[(&str, &[&str])] = &[
     ("venv", &["pyproject.toml", "requirements.txt", "setup.py"]),
     ("Pods", &["Podfile"]),
     ("vendor", &["composer.json", "Gemfile"]),
+    ("_build", &["dune-project", "rebar.config"]),
+    ("dist-newstyle", &["cabal.project"]),
+    ("zig-cache", &["build.zig"]),
+    ("zig-out", &["build.zig"]),
 ];
 
 /// Directory names that mean the same thing wherever they appear.
+///
+/// The generic ones are only trusted when their parent vouches for them, in
+/// `classify` below — a directory called `registry` or `cache` proves nothing
+/// on its own.
 const ALWAYS: &[(&str, Category)] = &[
-    ("DerivedData", Category::AppCache),
-    ("Caches", Category::AppCache),
     ("_cacache", Category::PackageCache),
     (".gradle", Category::PackageCache),
     ("registry", Category::PackageCache),
     ("toolchains", Category::PackageCache),
+    #[cfg(target_os = "macos")]
+    ("DerivedData", Category::AppCache),
+    #[cfg(target_os = "macos")]
+    ("Caches", Category::AppCache),
+    // The XDG cache root, and the two package managers that most often fill it.
+    #[cfg(not(target_os = "macos"))]
+    (".cache", Category::AppCache),
+    #[cfg(not(target_os = "macos"))]
+    ("repository", Category::PackageCache),
+    #[cfg(not(target_os = "macos"))]
+    ("thumbnails", Category::AppCache),
 ];
 
-/// File extensions that are always a disk image.
-const IMAGE_EXTS: &[&str] = &["raw", "qcow2", "vmdk", "vdi", "img", "sparsebundle"];
+/// File extensions that are always a disk image. `Docker.raw` on macOS,
+/// libvirt's `qcow2` on Linux, and the VirtualBox/VMware formats on both.
+const IMAGE_EXTS: &[&str] = &["raw", "qcow2", "vmdk", "vdi", "img", "sparsebundle", "vhd", "vhdx"];
 
 /// Classify one entry, given the names of everything beside it in the same
 /// directory. `parent_name` disambiguates the generic names: a `registry`
@@ -102,6 +120,12 @@ pub fn classify(
         let ok = match *dir {
             "registry" | "toolchains" => matches!(parent_name, ".cargo" | ".rustup"),
             "Caches" => parent_name == "Library",
+            "repository" => parent_name == ".m2",
+            // Only the XDG cache root itself, not every `.cache` in a project.
+            ".cache" => crate::paths::home().is_some_and(|h| {
+                h.file_name().is_some_and(|n| n == parent_name)
+            }),
+            "thumbnails" => parent_name == ".cache",
             _ => true,
         };
         if ok {

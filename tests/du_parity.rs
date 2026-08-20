@@ -120,5 +120,13 @@ fn symlink_is_not_followed() {
     build_fixture(dir.path(), false);
     let tree = scan(dir.path());
     let n = tree.node(find(&tree, "c/link-to-big"));
-    assert!(n.total_bytes < 4096, "symlink counted its target: {}", n.total_bytes);
+    // Not "costs nothing": a filesystem may allocate a block for the link
+    // itself (ext4 does for longer targets, APFS stores it inline). The claim
+    // is that we recorded the link, not the 8MB it points at.
+    assert!(
+        n.total_bytes < 64 * 1024,
+        "symlink appears to have been followed: {} bytes",
+        n.total_bytes
+    );
+    assert!(n.self_len < 4096, "symlink length is its target's path, not its size");
 }

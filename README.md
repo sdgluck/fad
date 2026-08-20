@@ -5,6 +5,8 @@ Find what is eating your disk, and delete it, without leaving the terminal.
 A keyboard-driven replacement for OmniDiskSweeper: two panes, a live tree ranked
 by real disk usage, and a staged batch you review before anything is deleted.
 
+Runs on macOS and Linux.
+
 ```
 ┌ /Users/you  285G  294014 dirs, 2411907 files ────────┬ selection ──────────────┐
 │ ▾ you                              285G ████████████ │ /Users/you/Library      │
@@ -74,12 +76,16 @@ between runs, because the walk is parallel and arrival order is not stable.
 
 - **Other filesystems.** Mount points are shown but not entered, so a network
   share or an external drive cannot stall the scan. `--cross-device` opts in.
-- **Cloud folders.** iCloud Drive, Dropbox, OneDrive and friends are backed by
-  FileProvider extensions. They sit on the boot volume and report the boot
-  volume's device number, so the mount check cannot see them — but `readdir`
-  inside one can block on the network for *minutes*. They are detected by the
-  `com.apple.file-provider-domain-id` xattr, skipped, and reported in a banner.
-  `--cloud` opts in.
+  This is what stops an NFS or SMB share, or a FUSE mount like rclone, from
+  hanging a scan on Linux.
+- **Cloud folders (macOS).** iCloud Drive, Dropbox, OneDrive and friends are
+  backed by FileProvider extensions. They sit on the boot volume and report the
+  boot volume's device number, so the mount check cannot see them — but
+  `readdir` inside one can block on the network for *minutes*. They are detected
+  by the `com.apple.file-provider-domain-id` xattr, skipped, and reported in a
+  banner. `--cloud` opts in. Linux needs no equivalent: the clients that can
+  stall a walk are real mounts, and Dropbox and friends sync into plain local
+  directories.
 - **What it cannot read.** Directories that refuse to open are counted and
   reported, with a hint about granting Full Disk Access to your terminal.
 
@@ -91,12 +97,36 @@ Nothing is skipped silently. If a number is incomplete, the UI says so.
 reclaimed, the largest items by name, and anything the guard refused. `enter`
 commits.
 
-The default is the macOS Trash, via `NSFileManager`, so Finder's "Put Back"
-works and `u` restores the whole batch in place. `D` in the confirmation toggles
-to a permanent delete, and says plainly that it cannot be undone.
+The default is the system trash, and `u` restores the whole batch in place. `D`
+in the confirmation toggles to a permanent delete, and says plainly that it
+cannot be undone.
 
-Refused always: `/`, `/System`, `/Users`, `/usr`, your home directory, the scan
-root, and anything containing the scan root.
+| | |
+|---|---|
+| macOS | `NSFileManager.trashItemAtURL:`, so Finder's "Put Back" works |
+| Linux | the FreeDesktop.org trash spec: `~/.local/share/Trash`, or the per-filesystem `$topdir/.Trash-$uid` when the item lives on another volume |
+
+Both implementations report *where the item landed*, which is what makes fad's
+own undo a plain rename back. On Linux, restoring also removes the `.trashinfo`
+file, so your desktop's trash does not keep showing an entry whose file is gone.
+
+Trashing is always a rename, never a copy — which is why the Linux side picks a
+trash directory by device number rather than by path.
+
+Refused always: `/`, your home directory, the platform's system directories
+(`/System` and `/Users` on macOS, `/usr`, `/etc`, `/home` and friends on Linux),
+the scan root, and anything containing the scan root.
+
+## Where it keeps things
+
+| | macOS | Linux |
+|---|---|---|
+| scan snapshots | `~/Library/Caches/fad` | `$XDG_CACHE_HOME/fad` |
+| undo journal | `~/Library/Application Support/fad` | `$XDG_DATA_HOME/fad` |
+
+The journal is deliberately not in a cache directory: a cleaner is entitled to
+wipe a cache, and losing your undo history to one would be a nasty surprise.
+`FAD_CACHE_DIR` and `FAD_STATE_DIR` override both.
 
 ## Speed
 
@@ -119,12 +149,20 @@ them. Snapshots are only written for scans that ran to completion.
 ## Development
 
 ```sh
-cargo test                                    # includes du-parity and real Trash round-trips
+cargo test                                    # du-parity, real trash round-trips, tree arithmetic, rendering
 cargo run --release --example statbench -- ~  # per-entry stat cost
 cargo run --release --example cachebench -- ~ # snapshot build/encode/load timings
 ```
 
-The undo journal lives in `~/Library/Application Support/fad` — deliberately not
-in `Caches`, which a cleaner is entitled to wipe. `FAD_STATE_DIR` and
-`FAD_CACHE_DIR` override both locations, and the tests use them so a test run
-can never consume a real session's undo history.
+To run the suite on Linux from a Mac:
+
+```sh
+docker run --rm -v "$PWD":/src:ro -w /work rust:latest bash -c \
+  'cp -r /src/src /src/tests /src/examples /src/Cargo.toml /src/Cargo.lock /work/ && cargo test'
+```
+
+Tests that redirect `HOME`, `XDG_DATA_HOME`, `FAD_STATE_DIR` or `FAD_CACHE_DIR`
+must hold `common::env_lock()` for their whole body — environment variables are
+process-global and `cargo test` runs a binary's tests on several threads at
+once. They use `common::isolate()` so a test run can never read or consume the
+real user's trash, cache, or undo history.

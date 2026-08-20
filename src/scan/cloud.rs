@@ -33,6 +33,11 @@ pub fn is_cloud_root(path: &Path) -> bool {
     rc >= 0
 }
 
+/// Nothing to do elsewhere. On Linux the cloud clients that can stall a walk
+/// — rclone, gcsfuse, an NFS or SMB share — are real mounts with their own
+/// device numbers, so the ordinary filesystem-boundary check already stops at
+/// them. Dropbox and friends sync into plain local directories, which are
+/// exactly as cheap to walk as anything else.
 #[cfg(not(target_os = "macos"))]
 pub fn is_cloud_root(_path: &Path) -> bool {
     false

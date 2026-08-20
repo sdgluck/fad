@@ -185,9 +185,9 @@ fn normal_key(app: &mut App, k: KeyEvent) {
 fn reveal(app: &mut App) {
     let Some(id) = app.selected() else { return };
     let path = app.tree.path(id);
-    match std::process::Command::new("open").arg("-R").arg(&path).status() {
-        Ok(_) => app.status = Some("revealed in Finder".into()),
-        Err(e) => app.status = Some(format!("could not open Finder: {e}")),
+    match crate::platform::reveal(&path) {
+        Ok(msg) => app.status = Some(msg.into()),
+        Err(e) => app.status = Some(format!("could not open a file manager: {e}")),
     }
 }
 
@@ -207,21 +207,13 @@ fn open_editor(app: &mut App) {
 }
 
 fn copy_path(app: &mut App) {
-    use std::io::Write;
-    use std::process::Stdio;
-
     let Some(id) = app.selected() else { return };
     let path = app.tree.path(id);
-    let child = std::process::Command::new("pbcopy").stdin(Stdio::piped()).spawn();
-    match child {
-        Ok(mut c) => {
-            if let Some(stdin) = c.stdin.as_mut() {
-                let _ = stdin.write_all(path.as_os_str().as_encoded_bytes());
-            }
-            let _ = c.wait();
-            app.status = Some("path copied".into());
+    match crate::platform::copy_to_clipboard(&path.to_string_lossy()) {
+        Ok(()) => app.status = Some("path copied".into()),
+        Err(_) => {
+            app.status = Some(format!("no clipboard \u{2014} {}", crate::platform::clipboard_hint()))
         }
-        Err(e) => app.status = Some(format!("could not run pbcopy: {e}")),
     }
 }
 

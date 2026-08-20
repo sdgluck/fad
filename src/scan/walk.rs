@@ -13,7 +13,7 @@ use crossbeam_channel::Sender;
 
 use super::dir;
 use super::meta::Meta;
-use super::platform;
+use super::cloud;
 
 /// Scan-side identity of a directory. Dense from 0; the root is always 0.
 pub type ScanId = u32;
@@ -121,7 +121,7 @@ fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s Ctx, path: PathBuf, id: ScanI
         if meta.is_dir() {
             if !ctx.opts.cross_device && meta.dev != ctx.root_dev {
                 skip = Some(Skip::OtherDevice);
-            } else if !ctx.opts.cloud && platform::is_cloud_root(&path.join(&*name)) {
+            } else if !ctx.opts.cloud && cloud::is_cloud_root(&path.join(&*name)) {
                 skip = Some(Skip::CloudStorage);
             } else {
                 let child_id = ctx.next_id.fetch_add(1, Ordering::Relaxed);

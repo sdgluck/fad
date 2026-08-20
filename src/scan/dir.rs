@@ -72,9 +72,24 @@ pub fn read_dir_stat(path: &Path) -> io::Result<Vec<DirEntry>> {
     Ok(out)
 }
 
+/// `readdir` signals "end of directory" and "error" the same way — a null
+/// return — and they are only distinguishable by whether it touched `errno`.
+/// The slot has a different name on every libc.
 fn errno_reset() {
+    #[cfg(target_os = "macos")]
     // SAFETY: __error() returns this thread's errno slot.
-    unsafe { *libc::__error() = 0 };
+    unsafe {
+        *libc::__error() = 0
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: __errno_location() returns this thread's errno slot.
+    unsafe {
+        *libc::__errno_location() = 0
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    unsafe {
+        *libc::__error() = 0
+    };
 }
 
 struct DirGuard(*mut libc::DIR);

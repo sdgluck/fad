@@ -21,14 +21,6 @@ use crate::tree::{Snapshot, Tree};
 const FORMAT: u32 = 2;
 const MAGIC: &[u8; 4] = b"fad\0";
 
-pub fn cache_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("FAD_CACHE_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Caches/fad"))
-}
-
 fn snapshot_path(root: &Path) -> Option<PathBuf> {
     // A stable, readable filename per root: the hash keeps it unique, the
     // basename keeps the directory browsable when something goes wrong.
@@ -39,7 +31,7 @@ fn snapshot_path(root: &Path) -> Option<PathBuf> {
     }
     let name = root.file_name().and_then(|s| s.to_str()).unwrap_or("root");
     let name: String = name.chars().filter(|c| c.is_alphanumeric() || *c == '-').take(24).collect();
-    Some(cache_dir()?.join(format!("{name}-{hash:016x}.snap")))
+    Some(crate::paths::cache_dir()?.join(format!("{name}-{hash:016x}.snap")))
 }
 
 pub fn save(tree: &Tree) -> io::Result<()> {
@@ -83,7 +75,7 @@ pub fn load(root: &Path) -> Option<Tree> {
 }
 
 pub fn clear() -> io::Result<()> {
-    let Some(dir) = cache_dir() else { return Ok(()) };
+    let Some(dir) = crate::paths::cache_dir() else { return Ok(()) };
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),

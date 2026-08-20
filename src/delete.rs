@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::trash;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disposal {
     /// Recoverable. Slower, and cannot cross a volume boundary.
@@ -32,18 +34,15 @@ impl Disposal {
 /// at or above the scan root. A tool whose whole job is bulk deletion has to be
 /// the one that says no.
 pub fn guard(path: &Path, root: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
     const NEVER: &[&str] = &[
-        "/",
-        "/Applications",
-        "/Library",
-        "/System",
-        "/Users",
-        "/bin",
-        "/etc",
-        "/private",
-        "/sbin",
-        "/usr",
-        "/var",
+        "/", "/Applications", "/Library", "/System", "/Users", "/bin", "/etc", "/private",
+        "/sbin", "/usr", "/var",
+    ];
+    #[cfg(not(target_os = "macos"))]
+    const NEVER: &[&str] = &[
+        "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/opt",
+        "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/usr", "/var",
     ];
 
     if NEVER.iter().any(|p| path == Path::new(p)) {
@@ -55,8 +54,8 @@ pub fn guard(path: &Path, root: &Path) -> Result<(), String> {
     if root.starts_with(path) {
         return Err(format!("{} contains the scan root", path.display()));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        if path == Path::new(&home) {
+    if let Some(home) = crate::paths::home() {
+        if path == home {
             return Err("that is your home directory".into());
         }
     }
@@ -64,33 +63,6 @@ pub fn guard(path: &Path, root: &Path) -> Result<(), String> {
         return Err("that is too close to the filesystem root".into());
     }
     Ok(())
-}
-
-/// Move one item to the Trash, returning where it landed.
-#[cfg(target_os = "macos")]
-pub fn trash(path: &Path) -> io::Result<PathBuf> {
-    use objc2_foundation::{NSFileManager, NSString, NSURL};
-
-    let fm = NSFileManager::defaultManager();
-    let ns_path = NSString::from_str(&path.to_string_lossy());
-    let url = NSURL::fileURLWithPath(&ns_path);
-
-    let mut resulting = None;
-    fm.trashItemAtURL_resultingItemURL_error(&url, Some(&mut resulting))
-        .map_err(|e| io::Error::other(e.localizedDescription().to_string()))?;
-
-    let landed = resulting
-        .and_then(|u| u.path())
-        .map(|p| PathBuf::from(p.to_string()))
-        // Very old systems may not report the URL back. The item is trashed
-        // either way; we just cannot offer to undo it.
-        .ok_or_else(|| io::Error::other("macOS did not report where the item was trashed"))?;
-    Ok(landed)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn trash(_path: &Path) -> io::Result<PathBuf> {
-    Err(io::Error::other("Trash is only implemented on macOS"))
 }
 
 pub fn permanent(path: &Path) -> io::Result<()> {
@@ -161,7 +133,7 @@ fn run_batch(items: Vec<(PathBuf, u64)>, disposal: Disposal, tx: Sender<Outcome>
     let mut journal = Vec::new();
     for (path, bytes) in items {
         let result = match disposal {
-            Disposal::Trash => trash(&path).map(Some).map_err(|e| e.to_string()),
+            Disposal::Trash => trash::trash(&path).map(Some).map_err(|e| e.to_string()),
             Disposal::Permanent => permanent(&path).map(|_| None).map_err(|e| e.to_string()),
         };
         if let Ok(Some(to)) = &result {
@@ -178,21 +150,8 @@ fn run_batch(items: Vec<(PathBuf, u64)>, disposal: Disposal, tx: Sender<Outcome>
 
 // ---------------------------------------------------------------- undo journal
 
-/// The journal lives in Application Support, not Caches: a cache cleaner is
-/// entitled to delete a cache, and losing your undo history to one would be a
-/// nasty surprise.
-pub fn state_dir() -> Option<PathBuf> {
-    // Overridable so tests never touch the real journal: a test run must not be
-    // able to consume the undo history of an actual session.
-    if let Some(dir) = std::env::var_os("FAD_STATE_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/fad"))
-}
-
 fn journal_path() -> Option<PathBuf> {
-    Some(state_dir()?.join("undo.jsonl"))
+    Some(crate::paths::state_dir()?.join("undo.jsonl"))
 }
 
 /// One committed batch, appended as a single JSON line.
@@ -265,13 +224,7 @@ pub fn undo_last() -> Result<UndoReport, String> {
             report.skipped.push((e.from.clone(), "something is there now".into()));
             continue;
         }
-        if let Some(parent) = e.from.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                report.skipped.push((e.from.clone(), err.to_string()));
-                continue;
-            }
-        }
-        match std::fs::rename(&e.to, &e.from) {
+        match trash::restore(&e.to, &e.from) {
             Ok(()) => {
                 report.restored += 1;
                 report.bytes += e.bytes;

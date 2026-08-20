@@ -5,11 +5,7 @@ use std::path::{Path, PathBuf};
 
 use fad::delete::{self, Disposal, Job};
 
-/// Point the undo journal at a scratch directory. Without this a test run would
-/// eat whatever batch the user last committed for real.
-fn isolate_state(dir: &Path) {
-    unsafe { std::env::set_var("FAD_STATE_DIR", dir.join("state")) };
-}
+mod common;
 
 fn wait(job: &mut Job) {
     for _ in 0..2000 {
@@ -46,7 +42,10 @@ fn permanent_delete_removes_files_and_trees() {
 #[test]
 fn trash_then_undo_puts_it_back() {
     let dir = tempfile::tempdir().unwrap();
-    isolate_state(dir.path());
+    // Held for the whole test: the trash location is derived from HOME on
+    // Linux, and the undo journal from FAD_STATE_DIR everywhere.
+    let _env = common::env_lock();
+    common::isolate(dir.path());
     let file = dir.path().join("fad-test-trashable.bin");
     std::fs::write(&file, vec![9u8; 8192]).unwrap();
 
@@ -70,12 +69,34 @@ fn trash_then_undo_puts_it_back() {
 
 #[test]
 fn guard_refuses_the_dangerous_paths() {
-    let root = Path::new("/Users/someone/dev");
-    for bad in ["/", "/System", "/Users", "/Users/someone", "/Users/someone/dev"] {
+    // System directories differ per platform; the structural rules — the scan
+    // root, its ancestors, and anything one level from `/` — do not.
+    #[cfg(target_os = "macos")]
+    let (root, systems) = (Path::new("/Users/someone/dev"), ["/", "/System", "/Users"]);
+    #[cfg(not(target_os = "macos"))]
+    let (root, systems) = (Path::new("/home/someone/dev"), ["/", "/usr", "/home"]);
+
+    for bad in systems {
+        assert!(delete::guard(Path::new(bad), root).is_err(), "guard let {bad} through");
+    }
+    for bad in [root, root.parent().unwrap()] {
         assert!(
-            delete::guard(Path::new(bad), root).is_err(),
-            "guard let {bad} through"
+            delete::guard(bad, root).is_err(),
+            "guard let {} through",
+            bad.display()
         );
     }
-    assert!(delete::guard(Path::new("/Users/someone/dev/target"), root).is_ok());
+    assert!(delete::guard(&root.join("target"), root).is_ok());
+}
+
+/// The home directory is off limits however the environment describes it.
+#[test]
+fn guard_refuses_the_home_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = common::env_lock();
+    let home = dir.path().join("someone");
+    std::fs::create_dir_all(home.join("project")).unwrap();
+    common::isolate(&home);
+
+    assert!(delete::guard(&home, &home.join("project")).is_err());
 }
