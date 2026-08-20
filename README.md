@@ -40,7 +40,12 @@ fad --json       # prints the ranked tree as JSON and exits
 
 The UI opens immediately and fills in as the scan streams results. If a previous
 scan of the same root was saved, its totals appear while the fresh walk catches
-up.
+up — and its entry count becomes the denominator for a progress bar and an ETA,
+which is why the first scan of a directory has neither.
+
+While the walk runs, the bottom of the tree pane shows which directory it is in
+and how many entries a second it is getting through. A three-minute scan with no
+sign of movement reads as a hang.
 
 ### Keys
 

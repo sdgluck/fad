@@ -7,6 +7,7 @@
 //! and the channel is FIFO).
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crossbeam_channel::Sender;
@@ -62,11 +63,30 @@ impl Default for ScanOpts {
     }
 }
 
+/// What the walk has got through so far. Shared with the UI, which is the
+/// difference between a scan that looks stuck and one that says where it is.
 #[derive(Debug, Default)]
 pub struct Progress {
     pub dirs_done: AtomicU64,
     pub entries_seen: AtomicU64,
     pub unreadable: AtomicU64,
+    /// The directory some worker is in right now. Written with `try_lock` and
+    /// skipped on contention: this is a status line, and blocking eight walker
+    /// threads to keep it exact would cost more than it is worth.
+    current: Mutex<PathBuf>,
+}
+
+impl Progress {
+    fn note(&self, path: &std::path::Path) {
+        if let Ok(mut cur) = self.current.try_lock() {
+            cur.clear();
+            cur.push(path);
+        }
+    }
+
+    pub fn current(&self) -> PathBuf {
+        self.current.lock().map(|p| p.clone()).unwrap_or_default()
+    }
 }
 
 struct Ctx {
@@ -74,19 +94,19 @@ struct Ctx {
     next_id: AtomicU32,
     root_dev: u64,
     opts: ScanOpts,
-    progress: Progress,
+    progress: std::sync::Arc<Progress>,
 }
 
 /// Walk `root`, streaming batches into `tx`. Returns once every directory has
 /// been visited; `tx` is dropped on return so the receiver sees a clean close.
-pub fn walk(root: PathBuf, root_meta: &Meta, opts: ScanOpts, tx: Sender<Batch>) -> Progress {
-    let ctx = Ctx {
-        tx,
-        next_id: AtomicU32::new(ROOT_ID + 1),
-        root_dev: root_meta.dev,
-        opts,
-        progress: Progress::default(),
-    };
+pub fn walk(
+    root: PathBuf,
+    root_meta: &Meta,
+    opts: ScanOpts,
+    tx: Sender<Batch>,
+    progress: std::sync::Arc<Progress>,
+) {
+    let ctx = Ctx { tx, next_id: AtomicU32::new(ROOT_ID + 1), root_dev: root_meta.dev, opts, progress };
 
     rayon::scope(|s| {
         let ctx = &ctx;
@@ -94,7 +114,6 @@ pub fn walk(root: PathBuf, root_meta: &Meta, opts: ScanOpts, tx: Sender<Batch>) 
     });
 
     drop(ctx.tx);
-    ctx.progress
 }
 
 fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s Ctx, path: PathBuf, id: ScanId) {
@@ -135,6 +154,7 @@ fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s Ctx, path: PathBuf, id: ScanI
 
     ctx.progress.entries_seen.fetch_add(entries.len() as u64, Ordering::Relaxed);
     ctx.progress.dirs_done.fetch_add(1, Ordering::Relaxed);
+    ctx.progress.note(&path);
 
     // Send before spawning: guarantees the tree has this node's children
     // registered before any grandchild batch can arrive.

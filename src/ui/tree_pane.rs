@@ -132,6 +132,35 @@ fn empty_reason(app: &App) -> String {
 fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
 
+    // A long walk with no sign of movement reads as a hang. Say where it is,
+    // how fast it is going, and — once a previous snapshot gives us a
+    // denominator — how much longer it has.
+    if let Some((p, fraction)) = app.scan_progress() {
+        let here = p
+            .current
+            .strip_prefix(app.tree.root_path())
+            .unwrap_or(&p.current)
+            .display()
+            .to_string();
+        let mut head = format!(" \u{2937} {}", super::compress(&here, width.saturating_sub(28)));
+        if p.rate > 0.0 {
+            head.push_str(&format!("  {}/s", si(p.rate)));
+        }
+        out.push(Line::from(Span::styled(truncate_end(&head, width), theme.dim)));
+
+        if let Some(f) = fraction {
+            let left = remaining(&p, f);
+            let cells = width.saturating_sub(left.chars().count() + 4);
+            let filled = (f * cells as f64) as usize;
+            out.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("\u{2588}".repeat(filled), theme.bar),
+                Span::styled("\u{2591}".repeat(cells.saturating_sub(filled)), theme.dim),
+                Span::styled(format!("  {left}"), theme.dim),
+            ]));
+        }
+    }
+
     if app.from_cache {
         out.push(Line::from(Span::styled(
             " \u{25cc} last known sizes \u{2014} rescanning in the background".to_string(),
@@ -199,6 +228,35 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
         )));
     }
     out
+}
+
+/// The time left, from the rate so far and how much of last run's entry count
+/// is still to come. Stated as an estimate, because that is what it is.
+fn remaining(p: &crate::scan::ScanProgress, fraction: f64) -> String {
+    if p.rate <= 0.0 || fraction >= 1.0 {
+        return "almost there".to_string();
+    }
+    let total = p.entries as f64 / fraction;
+    let secs = ((total - p.entries as f64) / p.rate).max(0.0);
+    if secs < 1.0 {
+        "almost there".to_string()
+    } else if secs < 90.0 {
+        format!("~{}s left", secs as u64)
+    } else {
+        format!("~{}m left", (secs / 60.0).round() as u64)
+    }
+}
+
+/// Thousands and millions, for a rate. Base ten, unlike a size: nobody thinks
+/// of files per second in units of 1024.
+fn si(v: f64) -> String {
+    if v >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        format!("{:.0}k", v / 1_000.0)
+    } else {
+        format!("{v:.0}")
+    }
 }
 
 fn truncate_end(s: &str, width: usize) -> String {

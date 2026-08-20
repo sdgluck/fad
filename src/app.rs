@@ -203,6 +203,10 @@ pub struct App {
     pub breakdown: Option<Breakdown>,
     /// Hide subtrees written to more recently than this.
     pub age_filter: AgeFilter,
+    /// How many entries the last snapshot of this root held. The only honest
+    /// denominator we have for an ETA: the walk cannot know what it has not
+    /// reached, but last time is a good guess at this time.
+    pub expected_entries: Option<u64>,
     /// The user's persistent ignore list.
     pub ignore: crate::ignore::Rules,
     /// What the ignore list hid on the last rebuild, so the tree can say so
@@ -254,6 +258,9 @@ impl App {
         self.snapshot_rx = None;
 
         let Some(snapshot) = loaded else { return false };
+        // Worth keeping even when the snapshot is too late to display: an ETA
+        // is the one thing a three-minute walk cannot produce on its own.
+        self.expected_entries = Some(snapshot.len() as u64);
         self.install_snapshot(snapshot)
     }
 
@@ -313,6 +320,7 @@ impl App {
             snapshot_rx: None,
             breakdown: None,
             age_filter: AgeFilter::All,
+            expected_entries: None,
             ignore: crate::ignore::Rules::load(),
             ignored: (0, 0),
             mouse: true,
@@ -416,6 +424,19 @@ impl App {
 
     pub fn scanning(&self) -> bool {
         self.scan.is_some()
+    }
+
+    /// How the walk is doing, and how far through it looks. The fraction is
+    /// `None` until a previous snapshot gives us something to measure against,
+    /// and is capped at 1: this run finding more than last run is normal, and a
+    /// bar that reads 140% is worse than no bar.
+    pub fn scan_progress(&self) -> Option<(crate::scan::ScanProgress, Option<f64>)> {
+        let p = self.scan.as_ref()?.progress();
+        let fraction = self
+            .expected_entries
+            .filter(|n| *n > 0)
+            .map(|n| (p.entries as f64 / n as f64).min(1.0));
+        Some((p, fraction))
     }
 
     /// True only when the displayed tree is the result of a walk that ran to
