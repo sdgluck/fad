@@ -60,8 +60,11 @@ fn header(app: &App) -> Line<'static> {
         Span::from(" ").into(),
         Span::from(path).bold(),
         Span::from("  "),
-        Span::from(human(root.total_bytes)).bold(),
+        Span::from(human(app.tree.size(app.tree.root(), app.apparent))).bold(),
     ];
+    if app.apparent {
+        spans.push(Span::from(" apparent"));
+    }
     if app.scanning() {
         spans.push(Span::from(format!(
             "  scanning {} dirs, {} files ",
@@ -193,8 +196,9 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
     };
 
     let indent = "  ".repeat(row.depth as usize);
-    let size = human(n.total_bytes);
-    let bar = bar(n.total_bytes, row.sibling_max);
+    let bytes = app.tree.size(row.id, app.apparent);
+    let size = human(bytes);
+    let bar = bar(bytes, row.sibling_max);
 
     // Name column gets whatever the fixed columns leave behind.
     let fixed = 1 + 1 + indent.len() + 2 + 8 + 1 + BAR_WIDTH + 1;
@@ -219,7 +223,7 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
         Span::raw(" "),
         Span::styled(format!("{size:>8}"), theme.emphasis),
         Span::raw(" "),
-        Span::styled(bar, if is_hot(n.total_bytes, row.sibling_max) { theme.bar_hot } else { theme.bar }),
+        Span::styled(bar, if is_hot(bytes, row.sibling_max) { theme.bar_hot } else { theme.bar }),
     ];
 
     if n.flags & flags::CLOUD != 0 {
@@ -238,7 +242,7 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
 /// the one caveat the user needs before staging all of it.
 fn header_line(app: &App, theme: &Theme, cat: crate::presets::Category, selected: bool, width: usize) -> Line<'static> {
     let items = app.reclaim_items(cat);
-    let total: u64 = items.iter().map(|id| app.tree.node(*id).total_bytes).sum();
+    let total: u64 = items.iter().map(|id| app.tree.size(*id, app.apparent)).sum();
     let head = format!(" {} \u{b7} {} \u{b7} {} ", cat.label(), items.len(), human(total));
     let note = format!(" {} ", cat.note());
     let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);

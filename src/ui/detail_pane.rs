@@ -35,9 +35,14 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     // Compact on purpose: this pane is 38 columns and the extension breakdown
     // below it is worth more rows than a spacious header would be.
+    let (headline_bytes, other) = if app.apparent {
+        (n.total_len, n.total_bytes)
+    } else {
+        (n.total_bytes, n.total_len)
+    };
     let mut headline = vec![
-        Span::styled(human(n.total_bytes), theme.emphasis),
-        Span::styled(" on disk", theme.dim),
+        Span::styled(human(headline_bytes), theme.emphasis),
+        Span::styled(if app.apparent { " apparent" } else { " on disk" }, theme.dim),
     ];
     if n.flags & flags::IS_DIR != 0 {
         headline.push(Span::styled(
@@ -55,10 +60,10 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // compression, or a directory full of either.
     // Compare the rendered strings, not the raw numbers: a 0.4% difference is
     // noise, and "20M apparent size" under "20M on disk" says nothing.
-    if human(n.total_len) != human(n.total_bytes) && n.total_len > 0 {
+    if human(other) != human(headline_bytes) && other > 0 {
         lines.push(Line::from(vec![
-            Span::styled(human(n.total_len), theme.normal),
-            Span::styled(" apparent size", theme.dim),
+            Span::styled(human(other), theme.normal),
+            Span::styled(if app.apparent { " on disk" } else { " apparent size" }, theme.dim),
         ]));
     }
     lines.push(Line::from(Span::styled(age(n.mtime), theme.dim)));
@@ -127,7 +132,7 @@ fn draw_staged(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 
     let mut items: Vec<NodeId> = app.staged.iter().copied().collect();
-    items.sort_unstable_by_key(|id| std::cmp::Reverse(app.tree.node(*id).total_bytes));
+    items.sort_unstable_by_key(|id| std::cmp::Reverse(app.tree.size(*id, app.apparent)));
 
     let width = inner.width as usize;
     let lines: Vec<Line> = items
@@ -135,7 +140,7 @@ fn draw_staged(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .take(inner.height as usize)
         .map(|id| {
             let n = app.tree.node(*id);
-            let size = human(n.total_bytes);
+            let size = human(app.tree.size(*id, app.apparent));
             let name_w = width.saturating_sub(size.len() + 3);
             Line::from(vec![
                 Span::styled("\u{25cf} ", theme.staged),

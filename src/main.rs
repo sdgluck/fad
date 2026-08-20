@@ -26,7 +26,7 @@ struct Args {
     #[arg(long)]
     cloud: bool,
 
-    /// Report `st_size` instead of allocated blocks.
+    /// Report `st_size` instead of allocated blocks, in the UI and in --json.
     #[arg(long)]
     apparent: bool,
 
@@ -97,12 +97,13 @@ fn main() {
 
     if args.json {
         scan.finish(&mut tree);
-        tree.sort_all_by_size();
+        tree.sort_all_by_size(args.apparent);
         print_json(&tree, &args);
         return;
     }
 
     let mut app = App::new(tree, scan, opts);
+    app.apparent = args.apparent;
     if !args.no_cache {
         app.load_snapshot_async();
     }

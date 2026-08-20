@@ -81,6 +81,9 @@ pub struct App {
     pub cursor: usize,
     pub offset: usize,
     pub sort: Sort,
+    /// Report `st_size` instead of allocated blocks, everywhere a size is shown
+    /// or ranked.
+    pub apparent: bool,
     pub mode: Mode,
     pub filter: String,
     pub status: Option<String>,
@@ -140,14 +143,29 @@ impl App {
         self.snapshot_rx = None;
 
         let Some(snapshot) = loaded else { return false };
+        self.install_snapshot(snapshot)
+    }
+
+    /// Put a loaded snapshot on screen and push the tree being filled behind
+    /// it. Separate from `poll_snapshot` so the swap — the part with the sharp
+    /// edges — can be exercised without racing a real walk.
+    pub fn install_snapshot(&mut self, snapshot: Tree) -> bool {
         if self.scan.is_none() || self.pending.is_some() {
             return false;
         }
+        // Node ids are arena indices and mean nothing in the other tree, so
+        // anything staged in the second before the snapshot landed has to be
+        // re-resolved by path — exactly as `adopt` does on the way back. Keeping
+        // the raw ids would silently re-point the batch at unrelated files.
+        let staged: Vec<PathBuf> = self.staged.iter().map(|id| self.tree.path(*id)).collect();
+
         // The tree being filled becomes the pending one; the snapshot goes on screen.
         let live = std::mem::replace(&mut self.tree, snapshot);
         self.pending = Some(live);
         self.from_cache = true;
         self.expanded = HashSet::from([self.tree.root()]);
+        self.staged = staged.iter().filter_map(|p| self.tree.find_path(p)).collect();
+        self.refused.clear();
         self.ext_cache = None;
         self.cursor = 0;
         self.offset = 0;
@@ -167,6 +185,7 @@ impl App {
             cursor: 0,
             offset: 0,
             sort: Sort::Size,
+            apparent: false,
             mode: Mode::Normal,
             filter: String::new(),
             status: None,
@@ -193,7 +212,16 @@ impl App {
         let (tree, scan) = Scan::start(&root, self.opts.clone())?;
         self.tree = tree;
         self.scan = Some(scan);
+        // The half-built tree from the previous scan must go with it. Left in
+        // place it would keep receiving the new walk's batches against the old
+        // walk's scan ids, folding fresh sizes into stale nodes — and
+        // `from_cache` would pin the session as never-complete, so no snapshot
+        // would ever be written again.
+        self.pending = None;
+        self.from_cache = false;
+        self.snapshot_rx = None;
         self.staged.clear();
+        self.refused.clear();
         self.expanded = HashSet::from([self.tree.root()]);
         self.ext_cache = None;
         self.cursor = 0;
@@ -295,12 +323,14 @@ impl App {
             self.build_reclaim_rows();
         } else {
             let root = self.tree.root();
-            let max = self.tree.node(root).total_bytes;
+            let max = self.tree.size(root, self.apparent);
             self.push_row(root, 0, max);
         }
 
         if let Some(anchor) = anchor {
-            if let Some(i) = self.rows.iter().position(|r| r.id == anchor) {
+            // A heading shares its id with the first item under it, so match the
+            // item row rather than letting the cursor drift up onto the heading.
+            if let Some(i) = self.rows.iter().position(|r| r.header.is_none() && r.id == anchor) {
                 self.cursor = i;
             }
         }
@@ -329,8 +359,9 @@ impl App {
             if items.is_empty() {
                 continue;
             }
-            items.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.node(*id).total_bytes));
-            let max = self.tree.node(items[0]).total_bytes;
+            let apparent = self.apparent;
+            items.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.size(*id, apparent)));
+            let max = self.tree.size(items[0], apparent);
 
             self.rows.push(Row { id: items[0], depth: 0, sibling_max: max, header: Some(cat) });
             for id in items {
@@ -364,8 +395,8 @@ impl App {
         if !self.expanded.contains(&id) {
             return;
         }
-        self.tree.sort_children(id, self.sort);
-        let child_max = self.tree.max_child_bytes(id);
+        self.tree.sort_children(id, self.sort, self.apparent);
+        let child_max = self.tree.max_child_size(id, self.apparent);
         let children = self.tree.node(id).children.clone();
         for c in children {
             if !self.passes_filter(c) {
@@ -394,7 +425,10 @@ impl App {
         let haystack = Utf32Str::new(&name, &mut hb);
         let needle = Utf32Str::new(&self.filter, &mut nb);
         // Smart case, like every other tool with a `/`: a lowercase query is
-        // case-insensitive, and typing a capital means you meant it.
+        // case-insensitive, and typing a capital means you meant it. The
+        // matcher's own default is unconditionally case-insensitive, so the
+        // decision has to be made here, per query.
+        self.matcher.config.ignore_case = !self.filter.chars().any(char::is_uppercase);
         self.matcher.fuzzy_match(haystack, needle).is_some()
     }
 
@@ -416,7 +450,7 @@ impl App {
         // and otherwise only when the size has actually changed and enough time
         // has passed that we are not doing it on every frame of a live scan.
         const THROTTLE: Duration = Duration::from_millis(250);
-        let bytes = self.tree.node(id).total_bytes;
+        let bytes = self.tree.size(id, self.apparent);
         if let Some(c) = self.ext_cache.as_ref() {
             let fresh = c.id == id && (c.at_bytes == bytes || c.at.elapsed() < THROTTLE);
             if fresh {
@@ -451,7 +485,7 @@ impl App {
             }
             let key = extension_of(&n.name);
             let e = by_ext.entry(key).or_default();
-            e.0 += n.self_bytes;
+            e.0 += self.tree.self_size(cur, self.apparent);
             e.1 += 1;
         }
 
@@ -465,13 +499,48 @@ impl App {
             id,
             items,
             partial,
-            at_bytes: self.tree.node(id).total_bytes,
+            at_bytes: self.tree.size(id, self.apparent),
             at: Instant::now(),
         }
     }
 
     pub fn staged_bytes(&self) -> u64 {
-        self.staged.iter().map(|id| self.tree.node(*id).total_bytes).sum()
+        self.staged.iter().map(|id| self.tree.size(*id, self.apparent)).sum()
+    }
+
+    /// Stage `id`, dropping anything already staged inside it.
+    ///
+    /// Without this a directory and something under it can both be staged: the
+    /// total double-counts the child, and since the batch runs largest-first the
+    /// child is deleted along with its parent and then reported as a failure for
+    /// a path that is exactly as gone as the user asked for.
+    pub fn stage(&mut self, id: NodeId) {
+        if self.is_staged_under(id) {
+            return;
+        }
+        let nested: Vec<NodeId> =
+            self.staged.iter().copied().filter(|o| self.is_ancestor(id, *o)).collect();
+        for n in nested {
+            self.staged.remove(&n);
+        }
+        self.staged.insert(id);
+    }
+
+    /// True when `id` is already covered by a staged ancestor.
+    fn is_staged_under(&self, id: NodeId) -> bool {
+        self.staged.iter().any(|s| self.is_ancestor(*s, id))
+    }
+
+    /// Is `ancestor` strictly above `id`?
+    fn is_ancestor(&self, ancestor: NodeId, id: NodeId) -> bool {
+        let mut cur = self.tree.node(id).parent;
+        while let Some(p) = cur {
+            if p == ancestor {
+                return true;
+            }
+            cur = self.tree.node(p).parent;
+        }
+        false
     }
 
     /// Staged items in commit order, largest first, with anything the guard
@@ -496,8 +565,8 @@ impl App {
     /// shows up as early as possible.
     pub fn batch_items(&self) -> Vec<(std::path::PathBuf, u64)> {
         let mut ids: Vec<NodeId> = self.staged.iter().copied().collect();
-        ids.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.node(*id).total_bytes));
-        ids.iter().map(|id| (self.tree.path(*id), self.tree.node(*id).total_bytes)).collect()
+        ids.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.size(*id, self.apparent)));
+        ids.iter().map(|id| (self.tree.path(*id), self.tree.size(*id, self.apparent))).collect()
     }
 
     pub fn commit(&mut self) {

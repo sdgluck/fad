@@ -88,3 +88,79 @@ fn the_root_itself_cannot_be_removed() {
     assert!(tree.remove(root).is_none());
     assert!(tree.node(root).total_bytes > 0);
 }
+
+/// A batch whose parent has not been registered yet is held back, and must be
+/// applied — not quietly dropped — once the parent arrives. The walker's
+/// ordering means this should not happen, but a whole subtree silently missing
+/// from the totals is not a failure mode worth leaving to chance.
+#[test]
+fn a_batch_that_arrives_before_its_parent_is_still_counted() {
+    use fad::scan::meta::{Kind, Meta};
+    use fad::scan::walk::{Batch, Entry};
+
+    let meta = |dir: bool, blocks: u64| Meta {
+        blocks,
+        len: blocks,
+        mtime: 0,
+        dev: 1,
+        ino: 0,
+        nlink: 1,
+        kind: if dir { Kind::Dir } else { Kind::File },
+    };
+
+    let mut tree = Tree::new("/root".into(), &meta(true, 0));
+
+    // The child directory's contents turn up first, naming a scan id the tree
+    // has never seen.
+    tree.apply(Batch {
+        parent: 7,
+        entries: vec![Entry {
+            name: "big.bin".into(),
+            meta: meta(false, 4096),
+            descend: None,
+            skip: None,
+        }],
+        unreadable: None,
+    });
+    assert_eq!(tree.node(tree.root()).total_bytes, 0);
+
+    // Now the parent arrives and claims scan id 7.
+    tree.apply(Batch {
+        parent: 0,
+        entries: vec![Entry {
+            name: "sub".into(),
+            meta: meta(true, 0),
+            descend: Some(7),
+            skip: None,
+        }],
+        unreadable: None,
+    });
+
+    assert_eq!(tree.node(tree.root()).total_bytes, 4096, "the held batch was dropped");
+    assert_eq!(tree.node(tree.root()).file_count, 1);
+    let sub = find(&tree, "sub");
+    assert_eq!(tree.node(sub).total_bytes, 4096);
+}
+
+/// Presets are matched against the parent directory's name, and the scan root
+/// is a parent like any other: `fad ~/.cargo` still has to recognise
+/// `registry`, and `fad ~` still has to recognise the caches directly inside it.
+#[test]
+fn presets_match_directly_under_the_scan_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let cargo = dir.path().join(".cargo");
+    std::fs::create_dir_all(cargo.join("registry/cache")).unwrap();
+    std::fs::write(cargo.join("registry/cache/crate.crate"), vec![0u8; 64 * 1024]).unwrap();
+
+    // Scanned from above, `registry` has an ordinary `.cargo` parent node.
+    let from_above = scan(dir.path());
+    let nested = find(&from_above, ".cargo/registry");
+    let expected = from_above.node(nested).preset;
+    assert!(expected.is_some(), "fixture does not match any preset");
+
+    // Scanned with `.cargo` as the root, it must still match.
+    let at_root = scan(&cargo);
+    let top = find(&at_root, "registry");
+    assert_eq!(at_root.node(top).preset, expected, "the scan root did not vouch for its children");
+    assert!(at_root.reclaimable.contains(&top), "missing from the reclaimable view");
+}

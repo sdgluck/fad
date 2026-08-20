@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 
 use crate::tree::{Snapshot, Tree};
 
-/// Bumped whenever `Node` or `Tree` change shape. An old snapshot is discarded
-/// rather than misread.
-const FORMAT: u32 = 2;
+/// Bumped whenever `Node` or `Tree` change shape, or a field changes meaning.
+/// An old snapshot is discarded rather than misread. Version 3 stores the root
+/// node's basename where 2 stored its whole path.
+const FORMAT: u32 = 3;
 const MAGIC: &[u8; 4] = b"fad\0";
 
 fn snapshot_path(root: &Path) -> Option<PathBuf> {

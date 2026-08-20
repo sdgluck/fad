@@ -280,13 +280,19 @@ fn collapse(app: &mut App) {
 }
 
 fn toggle_stage(app: &mut App) {
+    // A heading carries the id of the first item under it, so `space` here
+    // would stage a row the cursor is not on. `A` is the key for a category.
+    if app.rows.get(app.cursor).is_some_and(|r| r.header.is_some()) {
+        app.status = Some("A stages the whole category".into());
+        return;
+    }
     let Some(id) = app.selected() else { return };
     if id == app.tree.root() {
         app.status = Some("the scan root cannot be deleted".into());
         return;
     }
     if !app.staged.remove(&id) {
-        app.staged.insert(id);
+        app.stage(id);
     }
 }
 
@@ -309,7 +315,7 @@ fn stage_children(app: &mut App) {
         let items = app.reclaim_items(cat);
         let all = items.iter().all(|id| app.staged.contains(id));
         for id in items {
-            if all { app.staged.remove(&id); } else { app.staged.insert(id); }
+            if all { app.staged.remove(&id); } else { app.stage(id); }
         }
         return;
     }
@@ -324,7 +330,7 @@ fn stage_children(app: &mut App) {
         if all_staged {
             app.staged.remove(&c);
         } else {
-            app.staged.insert(c);
+            app.stage(c);
         }
     }
 }

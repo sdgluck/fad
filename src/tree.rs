@@ -104,7 +104,12 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(root_path: PathBuf, root_meta: &Meta) -> Self {
-        let name = root_path.to_string_lossy().into_owned().into_boxed_str();
+        // The basename, not the whole path: this is what `presets::classify`
+        // sees as the parent name of every top-level entry, and a rule keyed on
+        // `Library` or `.cargo` must still fire when that directory *is* the
+        // scan root. The full path is kept in `root_path` and shown in the
+        // pane title.
+        let name = Tree::root_name(&root_path);
         let root = Node {
             name,
             parent: None,
@@ -291,19 +296,17 @@ impl Tree {
     }
 
     fn drain_orphans(&mut self) {
-        let mut again = true;
-        while again {
-            again = false;
-            let mut pending = std::mem::take(&mut self.orphans);
-            pending.retain(|b| {
-                if self.by_scan_id.contains_key(&b.parent) {
-                    again = true;
-                    false
-                } else {
-                    true
-                }
-            });
-            let ready = std::mem::replace(&mut self.orphans, pending);
+        loop {
+            // `partition`, not `retain`: the batches whose parent has now
+            // arrived are the ones we must apply, and `retain` would drop them
+            // on the floor instead of handing them back.
+            let (ready, waiting): (Vec<Batch>, Vec<Batch>) = std::mem::take(&mut self.orphans)
+                .into_iter()
+                .partition(|b| self.by_scan_id.contains_key(&b.parent));
+            self.orphans = waiting;
+            if ready.is_empty() {
+                return;
+            }
             for b in ready {
                 self.apply(b);
             }
@@ -373,12 +376,13 @@ impl Tree {
     /// Order children by `sort`, in place. Called only for nodes that are
     /// actually on screen, so a live scan never pays to order two million
     /// entries nobody is looking at.
-    pub fn sort_children(&mut self, id: NodeId, sort: Sort) {
+    pub fn sort_children(&mut self, id: NodeId, sort: Sort, apparent: bool) {
         let mut kids = std::mem::take(&mut self.nodes[id as usize].children);
         match sort {
             Sort::Size => kids.sort_unstable_by(|a, b| {
+                let (sa, sb) = (self.size(*a, apparent), self.size(*b, apparent));
                 let (a, b) = (&self.nodes[*a as usize], &self.nodes[*b as usize]);
-                b.total_bytes.cmp(&a.total_bytes).then_with(|| a.name.cmp(&b.name))
+                sb.cmp(&sa).then_with(|| a.name.cmp(&b.name))
             }),
             Sort::Count => kids.sort_unstable_by(|a, b| {
                 let (a, b) = (&self.nodes[*a as usize], &self.nodes[*b as usize]);
@@ -399,23 +403,46 @@ impl Tree {
     /// The largest child total, for scaling a row's size bar against its
     /// siblings rather than against the root (which would flatten every level
     /// below the first into an invisible sliver).
-    pub fn max_child_bytes(&self, id: NodeId) -> u64 {
+    pub fn max_child_size(&self, id: NodeId, apparent: bool) -> u64 {
         self.node(id)
             .children
             .iter()
-            .map(|c| self.node(*c).total_bytes)
+            .map(|c| self.size(*c, apparent))
             .max()
             .unwrap_or(0)
     }
 
+    /// The subtree size to report: allocated blocks, or `st_size` under
+    /// `--apparent`. Everything that shows or ranks a size goes through here,
+    /// so the flag cannot end up honoured in one pane and ignored in another.
+    pub fn size(&self, id: NodeId, apparent: bool) -> u64 {
+        let n = self.node(id);
+        if apparent { n.total_len } else { n.total_bytes }
+    }
+
+    /// This entry's own contribution, on the same metric.
+    pub fn self_size(&self, id: NodeId, apparent: bool) -> u64 {
+        let n = self.node(id);
+        if apparent { n.self_len } else { n.self_bytes }
+    }
+
+    fn root_name(root_path: &Path) -> Box<str> {
+        match root_path.file_name() {
+            Some(n) => n.to_string_lossy().into_owned().into_boxed_str(),
+            // `/` and `C:` style roots have no final component.
+            None => root_path.to_string_lossy().into_owned().into_boxed_str(),
+        }
+    }
+
     /// Sort every node's children largest-first. Called once for `--json`; the
     /// TUI sorts lazily, only what is visible.
-    pub fn sort_all_by_size(&mut self) {
+    pub fn sort_all_by_size(&mut self, apparent: bool) {
         for i in 0..self.nodes.len() {
             let mut kids = std::mem::take(&mut self.nodes[i].children);
             kids.sort_unstable_by(|a, b| {
+                let (sa, sb) = (self.size(*a, apparent), self.size(*b, apparent));
                 let (a, b) = (&self.nodes[*a as usize], &self.nodes[*b as usize]);
-                b.total_bytes.cmp(&a.total_bytes).then_with(|| a.name.cmp(&b.name))
+                sb.cmp(&sa).then_with(|| a.name.cmp(&b.name))
             });
             self.nodes[i].children = kids;
         }
