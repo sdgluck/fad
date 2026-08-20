@@ -57,6 +57,34 @@ struct Args {
     #[arg(long)]
     clear_cache: bool,
 
+    /// Print the selected path to stdout on exit, so `cd "$(fad --print-path)"`
+    /// works.
+    #[arg(long)]
+    print_path: bool,
+
+    /// With --reclaim, actually delete instead of opening the UI. Only ever
+    /// touches entries the built-in rules recognise.
+    #[arg(long)]
+    yes: bool,
+
+    /// With --reclaim --yes, stop once this much has been staged, largest
+    /// first. e.g. 10G.
+    #[arg(long, value_parser = parse_size)]
+    max: Option<u64>,
+
+    /// With --reclaim --yes, print what would go and delete nothing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// With --reclaim --yes, delete permanently instead of trashing.
+    #[arg(long)]
+    permanent: bool,
+
+    /// Print what changed since the last saved scan of this root, largest
+    /// change first.
+    #[arg(long)]
+    since: bool,
+
     /// Do not capture the mouse. Clicking and the wheel stop working; your
     /// terminal's own text selection starts working again.
     #[arg(long)]
@@ -118,6 +146,22 @@ fn main() {
         return;
     }
 
+    if args.reclaim && args.yes {
+        scan.finish(&mut tree);
+        std::process::exit(reclaim_now(&tree, &args));
+    }
+
+    if args.since {
+        scan.finish(&mut tree);
+        let code = print_since(&tree, &args);
+        // Leave this walk behind as the new baseline, or a script that runs
+        // --since on a timer would keep measuring against the same old scan.
+        if !args.no_cache {
+            let _ = fad::cache::save(&tree);
+        }
+        std::process::exit(code);
+    }
+
     let mut app = App::new(tree, scan, opts);
     app.apparent = args.apparent;
     app.mouse = !args.no_mouse;
@@ -127,16 +171,22 @@ fn main() {
     }
     let save = !args.no_cache;
     match run::run(app) {
-        Ok(Some(final_tree)) => {
-            if save {
+        Ok(outcome) => {
+            // Quit before the walk finished leaves an incomplete tree, and the
+            // previous snapshot — which at least was whole — stays put.
+            if let (true, Some(final_tree)) = (save, outcome.tree.as_ref()) {
                 // Best effort: failing to write a cache is never worth an error
                 // on the way out of a session that otherwise went fine.
-                let _ = fad::cache::save(&final_tree);
+                let _ = fad::cache::save(final_tree);
+            }
+            // Last, and on stdout alone, so it is the only thing a shell
+            // substitution picks up.
+            if args.print_path {
+                if let Some(p) = outcome.selected {
+                    println!("{}", p.display());
+                }
             }
         }
-        // Quit before the walk finished, so the tree is incomplete and the
-        // previous snapshot — which at least was whole — stays put.
-        Ok(None) => {}
         Err(e) => {
             eprintln!("fad: {e}");
             std::process::exit(1);
@@ -171,6 +221,135 @@ fn print_json(tree: &Tree, args: &Args) {
     }
 }
 
+/// Scripted cleanup. Deliberately narrow: it only ever touches entries the
+/// built-in rules recognise, it honours the ignore list and the same guard the
+/// UI uses, and it prints every path before it goes. A tool that deletes
+/// without a person watching has to be boring about what it will consider.
+fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
+    let ignore = fad::ignore::Rules::load();
+    let root = tree.root_path();
+
+    let chosen = fad::reclaim::under_cap(
+        fad::reclaim::candidates(tree, args.apparent, args.min_size, &ignore),
+        args.max,
+    );
+    let total: u64 = chosen.iter().map(|(_, b)| b).sum();
+    let batch: Vec<(PathBuf, u64)> =
+        chosen.iter().map(|(id, bytes)| (tree.path(*id), *bytes)).collect();
+
+    if batch.is_empty() {
+        println!("fad: nothing reclaimable under {}", root.display());
+        return 0;
+    }
+
+    for (path, bytes) in &batch {
+        println!("{:>8}  {}", human(*bytes), path.display());
+    }
+    let verb = if args.dry_run {
+        "would reclaim"
+    } else if args.permanent {
+        "permanently deleting"
+    } else {
+        "moving to the trash"
+    };
+    println!("{verb}: {} item(s), {}", batch.len(), human(total));
+
+    if args.dry_run {
+        return 0;
+    }
+
+    let disposal =
+        if args.permanent { fad::delete::Disposal::Permanent } else { fad::delete::Disposal::Trash };
+    let mut job = fad::delete::Job::start(batch, disposal);
+    while !job.is_finished() {
+        job.poll();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    job.poll();
+
+    let failures = job.failures();
+    for o in &failures {
+        eprintln!("fad: {}: {}", o.path.display(), o.result.as_ref().err().cloned().unwrap_or_default());
+    }
+    println!("reclaimed {}", human(job.freed()));
+    if !args.permanent {
+        println!("still in the trash until you empty it");
+    }
+    i32::from(!failures.is_empty())
+}
+
+/// What changed since the last saved scan of this root. Answers "what did that
+/// install just add?", which no single scan can.
+fn print_since(tree: &Tree, args: &Args) -> i32 {
+    let Some((previous, at)) = fad::cache::load(tree.root_path()) else {
+        eprintln!(
+            "fad: no saved scan of {} to compare against \u{2014} run fad once first",
+            tree.root_path().display()
+        );
+        return 1;
+    };
+
+    // One entry per path present in either tree, at any depth down to --depth.
+    let mut changes: Vec<(PathBuf, i64, bool)> = Vec::new();
+    let mut stack = vec![(tree.root(), 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        let path = tree.path(id);
+        let now = tree.size(id, args.apparent) as i64;
+        let (delta, is_new) = match previous.find_path(&path) {
+            Some(then) => (now - previous.size(then, args.apparent) as i64, false),
+            None => (now, true),
+        };
+        if delta.unsigned_abs() >= args.min_size.max(1) {
+            changes.push((path, delta, is_new));
+        }
+        // A directory that is entirely new is reported once, not once per file
+        // inside it.
+        if depth < args.depth && !is_new {
+            stack.extend(tree.node(id).children.iter().map(|c| (*c, depth + 1)));
+        }
+    }
+    changes.sort_unstable_by_key(|(_, d, _)| std::cmp::Reverse(d.abs()));
+
+    if args.json {
+        let items: Vec<_> = changes
+            .iter()
+            .map(|(path, delta, is_new)| {
+                serde_json::json!({
+                    "path": path,
+                    "delta": delta,
+                    "change": format!("{}{}", if *delta < 0 { "-" } else { "+" }, human(delta.unsigned_abs())),
+                    "new": is_new,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "root": tree.root_path(),
+                "since": at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                "changes": items,
+            }))
+            .unwrap()
+        );
+        return 0;
+    }
+
+    if changes.is_empty() {
+        println!("fad: nothing changed by more than {}", human(args.min_size.max(1)));
+        return 0;
+    }
+    for (path, delta, is_new) in &changes {
+        println!(
+            "{}{:>7}  {}{}",
+            if *delta < 0 { '-' } else { '+' },
+            human(delta.unsigned_abs()),
+            path.display(),
+            if *is_new { "  (new)" } else { "" }
+        );
+    }
+    0
+}
+
 /// The reclaimable set, grouped by category and ranked. Shaped for a script:
 /// every entry carries the path, the size, and — where we can name one — the
 /// command that puts it back, so a cleanup can be reviewed before it is run.
@@ -184,7 +363,7 @@ fn print_reclaim_json(tree: &Tree, args: &Args) {
             .filter(|id| tree.node(*id).preset == Some(cat))
             // A `node_modules` inside a `node_modules` is already covered by
             // its ancestor; listing both would double the headline total.
-            .filter(|id| !has_reclaimable_ancestor(tree, *id))
+            .filter(|id| !fad::reclaim::has_reclaimable_ancestor(tree, *id))
             .filter(|id| tree.size(*id, args.apparent) >= args.min_size)
             .collect();
         if items.is_empty() {
@@ -228,17 +407,6 @@ fn print_reclaim_json(tree: &Tree, args: &Args) {
         }))
         .unwrap()
     );
-}
-
-fn has_reclaimable_ancestor(tree: &Tree, id: NodeId) -> bool {
-    let mut cur = tree.node(id).parent;
-    while let Some(p) = cur {
-        if tree.node(p).preset.is_some() {
-            return true;
-        }
-        cur = tree.node(p).parent;
-    }
-    false
 }
 
 fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::Value {

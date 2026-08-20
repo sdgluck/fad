@@ -86,6 +86,12 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --cloud           descend into iCloud/Dropbox/OneDrive folders
 --apparent        report st_size instead of allocated blocks
 --reclaim         open in the reclaimable view; with --json, print that set
+--yes             with --reclaim, delete instead of opening the UI
+--max 10G         with --reclaim --yes, stop once this much is staged
+--dry-run         with --reclaim --yes, print what would go and delete nothing
+--permanent       with --reclaim --yes, delete outright instead of trashing
+--since           print what changed since the last saved scan of this root
+--print-path      print the selected path on exit, for `cd "$(fad --print-path)"`
 --json            dump the ranked tree as JSON instead of opening the UI
 --min-size 100M   hide entries below a threshold (--json)
 --depth N         how deep to print (--json, default 2)
@@ -150,6 +156,29 @@ or `new since last week`.
 
 Growth is usually more actionable than size. A cache that put on 12G this week
 is a better target than a stable 20G one.
+
+## Without the UI
+
+```sh
+fad --reclaim --yes --dry-run ~/dev     # what a cleanup would take
+fad --reclaim --yes --max 10G ~/dev     # take up to 10G of it, to the trash
+fad --since ~/dev                       # what changed since the last scan
+cd "$(fad --print-path)"                # quit on a directory, land in it
+```
+
+`--reclaim --yes` is deliberately narrow. It only ever considers entries the
+built-in rules recognise, it honours your ignore list and the same guard the UI
+uses, and it prints every path before touching it. It trashes by default;
+`--permanent` is the flag that makes it irreversible.
+
+`--max` takes candidates largest first and *skips* anything that would push the
+batch over the cap rather than stopping there — otherwise a 2G cap could reclaim
+nothing at all when the biggest candidate happens to be 3G.
+
+`--since` compares against the saved snapshot and prints the biggest changes
+first, then leaves the fresh walk behind as the new baseline, so it can be run
+on a timer. It answers "what did that install just add?", which no single scan
+can.
 
 ## Sizes
 

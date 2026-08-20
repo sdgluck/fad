@@ -8,6 +8,7 @@ pub mod ignore;
 pub mod paths;
 pub mod platform;
 pub mod presets;
+pub mod reclaim;
 pub mod run;
 pub mod scan;
 pub mod trash;

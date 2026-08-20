@@ -552,7 +552,7 @@ impl App {
                 .filter(|id| self.tree.node(*id).flags & flags::DELETED == 0)
                 // A `node_modules` inside a `node_modules` is already covered
                 // by its ancestor; listing both would double the headline total.
-                .filter(|id| !self.has_reclaimable_ancestor(*id))
+                .filter(|id| !crate::reclaim::has_reclaimable_ancestor(&self.tree, *id))
                 .collect();
             let mut items: Vec<NodeId> =
                 candidates.into_iter().filter(|id| self.passes_filter(*id)).collect();
@@ -707,17 +707,6 @@ impl App {
         self.offset = 0;
         self.mark_dirty();
         true
-    }
-
-    fn has_reclaimable_ancestor(&self, id: NodeId) -> bool {
-        let mut cur = self.tree.node(id).parent;
-        while let Some(p) = cur {
-            if self.tree.node(p).preset.is_some() {
-                return true;
-            }
-            cur = self.tree.node(p).parent;
-        }
-        false
     }
 
     /// Everything in a category, whether or not its heading is open. `A` on a

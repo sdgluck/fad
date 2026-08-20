@@ -22,8 +22,15 @@ use crate::ui;
 const SCAN_TICK: Duration = Duration::from_millis(33);
 const IDLE_TICK: Duration = Duration::from_millis(250);
 
-/// Runs the UI and hands back the tree, but only if it is worth persisting.
-pub fn run(mut app: App) -> io::Result<Option<crate::tree::Tree>> {
+/// What the session left behind.
+pub struct Outcome {
+    /// The tree, but only if it is worth persisting.
+    pub tree: Option<crate::tree::Tree>,
+    /// Where the cursor was when the user quit, for `--print-path`.
+    pub selected: Option<std::path::PathBuf>,
+}
+
+pub fn run(mut app: App) -> io::Result<Outcome> {
     let mouse = app.mouse;
     let mut terminal = enter(mouse)?;
     let result = event_loop(&mut terminal, &mut app);
@@ -31,7 +38,8 @@ pub fn run(mut app: App) -> io::Result<Option<crate::tree::Tree>> {
     // left staring at a broken shell.
     leave(&mut terminal, mouse)?;
     result?;
-    Ok(app.tree_is_complete().then_some(app.tree))
+    let selected = app.selected().map(|id| app.tree.path(id));
+    Ok(Outcome { tree: app.tree_is_complete().then_some(app.tree), selected })
 }
 
 fn enter(mouse: bool) -> io::Result<ratatui::DefaultTerminal> {
