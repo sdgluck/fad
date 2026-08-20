@@ -100,6 +100,16 @@ fn extension_of(name: &str) -> &str {
     }
 }
 
+/// A group heading: a row the cursor can rest on, that opens and closes, and
+/// that `A` stages in one go. The reclaimable and duplicate views are both
+/// lists of groups, and differ only in what a group means.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Heading {
+    Category(Category),
+    /// Index into `dupes.groups`.
+    Dupes(usize),
+}
+
 /// One line of the tree pane.
 #[derive(Clone, Copy)]
 pub struct Row {
@@ -107,9 +117,9 @@ pub struct Row {
     pub depth: u16,
     /// Largest sibling total, for scaling this row's bar.
     pub sibling_max: u64,
-    /// Category headers in the reclaimable view are rows too, so the cursor
-    /// can land on one and stage everything under it.
-    pub header: Option<Category>,
+    /// Group headings are rows too, so the cursor can land on one and stage
+    /// everything under it.
+    pub header: Option<Heading>,
 }
 
 impl Row {
@@ -150,6 +160,15 @@ pub struct App {
     pub status: Option<String>,
     /// Showing only what the built-in rules consider reclaimable.
     pub reclaim_view: bool,
+    /// Showing files that exist more than once.
+    pub dupe_view: bool,
+    /// The finished duplicate report, if one has been asked for and arrived.
+    pub dupes: Option<crate::dupes::Report>,
+    /// A duplicate hunt in flight. Hashing gigabytes cannot happen on the UI
+    /// thread, and the view says so while it runs.
+    dupes_rx: Option<crossbeam_channel::Receiver<crate::dupes::Report>>,
+    /// Groups whose copies are showing.
+    pub dupes_open: HashSet<usize>,
     /// Categories whose items are showing. Headings start closed, so the first
     /// screen of the reclaimable view is the four totals rather than a wall of
     /// paths.
@@ -238,6 +257,7 @@ impl App {
         self.staged = staged.iter().filter_map(|p| self.tree.find_path(p)).collect();
         self.refused.clear();
         self.breakdown = None;
+        self.invalidate_dupes();
         self.cursor = 0;
         self.offset = 0;
         self.dirty = true;
@@ -261,6 +281,10 @@ impl App {
             filter: String::new(),
             status: None,
             reclaim_view: false,
+            dupe_view: false,
+            dupes: None,
+            dupes_rx: None,
+            dupes_open: HashSet::new(),
             reclaim_open: HashSet::new(),
             reclaim_cats: Vec::new(),
             from_cache: false,
@@ -298,6 +322,7 @@ impl App {
         self.refused.clear();
         self.expanded = HashSet::from([self.tree.root()]);
         self.breakdown = None;
+        self.invalidate_dupes();
         self.cursor = 0;
         self.offset = 0;
         self.mark_dirty();
@@ -346,6 +371,7 @@ impl App {
         self.tree = fresh;
         self.from_cache = false;
         self.breakdown = None;
+        self.invalidate_dupes();
 
         self.expanded = expanded.iter().filter_map(|p| self.tree.find_path(p)).collect();
         self.expanded.insert(self.tree.root());
@@ -393,7 +419,10 @@ impl App {
         let anchor = self.rows.get(self.cursor).map(|r| (r.id, r.header.is_some()));
 
         self.rows.clear();
-        if self.reclaim_view {
+        if self.dupe_view {
+            self.reclaim_cats.clear();
+            self.build_dupe_rows();
+        } else if self.reclaim_view {
             self.build_reclaim_rows();
         } else {
             self.reclaim_cats.clear();
@@ -442,7 +471,12 @@ impl App {
             items.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.size(*id, apparent)));
             let max = self.tree.size(items[0], apparent);
 
-            self.rows.push(Row { id: items[0], depth: 0, sibling_max: max, header: Some(cat) });
+            self.rows.push(Row {
+                id: items[0],
+                depth: 0,
+                sibling_max: max,
+                header: Some(Heading::Category(cat)),
+            });
             if self.reclaim_open.contains(&cat) {
                 for id in &items {
                     self.rows.push(Row::node(*id, 1, max));
@@ -450,6 +484,137 @@ impl App {
             }
             self.reclaim_cats.push((cat, items));
         }
+    }
+
+    /// The duplicate view: one heading per group of identical files, the
+    /// biggest pile of wasted space first.
+    fn build_dupe_rows(&mut self) {
+        let Some(report) = self.dupes.as_ref() else { return };
+        let widest = report.groups.first().map(|g| g.wasted()).unwrap_or(0);
+        let groups: Vec<(usize, Vec<NodeId>, u64)> = report
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (i, g.ids.clone(), g.bytes_each))
+            .collect();
+
+        for (i, ids, bytes_each) in groups {
+            // A copy already deleted this session leaves the group behind; a
+            // group down to one copy is not a duplicate any more.
+            let live: Vec<NodeId> = ids
+                .into_iter()
+                .filter(|id| self.tree.node(*id).flags & flags::DELETED == 0)
+                .collect();
+            if live.len() < 2 {
+                continue;
+            }
+            let shown: Vec<NodeId> =
+                live.iter().copied().filter(|id| self.passes_filter(*id)).collect();
+            if shown.is_empty() {
+                continue;
+            }
+            self.rows.push(Row {
+                id: shown[0],
+                depth: 0,
+                sibling_max: widest,
+                header: Some(Heading::Dupes(i)),
+            });
+            if self.dupes_open.contains(&i) {
+                for id in shown {
+                    self.rows.push(Row::node(id, 1, bytes_each));
+                }
+            }
+        }
+    }
+
+    /// The copies in a group that are still here, newest first. The newest is
+    /// the one "keep one" keeps.
+    pub fn dupe_items(&self, group: usize) -> Vec<NodeId> {
+        self.dupes
+            .as_ref()
+            .and_then(|r| r.groups.get(group))
+            .map(|g| {
+                g.ids
+                    .iter()
+                    .copied()
+                    .filter(|id| self.tree.node(*id).flags & flags::DELETED == 0)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Node ids are arena indices, so a duplicate report is only ever about
+    /// the tree it was computed from. Any tree swap has to throw it away —
+    /// carrying it over would point "delete this copy" at an unrelated file.
+    fn invalidate_dupes(&mut self) {
+        self.dupes = None;
+        self.dupes_rx = None;
+        self.dupes_open.clear();
+        self.dupe_view = false;
+    }
+
+    pub fn dupes_is_open(&self, group: usize) -> bool {
+        self.dupes_open.contains(&group)
+    }
+
+    pub fn dupe_hunt_running(&self) -> bool {
+        self.dupes_rx.is_some()
+    }
+
+    /// Start hashing. Only worth doing on a finished tree: half a walk means
+    /// half the candidates, and a duplicate whose twin has not been scanned yet
+    /// simply does not look like one.
+    pub fn start_dupe_hunt(&mut self) {
+        if self.dupes_rx.is_some() {
+            return;
+        }
+        let mut candidates = Vec::new();
+        let mut stack = vec![self.tree.root()];
+        while let Some(id) = stack.pop() {
+            let n = self.tree.node(id);
+            if n.flags & flags::DELETED != 0 {
+                continue;
+            }
+            if n.flags & flags::IS_DIR != 0 {
+                stack.extend_from_slice(&n.children);
+                continue;
+            }
+            // Hardlinked copies already share their storage, so deleting one
+            // frees nothing and calling them duplicates would be a lie.
+            if n.flags & flags::HARDLINK_DUPE != 0 || n.kind != crate::scan::meta::Kind::File {
+                continue;
+            }
+            if n.self_len < crate::dupes::MIN_SIZE {
+                continue;
+            }
+            candidates.push(crate::dupes::Candidate {
+                id,
+                path: self.tree.path(id),
+                // Content identity is about the bytes in the file, so this is
+                // the one size that is never `--apparent`-dependent.
+                bytes: n.self_len,
+                mtime: n.mtime,
+            });
+        }
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::dupes::find(candidates));
+        });
+        self.dupes_rx = Some(rx);
+    }
+
+    /// Collect a finished hunt. Returns true if the view needs a redraw.
+    pub fn poll_dupes(&mut self) -> bool {
+        let Some(rx) = self.dupes_rx.as_ref() else { return false };
+        let Ok(report) = rx.try_recv() else { return false };
+        self.dupes_rx = None;
+        self.dupes = Some(report);
+        self.dupes_open.clear();
+        self.cursor = 0;
+        self.offset = 0;
+        self.mark_dirty();
+        true
     }
 
     fn has_reclaimable_ancestor(&self, id: NodeId) -> bool {

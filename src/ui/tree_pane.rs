@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::Theme;
-use crate::app::App;
+use crate::app::{App, Heading};
 use crate::format::human;
 use crate::tree::flags;
 
@@ -80,6 +80,14 @@ fn header(app: &App) -> Line<'static> {
         spans.push(Span::from(" reclaimable ").bold().reversed());
         spans.push(Span::from(" "));
     }
+    if app.dupe_view {
+        let label = match app.dupes.as_ref() {
+            Some(r) => format!(" duplicates \u{b7} {} reclaimable ", human(r.wasted())),
+            None => " duplicates \u{b7} hashing\u{2026} ".to_string(),
+        };
+        spans.push(Span::from(label).bold().reversed());
+        spans.push(Span::from(" "));
+    }
     // Rows vanishing with no explanation reads as a bug, so an active age
     // filter has to be as visible as the reclaimable view is.
     if app.age_filter != crate::app::AgeFilter::All {
@@ -97,6 +105,14 @@ fn empty_reason(app: &App) -> String {
             " nothing here is {} \u{2014} a cycles the age filter",
             app.age_filter.label()
         )
+    } else if app.dupe_view {
+        if app.dupe_hunt_running() {
+            " hashing candidates\u{2026}".to_string()
+        } else if app.dupes.is_none() {
+            " duplicates need a finished scan \u{2014} R to rescan".to_string()
+        } else {
+            " no duplicates over 1M \u{2014} d for the full tree".to_string()
+        }
     } else if app.reclaim_view {
         " nothing reclaimable here \u{2014} r for the full tree".to_string()
     } else if app.scanning() {
@@ -126,6 +142,18 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
                 &format!(
                     " \u{26a0} {unreadable} unreadable director{} not counted \u{2014} grant Full Disk Access to your terminal",
                     if unreadable == 1 { "y" } else { "ies" }
+                ),
+                width,
+            ),
+            theme.warn,
+        )));
+    }
+
+    if let Some(n) = app.dupes.as_ref().map(|r| r.unverified).filter(|n| *n > 0) {
+        out.push(Line::from(Span::styled(
+            truncate_end(
+                &format!(
+                    " \u{26a0} {n} group(s) looked identical but were not read in full \u{2014} not shown"
                 ),
                 width,
             ),
@@ -178,8 +206,11 @@ fn scroll_into_view(app: &mut App, height: usize) {
 
 fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
     let row = app.rows[i];
-    if let Some(cat) = row.header {
-        return header_line(app, theme, cat, i == app.cursor, width);
+    if let Some(h) = row.header {
+        return match h {
+            Heading::Category(cat) => category_line(app, theme, cat, i == app.cursor, width),
+            Heading::Dupes(g) => dupe_line(app, theme, g, i == app.cursor, width),
+        };
     }
     let n = app.tree.node(row.id);
     let selected = i == app.cursor;
@@ -194,9 +225,19 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
         "▸"
     };
 
-    // The pane title already carries the root's full path; repeating it here
-    // just wastes the widest row in the tree.
-    let label: &str = if row.id == app.tree.root() {
+    // In the duplicate view a bare filename is useless: copies of the same
+    // file usually share one. The path is the only thing telling them apart.
+    let dupe_label;
+    let label: &str = if app.dupe_view && row.depth > 0 {
+        dupe_label = app
+            .tree
+            .path(row.id)
+            .strip_prefix(app.tree.root_path())
+            .unwrap_or(&app.tree.path(row.id))
+            .display()
+            .to_string();
+        &dupe_label
+    } else if row.id == app.tree.root() {
         app.tree
             .root_path()
             .file_name()
@@ -251,7 +292,7 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
 
 /// A category heading in the reclaimable view, carrying the category total and
 /// the one caveat the user needs before staging all of it.
-fn header_line(app: &App, theme: &Theme, cat: crate::presets::Category, selected: bool, width: usize) -> Line<'static> {
+fn category_line(app: &App, theme: &Theme, cat: crate::presets::Category, selected: bool, width: usize) -> Line<'static> {
     let items = app.reclaim_items(cat);
     let total: u64 = items.iter().map(|id| app.tree.size(*id, app.apparent)).sum();
     let arrow = if app.reclaim_is_open(cat) { '\u{25be}' } else { '\u{25b8}' };
@@ -262,6 +303,38 @@ fn header_line(app: &App, theme: &Theme, cat: crate::presets::Category, selected
     let line = Line::from(vec![
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.dim),
+        Span::styled("\u{2500}".repeat(rule), theme.dim),
+    ]);
+    if selected { line.style(theme.selection) } else { line }
+}
+
+/// A duplicate group heading. The number that matters is not the file's size
+/// but what deleting the extra copies would give back.
+fn dupe_line(app: &App, theme: &Theme, group: usize, selected: bool, width: usize) -> Line<'static> {
+    let items = app.dupe_items(group);
+    let each = app
+        .dupes
+        .as_ref()
+        .and_then(|r| r.groups.get(group))
+        .map(|g| g.bytes_each)
+        .unwrap_or(0);
+    let wasted = each * (items.len().saturating_sub(1)) as u64;
+    let name = items
+        .first()
+        .map(|id| app.tree.node(*id).name.to_string())
+        .unwrap_or_default();
+    let arrow = if app.dupes_is_open(group) { '\u{25be}' } else { '\u{25b8}' };
+    let head = format!(
+        " {arrow} {} copies of {} \u{b7} {} each ",
+        items.len(),
+        truncate(&name, 24),
+        human(each)
+    );
+    let note = format!(" {} reclaimable ", human(wasted));
+    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let line = Line::from(vec![
+        Span::styled(head, theme.emphasis),
+        Span::styled(note, theme.bar_hot),
         Span::styled("\u{2500}".repeat(rule), theme.dim),
     ]);
     if selected { line.style(theme.selection) } else { line }

@@ -1,7 +1,9 @@
 pub mod app;
 pub mod cache;
 pub mod delete;
+pub mod dupes;
 pub mod format;
+pub mod hash;
 pub mod paths;
 pub mod platform;
 pub mod presets;

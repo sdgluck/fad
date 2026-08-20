@@ -52,6 +52,7 @@ up.
 | `x` | review and commit the staged batch |
 | `u` | undo the last committed batch |
 | `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
+| `d` | duplicate view — files whose contents are byte-for-byte equal |
 | `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
 | `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
 | `s` | cycle sort: size → count → modified → name · `R` rescan |
@@ -86,6 +87,23 @@ test is the newest *file* below an entry, not the directory's own `mtime`:
 a directory's timestamp moves every time a child is renamed, so a project
 nobody has opened in two years would otherwise look freshly touched the moment
 it was reorganised.
+
+## Duplicates
+
+`d` looks for files that exist more than once. Files are grouped by exact size
+first, which is free — the scan already knows every size. Groups of two or more
+are fingerprinted from their first and last 64K, and only what survives that is
+read end to end and hashed with SHA-256.
+
+A group is shown only once every member has been hashed in full. Same size and
+same ends is a *likely* duplicate, and inviting you to delete one on that basis
+is how a tool like this destroys your work. If the read budget runs out, the
+unverified groups are counted in a banner and never listed.
+
+Only files over 1M are considered, and hardlinked copies are skipped: they
+already share their storage, so deleting one frees nothing.
+
+`A` on a group stages every copy but the newest.
 
 ## Sizes
 

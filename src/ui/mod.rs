@@ -93,6 +93,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("/", "fuzzy filter"),
         ("r", "reclaimable view: build artifacts, caches, VM images"),
         ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),
+        ("d", "duplicate view: files whose contents are byte-for-byte equal"),
         ("s", "cycle sort: size, count, modified, name"),
         ("o / e / y", "Finder / $EDITOR / copy path"),
         ("R", "rescan the selected subtree"),

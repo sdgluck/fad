@@ -9,7 +9,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use crate::app::{App, Mode};
+use crate::app::{App, Heading, Mode};
 use crate::delete::{self, Disposal};
 use crate::tree::flags;
 use crate::ui;
@@ -51,6 +51,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
     loop {
         app.poll_scan();
         app.poll_job();
+        app.poll_dupes();
 
         let tick = if app.scanning() { SCAN_TICK } else { IDLE_TICK };
         if last_draw.elapsed() >= tick {
@@ -172,6 +173,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('u') => undo(app),
         KeyCode::Char('r') => toggle_reclaim(app),
+        KeyCode::Char('d') => toggle_dupes(app),
         KeyCode::Char('a') => {
             app.age_filter = app.age_filter.next();
             app.status = Some(format!("showing {}", app.age_filter.label()));
@@ -252,9 +254,13 @@ fn move_cursor(app: &mut App, delta: i64) {
 }
 
 fn expand(app: &mut App) {
-    // Category headings open and close like directories, and start closed.
-    if let Some(cat) = app.rows.get(app.cursor).and_then(|r| r.header) {
-        if app.reclaim_open.insert(cat) {
+    // Group headings open and close like directories, and start closed.
+    if let Some(h) = app.rows.get(app.cursor).and_then(|r| r.header) {
+        let opened = match h {
+            Heading::Category(cat) => app.reclaim_open.insert(cat),
+            Heading::Dupes(i) => app.dupes_open.insert(i),
+        };
+        if opened {
             return;
         }
         // Already open: step onto the first item, matching what expanding an
@@ -284,8 +290,11 @@ fn expand(app: &mut App) {
 }
 
 fn collapse(app: &mut App) {
-    if let Some(cat) = app.rows.get(app.cursor).and_then(|r| r.header) {
-        app.reclaim_open.remove(&cat);
+    if let Some(h) = app.rows.get(app.cursor).and_then(|r| r.header) {
+        match h {
+            Heading::Category(cat) => app.reclaim_open.remove(&cat),
+            Heading::Dupes(i) => app.dupes_open.remove(&i),
+        };
         return;
     }
     let Some(id) = app.selected() else { return };
@@ -301,9 +310,12 @@ fn collapse(app: &mut App) {
 
 fn toggle_stage(app: &mut App) {
     // A heading carries the id of the first item under it, so `space` here
-    // would stage a row the cursor is not on. `A` is the key for a category.
-    if app.rows.get(app.cursor).is_some_and(|r| r.header.is_some()) {
-        app.status = Some("A stages the whole category".into());
+    // would stage a row the cursor is not on. `A` is the key for a group.
+    if let Some(h) = app.rows.get(app.cursor).and_then(|r| r.header) {
+        app.status = Some(match h {
+            Heading::Category(_) => "A stages the whole category".into(),
+            Heading::Dupes(_) => "A stages every copy but the newest".to_string(),
+        });
         return;
     }
     let Some(id) = app.selected() else { return };
@@ -318,6 +330,7 @@ fn toggle_stage(app: &mut App) {
 
 fn toggle_reclaim(app: &mut App) {
     app.reclaim_view = !app.reclaim_view;
+    app.dupe_view = false;
     app.cursor = 0;
     app.offset = 0;
     if app.reclaim_view && app.tree.reclaimable.is_empty() {
@@ -329,10 +342,41 @@ fn toggle_reclaim(app: &mut App) {
     }
 }
 
+/// The duplicate view. Hashing is only meaningful once the walk has finished,
+/// and only starts when the user asks for it.
+fn toggle_dupes(app: &mut App) {
+    app.dupe_view = !app.dupe_view;
+    app.cursor = 0;
+    app.offset = 0;
+    if !app.dupe_view {
+        return;
+    }
+    // The reclaimable view is the other list-of-groups screen; showing both at
+    // once would mean two different things by the same heading.
+    app.reclaim_view = false;
+    if app.dupes.is_some() || app.dupe_hunt_running() {
+        return;
+    }
+    if app.scanning() {
+        app.status = Some("still scanning \u{2014} duplicates need the whole tree".into());
+        return;
+    }
+    app.start_dupe_hunt();
+    app.status = Some("hashing candidates\u{2026}".into());
+}
+
 fn stage_children(app: &mut App) {
-    // On a category heading, `A` means the whole category.
-    if let Some(cat) = app.rows.get(app.cursor).and_then(|r| r.header) {
-        let items = app.reclaim_items(cat);
+    // On a category heading, `A` means the whole category. On a duplicate
+    // group it means every copy *but one* — staging all of them would delete
+    // the file, which is never what "these are duplicates" is asking for.
+    if let Some(h) = app.rows.get(app.cursor).and_then(|r| r.header) {
+        let items = match h {
+            Heading::Category(cat) => app.reclaim_items(cat),
+            Heading::Dupes(i) => app.dupe_items(i).into_iter().skip(1).collect(),
+        };
+        if items.is_empty() {
+            return;
+        }
         let all = items.iter().all(|id| app.staged.contains(id));
         for id in items {
             if all { app.staged.remove(&id); } else { app.stage(id); }
