@@ -85,6 +85,12 @@ pub struct Breakdown {
     at: Instant,
 }
 
+/// One line of the staging basket.
+pub enum BasketRow {
+    Group { cat: Option<Category>, count: usize, bytes: u64 },
+    Item(NodeId),
+}
+
 pub struct ExtRow {
     pub ext: String,
     pub bytes: u64,
@@ -134,6 +140,8 @@ pub enum Mode {
     /// Typing into the fuzzy filter.
     Filter,
     Help,
+    /// The staging basket: the whole batch on one screen, editable.
+    Basket,
     /// Reviewing the staged batch before committing it.
     Confirm,
     /// A batch is being deleted, or has just finished.
@@ -198,6 +206,8 @@ pub struct App {
     /// Capture the mouse. Off makes the terminal's own text selection work
     /// again, which is why it is a flag and not an assumption.
     pub mouse: bool,
+    /// Index into `basket_rows`.
+    pub basket_cursor: usize,
     /// Where the tree list was drawn last frame. Clicks arrive as terminal
     /// coordinates and mean nothing without it.
     pub tree_list: ratatui::layout::Rect,
@@ -299,6 +309,7 @@ impl App {
             breakdown: None,
             age_filter: AgeFilter::All,
             mouse: true,
+            basket_cursor: 0,
             tree_list: ratatui::layout::Rect::ZERO,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             disposal: Disposal::Trash,
@@ -785,6 +796,42 @@ impl App {
             at_bytes: self.tree.size(id, self.apparent),
             at: Instant::now(),
         }
+    }
+
+    /// The basket, grouped by what the built-in rules make of each item. A
+    /// batch of forty directories is unreviewable as a flat list; the same
+    /// forty under "build artifacts" and "app caches" can be read at a glance.
+    pub fn basket_rows(&self) -> Vec<BasketRow> {
+        let mut groups: Vec<(Option<Category>, Vec<NodeId>)> = Vec::new();
+        for cat in Category::all().into_iter().map(Some).chain([None]) {
+            let mut items: Vec<NodeId> = self
+                .staged
+                .iter()
+                .copied()
+                .filter(|id| self.tree.node(*id).preset == cat)
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            items.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.size(*id, self.apparent)));
+            groups.push((cat, items));
+        }
+
+        let mut rows = Vec::new();
+        for (cat, items) in groups {
+            let bytes = items.iter().map(|id| self.tree.size(*id, self.apparent)).sum();
+            rows.push(BasketRow::Group { cat, count: items.len(), bytes });
+            rows.extend(items.into_iter().map(BasketRow::Item));
+        }
+        rows
+    }
+
+    /// Free space once this batch lands, and the total, for the one number the
+    /// user actually came for.
+    pub fn after_commit(&self) -> Option<(u64, u64)> {
+        let root = self.tree.root_path();
+        let free = crate::platform::free_space(root)?;
+        Some((free.saturating_add(self.staged_bytes()), free))
     }
 
     pub fn staged_bytes(&self) -> u64 {

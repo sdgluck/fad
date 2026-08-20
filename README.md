@@ -49,7 +49,7 @@ up.
 | `j` `k` `↑` `↓` | move · `g` `G` first/last · `ctrl-d` `ctrl-u` jump 10 lines |
 | `l` `→` `enter` | expand · `h` `←` collapse, or jump to the parent |
 | `space` | stage / unstage · `A` stage everything in this directory or category |
-| `x` | review and commit the staged batch |
+| `x` | open the staging basket — review, unstage, commit |
 | `u` | undo the last committed batch |
 | `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
 | `d` | duplicate view — files whose contents are byte-for-byte equal |
@@ -64,8 +64,13 @@ it, click the left edge to stage it, and use the wheel to move the selection.
 Capturing the mouse takes over your terminal's own text selection, so
 `--no-mouse` turns it off.
 
+In the basket: `space` unstages the selected item, or the whole group when the
+cursor is on a heading; `C` clears the batch; `enter` goes on to the
+confirmation. It also reports how much free space you will have when the batch
+lands, which is the number you came for.
+
 In the confirmation screen: `D` toggles between trash and permanent delete,
-`enter` or `y` commits, `esc` or `q` cancels.
+`enter` or `y` commits, `esc` or `q` goes back to the basket.
 
 ### Flags
 

@@ -96,6 +96,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
             app.mode = Mode::Normal;
             app.mark_dirty();
         }
+        Mode::Basket => basket_key(app, k),
         Mode::Confirm => confirm_key(app, k),
         Mode::Deleting => deleting_key(app, k),
         Mode::Normal => normal_key(app, k),
@@ -155,12 +156,59 @@ fn click(app: &mut App, column: u16, row: u16) {
     }
 }
 
+fn basket_key(app: &mut App, k: KeyEvent) {
+    use crate::app::BasketRow;
+
+    let rows = app.basket_rows();
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => app.mode = Mode::Normal,
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.basket_cursor = (app.basket_cursor + 1).min(rows.len().saturating_sub(1))
+        }
+        KeyCode::Char('k') | KeyCode::Up => app.basket_cursor = app.basket_cursor.saturating_sub(1),
+        KeyCode::Char('g') => app.basket_cursor = 0,
+        KeyCode::Char('G') => app.basket_cursor = rows.len().saturating_sub(1),
+        // Unstaging a whole group from its heading is the mirror of `A`, which
+        // is how most of a batch this size got staged in the first place.
+        KeyCode::Char(' ') | KeyCode::Backspace | KeyCode::Char('d') => {
+            match rows.get(app.basket_cursor) {
+                Some(BasketRow::Item(id)) => {
+                    app.staged.remove(id);
+                }
+                Some(BasketRow::Group { cat, .. }) => {
+                    let cat = *cat;
+                    app.staged.retain(|id| app.tree.node(*id).preset != cat);
+                }
+                None => {}
+            }
+            let len = app.basket_rows().len();
+            app.basket_cursor = app.basket_cursor.min(len.saturating_sub(1));
+            if app.staged.is_empty() {
+                app.mode = Mode::Normal;
+            }
+        }
+        KeyCode::Char('C') => {
+            app.staged.clear();
+            app.mode = Mode::Normal;
+            app.status = Some("batch cleared".into());
+        }
+        KeyCode::Enter | KeyCode::Char('y') => {
+            app.review_batch();
+            app.mode = Mode::Confirm;
+        }
+        _ => {}
+    }
+    app.mark_dirty();
+}
+
 fn confirm_key(app: &mut App, k: KeyEvent) {
     match k.code {
+        // Back to the basket, not out of the flow entirely: cancelling a
+        // confirmation almost always means "let me fix one entry".
         KeyCode::Esc | KeyCode::Char('q') => {
             app.disposal = Disposal::Trash;
             app.refused.clear();
-            app.mode = Mode::Normal;
+            app.mode = if app.staged.is_empty() { Mode::Normal } else { Mode::Basket };
         }
         // Uppercase on purpose: a permanent delete should never be one
         // relaxed keystroke away from a recoverable one.
@@ -231,8 +279,8 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             if app.staged.is_empty() {
                 app.status = Some("nothing staged".into());
             } else {
-                app.review_batch();
-                app.mode = Mode::Confirm;
+                app.basket_cursor = 0;
+                app.mode = Mode::Basket;
             }
         }
         KeyCode::Char('u') => undo(app),

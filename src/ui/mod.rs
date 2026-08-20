@@ -1,6 +1,7 @@
 //! Rendering. Two panes: the tree on the left, everything about the selection
 //! on the right.
 
+mod basket;
 mod detail_pane;
 mod modal;
 mod theme;
@@ -16,6 +17,22 @@ use crate::app::{App, Mode};
 use crate::format::human;
 
 pub use theme::Theme;
+
+/// Keep the start and the end of a path, drop the middle: both halves carry
+/// information, the middle rarely does.
+pub(crate) fn compress(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= width {
+        return s.to_string();
+    }
+    let tail = width * 2 / 3;
+    let head = width.saturating_sub(tail + 1);
+    format!(
+        "{}\u{2026}{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let theme = Theme::default();
@@ -39,6 +56,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.mode {
         Mode::Help => draw_help(f, &theme, area),
+        Mode::Basket => basket::draw(f, app, &theme, area),
         Mode::Confirm => modal::draw_confirm(f, app, &theme, area),
         Mode::Deleting => modal::draw_progress(f, app, &theme, area),
         _ => {}
@@ -67,7 +85,7 @@ fn draw_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 spans.push(Span::styled(msg.clone(), theme.emphasis));
             } else {
                 spans.push(Span::styled(
-                    "space stage \u{b7} x commit \u{b7} r reclaimable \u{b7} / filter \u{b7} s sort \u{b7} ? help \u{b7} q quit",
+                    "space stage \u{b7} x basket \u{b7} r reclaimable \u{b7} / filter \u{b7} s sort \u{b7} ? help \u{b7} q quit",
                     theme.dim,
                 ));
             }
@@ -88,7 +106,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("h / \u{2190}", "collapse, or jump to parent"),
         ("space", "stage / unstage"),
         ("A", "stage every child of this directory"),
-        ("x", "commit the staged batch"),
+        ("x", "open the staging basket: review, edit, commit"),
         ("u", "undo the last committed batch"),
         ("/", "fuzzy filter"),
         ("r", "reclaimable view: build artifacts, caches, VM images"),

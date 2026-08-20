@@ -27,6 +27,17 @@ pub fn reveal(path: &Path) -> io::Result<&'static str> {
     }
 }
 
+/// Free bytes on the filesystem holding `path`, as the user sees them: blocks
+/// available to an unprivileged process, not the reserved total.
+pub fn free_space(path: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    (st.f_bavail as u64).checked_mul(st.f_frsize as u64)
+}
+
 /// Copy text to the system clipboard.
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]

@@ -14,6 +14,7 @@ use super::Theme;
 use crate::app::App;
 use crate::delete::Disposal;
 use crate::format::human;
+use super::compress;
 
 pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let items = app.batch_items();
@@ -150,20 +151,4 @@ fn popup(f: &mut Frame, theme: &Theme, area: Rect, title: &str, lines: Vec<Line>
         ),
         rect,
     );
-}
-
-/// Keep the start and the end of a path, drop the middle: both halves carry
-/// information, the middle rarely does.
-fn compress(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width {
-        return s.to_string();
-    }
-    let tail = width * 2 / 3;
-    let head = width - tail - 1;
-    format!(
-        "{}…{}",
-        chars[..head].iter().collect::<String>(),
-        chars[chars.len() - tail..].iter().collect::<String>()
-    )
 }

@@ -196,3 +196,47 @@ fn the_filter_is_smart_case() {
     // A capital the name does not have means you meant it.
     assert!(!rows_for(&mut app, "MOVIES").iter().any(|n| n == "Movies"));
 }
+
+/// The basket is the last place a batch can be corrected, so it has to show
+/// the whole batch — grouped, but with nothing dropped.
+#[test]
+fn the_basket_groups_the_batch_and_accounts_for_all_of_it() {
+    use fad::app::BasketRow;
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    let target = find(&app.tree, "dev/fad/target");
+    let caches = find(&app.tree, "Library/Caches");
+    let movies = find(&app.tree, "Movies/holiday.mov");
+    for id in [target, caches, movies] {
+        app.stage(id);
+    }
+
+    let rows = app.basket_rows();
+    let items: Vec<_> = rows
+        .iter()
+        .filter_map(|r| match r {
+            BasketRow::Item(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(items.len(), 3, "the basket must list every staged item");
+
+    let groups: Vec<_> = rows
+        .iter()
+        .filter_map(|r| match r {
+            BasketRow::Group { cat, count, bytes } => Some((*cat, *count, *bytes)),
+            _ => None,
+        })
+        .collect();
+    // An app cache, and two things the presets know nothing about — `target`
+    // has no `Cargo.toml` beside it, so it is not a build directory. Two
+    // headings, and the subtotals have to add up to the batch.
+    assert_eq!(groups.len(), 2, "expected one heading per category present");
+    let total: u64 = groups.iter().map(|(_, _, b)| b).sum();
+    assert_eq!(total, app.staged_bytes(), "group subtotals must account for the batch");
+    let uncategorised = groups.iter().find(|(c, _, _)| c.is_none()).expect("uncategorised items need a home");
+    assert_eq!(uncategorised.1, 2);
+}
