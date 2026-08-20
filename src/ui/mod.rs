@@ -124,7 +124,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("q", "quit"),
     ];
 
-    let w = 58u16.min(area.width.saturating_sub(4));
+    let w = 66u16.min(area.width.saturating_sub(4));
     let h = (KEYS.len() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
