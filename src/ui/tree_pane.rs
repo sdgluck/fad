@@ -186,6 +186,22 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
         )));
     }
 
+    // Trashing reclaims nothing until the trash goes out. A session that has
+    // just "freed" 40G and changed nothing on the volume has to say so.
+    let (n, bytes) = app.trash_pending;
+    if n > 0 {
+        out.push(Line::from(Span::styled(
+            truncate_end(
+                &format!(
+                    " \u{26a0} {} in the trash from {n} item(s) \u{2014} not reclaimed until you empty it",
+                    human(bytes)
+                ),
+                width,
+            ),
+            theme.warn,
+        )));
+    }
+
     let unreadable = app.tree.unreadable_count;
     if unreadable > 0 {
         out.push(Line::from(Span::styled(

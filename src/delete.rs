@@ -203,6 +203,31 @@ pub fn read_journal() -> Vec<Batch> {
     text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
+impl Batch {
+    pub fn bytes(&self) -> u64 {
+        self.entries.iter().map(|e| e.bytes).sum()
+    }
+
+    /// The entries still sitting in the trash. An entry the user has since
+    /// emptied is gone for good and must not be counted as recoverable.
+    pub fn recoverable(&self) -> (usize, u64) {
+        self.entries
+            .iter()
+            .filter(|e| e.to.exists())
+            .fold((0, 0), |(n, b), e| (n + 1, b + e.bytes))
+    }
+}
+
+/// What fad has put in the trash and not yet seen emptied. Deleting to the
+/// trash reclaims nothing until the trash goes out, which is a real enough
+/// footgun to say out loud.
+pub fn still_in_trash() -> (usize, u64) {
+    read_journal()
+        .iter()
+        .map(Batch::recoverable)
+        .fold((0, 0), |(n, b), (en, eb)| (n + en, b + eb))
+}
+
 pub struct UndoReport {
     pub restored: usize,
     pub bytes: u64,
@@ -211,8 +236,19 @@ pub struct UndoReport {
 
 /// Move the most recent trashed batch back where it came from.
 pub fn undo_last() -> Result<UndoReport, String> {
+    let n = read_journal().len();
+    undo_batch(n.checked_sub(1).ok_or("nothing to undo")?)
+}
+
+/// Put one batch back, by its index in `read_journal`. The journal is a stack
+/// of the last twenty commits, and there is no reason the only one you can
+/// reach is the top of it.
+pub fn undo_batch(index: usize) -> Result<UndoReport, String> {
     let mut batches = read_journal();
-    let batch = batches.pop().ok_or("nothing to undo")?;
+    if index >= batches.len() {
+        return Err("nothing to undo".into());
+    }
+    let batch = batches.remove(index);
 
     let mut report = UndoReport { restored: 0, bytes: 0, skipped: Vec::new() };
     for e in &batch.entries {

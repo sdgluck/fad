@@ -56,6 +56,7 @@ sign of movement reads as a hang.
 | `space` | stage / unstage · `A` stage everything in this directory or category |
 | `x` | open the staging basket — review, unstage, commit |
 | `u` | undo the last committed batch |
+| `U` | undo history — put any of the last 20 batches back |
 | `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
 | `d` | duplicate view — files whose contents are byte-for-byte equal |
 | `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
@@ -188,6 +189,13 @@ delete, which cannot be undone.
 |---|---|
 | macOS | the Finder trash — "Put Back" works |
 | Linux | the FreeDesktop.org trash: `~/.local/share/Trash`, or `$topdir/.Trash-$uid` for items on another filesystem |
+
+The journal keeps the last twenty committed batches. `u` puts the most recent
+one back; `U` opens the history, where any of them can be restored, and says
+which ones have since been emptied out of the trash and cannot be.
+
+Trashing reclaims nothing until the trash goes out, so a banner reports what
+`fad` has put there and not yet seen emptied.
 
 These paths are always refused: `/`, your home directory, system directories
 (`/System` and `/Users` on macOS; `/usr`, `/etc`, `/home` and friends on Linux),

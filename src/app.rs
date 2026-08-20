@@ -146,6 +146,8 @@ pub enum Mode {
     Help,
     /// The staging basket: the whole batch on one screen, editable.
     Basket,
+    /// The undo journal: every batch this machine still remembers.
+    History,
     /// Reviewing the staged batch before committing it.
     Confirm,
     /// A batch is being deleted, or has just finished.
@@ -227,6 +229,14 @@ pub struct App {
     pub mouse: bool,
     /// Index into `basket_rows`.
     pub basket_cursor: usize,
+    /// The undo journal, newest first, as of the last time it was opened.
+    pub history: Vec<delete::Batch>,
+    /// Index into `history`.
+    pub history_cursor: usize,
+    /// What fad has trashed and not yet seen emptied. Trashing reclaims nothing
+    /// until the trash goes out, and a headline that ignores that is a lie by
+    /// omission.
+    pub trash_pending: (usize, u64),
     /// Where the tree list was drawn last frame. Clicks arrive as terminal
     /// coordinates and mean nothing without it.
     pub tree_list: ratatui::layout::Rect,
@@ -354,6 +364,9 @@ impl App {
             ignored: (0, 0),
             mouse: true,
             basket_cursor: 0,
+            history: Vec::new(),
+            history_cursor: 0,
+            trash_pending: delete::still_in_trash(),
             tree_list: ratatui::layout::Rect::ZERO,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             disposal: Disposal::Trash,
@@ -1029,7 +1042,17 @@ impl App {
         true
     }
 
+    /// Reread the journal. Called whenever a batch lands or is put back, which
+    /// are the only two things that change it.
+    pub fn refresh_history(&mut self) {
+        self.history = delete::read_journal();
+        self.history.reverse();
+        self.history_cursor = self.history_cursor.min(self.history.len().saturating_sub(1));
+        self.trash_pending = delete::still_in_trash();
+    }
+
     pub fn finish_job(&mut self) {
+        self.refresh_history();
         self.job = None;
         self.disposal = Disposal::Trash;
         self.refused.clear();

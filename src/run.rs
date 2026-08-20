@@ -97,6 +97,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
             app.mark_dirty();
         }
         Mode::Basket => basket_key(app, k),
+        Mode::History => history_key(app, k),
         Mode::Confirm => confirm_key(app, k),
         Mode::Deleting => deleting_key(app, k),
         Mode::Normal => normal_key(app, k),
@@ -154,6 +155,38 @@ fn click(app: &mut App, column: u16, row: u16) {
         };
         if open { collapse(app) } else { expand(app) }
     }
+}
+
+/// The journal. `u` reaches the top of the stack; this reaches the rest of it.
+fn history_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('U') => app.mode = Mode::Normal,
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.history_cursor =
+                (app.history_cursor + 1).min(app.history.len().saturating_sub(1))
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.history_cursor = app.history_cursor.saturating_sub(1)
+        }
+        KeyCode::Enter | KeyCode::Char('u') => restore_selected(app),
+        _ => {}
+    }
+    app.mark_dirty();
+}
+
+fn restore_selected(app: &mut App) {
+    if app.history.is_empty() {
+        return;
+    }
+    // `history` is newest first; the journal is oldest first.
+    let index = app.history.len() - 1 - app.history_cursor;
+    let outcome = delete::undo_batch(index);
+    app.refresh_history();
+    app.mode = Mode::Normal;
+    app.status = Some(match outcome {
+        Ok(r) => undo_message(&r),
+        Err(e) => e,
+    });
 }
 
 fn basket_key(app: &mut App, k: KeyEvent) {
@@ -284,6 +317,11 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             }
         }
         KeyCode::Char('u') => undo(app),
+        KeyCode::Char('U') => {
+            app.refresh_history();
+            app.history_cursor = 0;
+            app.mode = Mode::History;
+        }
         KeyCode::Char('r') => toggle_reclaim(app),
         KeyCode::Char('d') => toggle_dupes(app),
         KeyCode::Char('a') => {
@@ -365,20 +403,24 @@ fn rescan(app: &mut App) {
 }
 
 fn undo(app: &mut App) {
-    match delete::undo_last() {
-        Ok(r) if r.restored == 0 && r.skipped.is_empty() => {
-            app.status = Some("nothing to undo".into())
-        }
-        Ok(r) => {
-            let mut msg = format!("restored {} item(s)", r.restored);
-            if !r.skipped.is_empty() {
-                msg.push_str(&format!(", {} could not be put back", r.skipped.len()));
-            }
-            msg.push_str(" — press R to rescan");
-            app.status = Some(msg);
-        }
-        Err(e) => app.status = Some(e),
+    let outcome = delete::undo_last();
+    app.refresh_history();
+    app.status = Some(match outcome {
+        Ok(r) => undo_message(&r),
+        Err(e) => e,
+    });
+}
+
+fn undo_message(r: &delete::UndoReport) -> String {
+    if r.restored == 0 && r.skipped.is_empty() {
+        return "nothing to undo".into();
     }
+    let mut msg = format!("restored {} item(s)", r.restored);
+    if !r.skipped.is_empty() {
+        msg.push_str(&format!(", {} could not be put back", r.skipped.len()));
+    }
+    msg.push_str(" \u{2014} press R to rescan");
+    msg
 }
 
 fn move_cursor(app: &mut App, delta: i64) {

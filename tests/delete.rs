@@ -7,6 +7,18 @@ use fad::delete::{self, Disposal, Job};
 
 mod common;
 
+/// The journal lands just after the last outcome does. Wait for the write
+/// rather than assume the two are the same moment.
+fn wait_for_journal(batches: usize) {
+    for _ in 0..2000 {
+        if delete::read_journal().len() >= batches {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("journal never recorded {batches} batch(es)");
+}
+
 fn wait(job: &mut Job) {
     for _ in 0..2000 {
         job.poll();
@@ -99,4 +111,47 @@ fn guard_refuses_the_home_directory() {
     common::isolate(&home);
 
     assert!(delete::guard(&home, &home.join("project")).is_err());
+}
+
+/// `u` reaches the top of the stack; the journal keeps twenty. Reaching past
+/// the top has to restore the batch you picked and leave the others alone.
+#[test]
+fn any_remembered_batch_can_be_put_back() {
+    let _guard = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let make = |name: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(&p, vec![0u8; 1024]).unwrap();
+        p
+    };
+
+    // Three separate commits, so the journal has three batches. The journal is
+    // written after the last outcome is sent, so finishing the job is not the
+    // same moment as the batch being recorded.
+    for (i, name) in ["first", "second", "third"].iter().enumerate() {
+        let p = make(name);
+        let mut job = Job::start(vec![(p, 1024)], Disposal::Trash);
+        wait(&mut job);
+        wait_for_journal(i + 1);
+    }
+
+    let before = delete::read_journal();
+    assert_eq!(before.len(), 3, "expected one batch per commit");
+    let (_, trashed) = delete::still_in_trash();
+    assert_eq!(trashed, 3 * 1024, "the trash total has to cover every batch");
+
+    // The oldest, not the newest.
+    let report = delete::undo_batch(0).expect("undo failed");
+    assert_eq!(report.restored, 1);
+    assert!(dir.path().join("first").exists(), "the chosen batch did not come back");
+    assert!(!dir.path().join("third").exists(), "an untouched batch was restored too");
+
+    let after = delete::read_journal();
+    assert_eq!(after.len(), 2, "the restored batch should leave the journal");
+    assert!(
+        after.iter().all(|b| b.entries.iter().all(|e| !e.from.ends_with("first"))),
+        "the restored batch is still on offer"
+    );
 }
