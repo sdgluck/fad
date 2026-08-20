@@ -451,6 +451,21 @@ impl Tree {
             .unwrap_or(0)
     }
 
+    /// What rebuilds this entry, when it is a build directory we can name a
+    /// command for. The siblings come from the arena rather than a fresh
+    /// `readdir`: the scan already read that directory, and this is called on
+    /// whatever the cursor is sitting on.
+    pub fn rebuild_command(&self, id: NodeId) -> Option<&'static str> {
+        let parent = self.node(id).parent?;
+        let siblings: std::collections::HashSet<&str> = self
+            .node(parent)
+            .children
+            .iter()
+            .map(|c| self.node(*c).name.as_ref())
+            .collect();
+        presets::rebuild_command(&self.node(id).name, &siblings)
+    }
+
     /// The subtree size to report: allocated blocks, or `st_size` under
     /// `--apparent`. Everything that shows or ranks a size goes through here,
     /// so the flag cannot end up honoured in one pane and ignored in another.

@@ -78,6 +78,7 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --cross-device    follow mount points into other filesystems
 --cloud           descend into iCloud/Dropbox/OneDrive folders
 --apparent        report st_size instead of allocated blocks
+--reclaim         open in the reclaimable view; with --json, print that set
 --json            dump the ranked tree as JSON instead of opening the UI
 --min-size 100M   hide entries below a threshold (--json)
 --depth N         how deep to print (--json, default 2)
@@ -98,6 +99,24 @@ test is the newest *file* below an entry, not the directory's own `mtime`:
 a directory's timestamp moves every time a child is renamed, so a project
 nobody has opened in two years would otherwise look freshly touched the moment
 it was reorganised.
+
+## Reclaimable
+
+`r` shows only what the built-in rules recognise: build artifacts, package
+caches, app caches and VM images, grouped by category.
+
+A build directory is matched against its siblings, never its name alone — a
+`target` is only a Rust build directory when there is a `Cargo.toml` next to it.
+Having proved which tool made it, `fad` can also say what puts it back, so the
+detail pane shows `cargo build` or `npm install` rather than a generic promise
+that your next build will handle it.
+
+`fad --reclaim --json` prints the same set for a script, each entry carrying its
+path, its size, and that restore command:
+
+```sh
+fad --reclaim --json ~/dev | jq -r '.categories[].items[] | "\(.size)\t\(.path)"'
+```
 
 ## Duplicates
 

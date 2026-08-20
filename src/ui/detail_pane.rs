@@ -68,6 +68,19 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
     lines.push(Line::from(Span::styled(age(n.mtime), theme.dim)));
 
+    // What it costs to get this back. The generic per-category note is a
+    // reassurance; the command is an answer.
+    if let Some(cat) = n.preset {
+        lines.push(Line::from(""));
+        match app.tree.rebuild_command(id) {
+            Some(cmd) => {
+                lines.push(Line::from(Span::styled("restore with", theme.dim)));
+                lines.push(Line::from(Span::styled(cmd.to_string(), theme.emphasis)));
+            }
+            None => lines.push(Line::from(Span::styled(cat.note(), theme.dim))),
+        }
+    }
+
     if n.flags & flags::CLOUD != 0 {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(

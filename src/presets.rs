@@ -47,19 +47,28 @@ impl Category {
     }
 }
 
-/// A build directory and the marker file that proves what it is.
-const BUILD_DIRS: &[(&str, &[&str])] = &[
-    ("node_modules", &["package.json"]),
-    ("target", &["Cargo.toml"]),
-    ("build", &["CMakeLists.txt", "build.gradle", "build.gradle.kts"]),
-    (".venv", &["pyproject.toml", "requirements.txt", "setup.py"]),
-    ("venv", &["pyproject.toml", "requirements.txt", "setup.py"]),
-    ("Pods", &["Podfile"]),
-    ("vendor", &["composer.json", "Gemfile"]),
-    ("_build", &["dune-project", "rebar.config"]),
-    ("dist-newstyle", &["cabal.project"]),
-    ("zig-cache", &["build.zig"]),
-    ("zig-out", &["build.zig"]),
+/// A build directory, the marker file that proves what it is, and the command
+/// that puts it back.
+///
+/// The third column is the whole reason the marker is checked by name rather
+/// than by "does a build system live here": having proved which tool made this
+/// directory, we can tell the user exactly what to run to get it back. "Rebuilt
+/// by your next build" is reassurance; `cargo build` is an answer.
+const BUILD_DIRS: &[(&str, &[&str], &str)] = &[
+    ("node_modules", &["package.json"], "npm install"),
+    ("target", &["Cargo.toml"], "cargo build"),
+    ("build", &["CMakeLists.txt"], "cmake --build build"),
+    ("build", &["build.gradle", "build.gradle.kts"], "./gradlew build"),
+    (".venv", &["pyproject.toml", "requirements.txt", "setup.py"], "python -m venv .venv"),
+    ("venv", &["pyproject.toml", "requirements.txt", "setup.py"], "python -m venv venv"),
+    ("Pods", &["Podfile"], "pod install"),
+    ("vendor", &["composer.json"], "composer install"),
+    ("vendor", &["Gemfile"], "bundle install"),
+    ("_build", &["dune-project"], "dune build"),
+    ("_build", &["rebar.config"], "rebar3 compile"),
+    ("dist-newstyle", &["cabal.project"], "cabal build"),
+    ("zig-cache", &["build.zig"], "zig build"),
+    ("zig-out", &["build.zig"], "zig build"),
 ];
 
 /// Directory names that mean the same thing wherever they appear.
@@ -89,6 +98,16 @@ const ALWAYS: &[(&str, Category)] = &[
 /// libvirt's `qcow2` on Linux, and the VirtualBox/VMware formats on both.
 const IMAGE_EXTS: &[&str] = &["raw", "qcow2", "vmdk", "vdi", "img", "sparsebundle", "vhd", "vhdx"];
 
+/// The command that rebuilds this directory, for the entries we can name one
+/// for. Same sibling test as `classify`, so the answer is the tool that
+/// actually made it rather than a guess from the directory's name.
+pub fn rebuild_command(name: &str, siblings: &HashSet<&str>) -> Option<&'static str> {
+    BUILD_DIRS
+        .iter()
+        .find(|(dir, markers, _)| *dir == name && markers.iter().any(|m| siblings.contains(m)))
+        .map(|(_, _, cmd)| *cmd)
+}
+
 /// Classify one entry, given the names of everything beside it in the same
 /// directory. `parent_name` disambiguates the generic names: a `registry`
 /// directory only means Cargo's inside `.cargo`.
@@ -108,7 +127,7 @@ pub fn classify(
         return None;
     }
 
-    for (dir, markers) in BUILD_DIRS {
+    for (dir, markers, _) in BUILD_DIRS {
         if name == *dir && markers.iter().any(|m| siblings.contains(m)) {
             return Some(Category::BuildArtifact);
         }

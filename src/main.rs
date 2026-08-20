@@ -7,6 +7,7 @@ use fad::format::human;
 use fad::run;
 use fad::scan::Scan;
 use fad::scan::walk::{ScanOpts, Skip};
+use fad::presets::Category;
 use fad::tree::{NodeId, Tree};
 
 /// Find and delete what is eating your disk.
@@ -41,6 +42,12 @@ struct Args {
     /// Dump the ranked tree as JSON and exit instead of opening the UI.
     #[arg(long)]
     json: bool,
+
+    /// Only what the built-in rules consider reclaimable: build artifacts,
+    /// package caches, app caches, VM images. Opens the UI in that view, or
+    /// with --json prints the set, grouped by category.
+    #[arg(long)]
+    reclaim: bool,
 
     /// Ignore any saved snapshot and always walk from scratch.
     #[arg(long)]
@@ -103,13 +110,18 @@ fn main() {
     if args.json {
         scan.finish(&mut tree);
         tree.sort_all_by_size(args.apparent);
-        print_json(&tree, &args);
+        if args.reclaim {
+            print_reclaim_json(&tree, &args);
+        } else {
+            print_json(&tree, &args);
+        }
         return;
     }
 
     let mut app = App::new(tree, scan, opts);
     app.apparent = args.apparent;
     app.mouse = !args.no_mouse;
+    app.reclaim_view = args.reclaim;
     if !args.no_cache {
         app.load_snapshot_async();
     }
@@ -157,6 +169,76 @@ fn print_json(tree: &Tree, args: &Args) {
             eprintln!("       {}", p.display());
         }
     }
+}
+
+/// The reclaimable set, grouped by category and ranked. Shaped for a script:
+/// every entry carries the path, the size, and — where we can name one — the
+/// command that puts it back, so a cleanup can be reviewed before it is run.
+fn print_reclaim_json(tree: &Tree, args: &Args) {
+    let mut cats = Vec::new();
+    for cat in Category::all() {
+        let mut items: Vec<NodeId> = tree
+            .reclaimable
+            .iter()
+            .copied()
+            .filter(|id| tree.node(*id).preset == Some(cat))
+            // A `node_modules` inside a `node_modules` is already covered by
+            // its ancestor; listing both would double the headline total.
+            .filter(|id| !has_reclaimable_ancestor(tree, *id))
+            .filter(|id| tree.size(*id, args.apparent) >= args.min_size)
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        items.sort_unstable_by_key(|id| std::cmp::Reverse(tree.size(*id, args.apparent)));
+
+        let total: u64 = items.iter().map(|id| tree.size(*id, args.apparent)).sum();
+        let entries: Vec<_> = items
+            .iter()
+            .map(|id| {
+                let bytes = tree.size(*id, args.apparent);
+                let mut v = serde_json::json!({
+                    "path": tree.path(*id),
+                    "bytes": bytes,
+                    "size": human(bytes),
+                });
+                if let Some(cmd) = tree.rebuild_command(*id) {
+                    v["restore_with"] = serde_json::Value::String(cmd.to_string());
+                }
+                v
+            })
+            .collect();
+        cats.push(serde_json::json!({
+            "category": cat.label(),
+            "note": cat.note(),
+            "bytes": total,
+            "size": human(total),
+            "items": entries,
+        }));
+    }
+
+    let total: u64 = cats.iter().map(|c| c["bytes"].as_u64().unwrap_or(0)).sum();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "root": tree.root_path(),
+            "bytes": total,
+            "size": human(total),
+            "categories": cats,
+        }))
+        .unwrap()
+    );
+}
+
+fn has_reclaimable_ancestor(tree: &Tree, id: NodeId) -> bool {
+    let mut cur = tree.node(id).parent;
+    while let Some(p) = cur {
+        if tree.node(p).preset.is_some() {
+            return true;
+        }
+        cur = tree.node(p).parent;
+    }
+    false
 }
 
 fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::Value {
