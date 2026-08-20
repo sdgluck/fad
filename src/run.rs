@@ -3,7 +3,10 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -21,26 +24,33 @@ const IDLE_TICK: Duration = Duration::from_millis(250);
 
 /// Runs the UI and hands back the tree, but only if it is worth persisting.
 pub fn run(mut app: App) -> io::Result<Option<crate::tree::Tree>> {
-    let mut terminal = enter()?;
+    let mouse = app.mouse;
+    let mut terminal = enter(mouse)?;
     let result = event_loop(&mut terminal, &mut app);
     // Restore the terminal first: whatever went wrong, the user should not be
     // left staring at a broken shell.
-    leave(&mut terminal)?;
+    leave(&mut terminal, mouse)?;
     result?;
     Ok(app.tree_is_complete().then_some(app.tree))
 }
 
-fn enter() -> io::Result<ratatui::DefaultTerminal> {
+fn enter(mouse: bool) -> io::Result<ratatui::DefaultTerminal> {
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
+    if mouse {
+        execute!(out, EnableMouseCapture)?;
+    }
     let backend = ratatui::backend::CrosstermBackend::new(out);
     let terminal = ratatui::Terminal::new(backend)?;
     Ok(terminal)
 }
 
-fn leave(terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+fn leave(terminal: &mut ratatui::DefaultTerminal, mouse: bool) -> io::Result<()> {
     disable_raw_mode()?;
+    if mouse {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
@@ -63,6 +73,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
         if event::poll(tick)? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
+                Event::Mouse(m) => on_mouse(app, m),
                 Event::Resize(_, _) => app.mark_dirty(),
                 _ => {}
             }
@@ -88,6 +99,59 @@ fn on_key(app: &mut App, k: KeyEvent) {
         Mode::Confirm => confirm_key(app, k),
         Mode::Deleting => deleting_key(app, k),
         Mode::Normal => normal_key(app, k),
+    }
+}
+
+/// Clicks and the wheel. A modal owns the screen while it is up, so the mouse
+/// does nothing there rather than quietly moving a selection underneath it.
+fn on_mouse(app: &mut App, m: MouseEvent) {
+    if app.mode != Mode::Normal {
+        return;
+    }
+    match m.kind {
+        // Move the cursor rather than the viewport. The detail pane follows the
+        // selection, so scrolling the two apart would leave the right-hand pane
+        // describing something off screen.
+        MouseEventKind::ScrollDown => move_cursor(app, 3),
+        MouseEventKind::ScrollUp => move_cursor(app, -3),
+        MouseEventKind::Down(MouseButton::Left) => click(app, m.column, m.row),
+        _ => return,
+    }
+    app.mark_dirty();
+}
+
+fn click(app: &mut App, column: u16, row: u16) {
+    let list = app.tree_list;
+    if column < list.x
+        || column >= list.x + list.width
+        || row < list.y
+        || row >= list.y + list.height
+    {
+        return;
+    }
+    let Some(i) = (app.offset).checked_add((row - list.y) as usize) else { return };
+    if i >= app.rows.len() {
+        return;
+    }
+    app.cursor = i;
+    app.status = None;
+
+    // The three columns a row starts with are the three things a click on a row
+    // can mean: the stage marker, the indent, and the twisty.
+    let r = app.rows[i];
+    let x = column - list.x;
+    if x == 0 {
+        toggle_stage(app);
+    } else if x == 1 + 2 * r.depth {
+        // Clicking the arrow toggles, rather than stepping in the way `l` does
+        // on an already-open row: a second click in the same place undoing the
+        // first is the only behaviour a pointer can have.
+        let open = match r.header {
+            Some(Heading::Category(c)) => app.reclaim_is_open(c),
+            Some(Heading::Dupes(g)) => app.dupes_is_open(g),
+            None => app.expanded.contains(&r.id),
+        };
+        if open { collapse(app) } else { expand(app) }
     }
 }
 

@@ -195,6 +195,12 @@ pub struct App {
     pub breakdown: Option<Breakdown>,
     /// Hide subtrees written to more recently than this.
     pub age_filter: AgeFilter,
+    /// Capture the mouse. Off makes the terminal's own text selection work
+    /// again, which is why it is a flag and not an assumption.
+    pub mouse: bool,
+    /// Where the tree list was drawn last frame. Clicks arrive as terminal
+    /// coordinates and mean nothing without it.
+    pub tree_list: ratatui::layout::Rect,
 
     /// What the pending commit will do. Reset to Trash after every batch, so a
     /// permanent delete is always a deliberate choice.
@@ -292,6 +298,8 @@ impl App {
             snapshot_rx: None,
             breakdown: None,
             age_filter: AgeFilter::All,
+            mouse: true,
+            tree_list: ratatui::layout::Rect::ZERO,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             disposal: Disposal::Trash,
             job: None,

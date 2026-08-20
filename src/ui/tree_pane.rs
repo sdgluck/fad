@@ -41,7 +41,11 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     for i in app.offset..(app.offset + height).min(app.rows.len()) {
         lines.push(row_line(app, theme, i, inner.width as usize));
     }
-    f.render_widget(Paragraph::new(lines), Rect { height: list_h, ..inner });
+    let list = Rect { height: list_h, ..inner };
+    // Remembered for hit-testing: a click is a terminal coordinate and means
+    // nothing without the rectangle the rows were last drawn into.
+    app.tree_list = list;
+    f.render_widget(Paragraph::new(lines), list);
 
     if !banners.is_empty() {
         let at = Rect {

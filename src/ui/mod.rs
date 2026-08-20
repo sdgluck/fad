@@ -97,6 +97,8 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("s", "cycle sort: size, count, modified, name"),
         ("o / e / y", "Finder / $EDITOR / copy path"),
         ("R", "rescan the selected subtree"),
+        ("click", "select \u{b7} on the arrow: open \u{b7} on the left edge: stage"),
+        ("wheel", "move the selection"),
         ("q", "quit"),
     ];
 

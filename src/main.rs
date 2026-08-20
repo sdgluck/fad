@@ -49,6 +49,11 @@ struct Args {
     /// Delete every saved snapshot and exit.
     #[arg(long)]
     clear_cache: bool,
+
+    /// Do not capture the mouse. Clicking and the wheel stop working; your
+    /// terminal's own text selection starts working again.
+    #[arg(long)]
+    no_mouse: bool,
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -104,6 +109,7 @@ fn main() {
 
     let mut app = App::new(tree, scan, opts);
     app.apparent = args.apparent;
+    app.mouse = !args.no_mouse;
     if !args.no_cache {
         app.load_snapshot_async();
     }

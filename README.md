@@ -59,6 +59,11 @@ up.
 | `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
 | `?` | help · `q` or `esc` quit |
 
+The mouse works too: click a row to select it, click its arrow to open or close
+it, click the left edge to stage it, and use the wheel to move the selection.
+Capturing the mouse takes over your terminal's own text selection, so
+`--no-mouse` turns it off.
+
 In the confirmation screen: `D` toggles between trash and permanent delete,
 `enter` or `y` commits, `esc` or `q` cancels.
 
@@ -71,6 +76,7 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --json            dump the ranked tree as JSON instead of opening the UI
 --min-size 100M   hide entries below a threshold (--json)
 --depth N         how deep to print (--json, default 2)
+--no-mouse        do not capture the mouse, so text selection keeps working
 --no-cache        ignore any snapshot and always walk from scratch
 --clear-cache     delete every saved snapshot and exit
 ```
