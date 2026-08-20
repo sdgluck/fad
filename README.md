@@ -1,9 +1,12 @@
 # fad
 
-Find what is eating your disk, and delete it, without leaving the terminal.
+**f**ind **a**nd **d**estroy — a terminal tool for finding what is using your
+disk and deleting it.
 
-A keyboard-driven replacement for OmniDiskSweeper: two panes, a live tree ranked
-by real disk usage, and a staged batch you review before anything is deleted.
+`fad` walks a directory tree, ranks everything by real disk usage, and shows it
+in a two-pane TUI: a live tree on the left, details of the selected item on the
+right. You mark items for deletion, review the batch, and commit it. Deleted
+items go to the system trash by default and can be restored with one keystroke.
 
 Runs on macOS and Linux.
 
@@ -30,126 +33,103 @@ cargo install --path .
 ## Use
 
 ```sh
-fad              # your home directory
-fad /some/path
-fad --json       # non-interactive: the ranked tree as JSON
+fad              # scans your home directory
+fad /some/path   # scans a directory
+fad --json       # prints the ranked tree as JSON and exits
 ```
+
+The UI opens immediately and fills in as the scan streams results. If a previous
+scan of the same root was saved, its totals appear while the fresh walk catches
+up.
+
+### Keys
 
 | Key | |
 |---|---|
-| `j` `k` `↑` `↓` | move · `g` `G` first/last · `ctrl-d` `ctrl-u` half page |
+| `j` `k` `↑` `↓` | move · `g` `G` first/last · `ctrl-d` `ctrl-u` jump 10 lines |
 | `l` `→` `enter` | expand · `h` `←` collapse, or jump to the parent |
 | `space` | stage / unstage · `A` stage everything in this directory or category |
 | `x` | review and commit the staged batch |
 | `u` | undo the last committed batch |
-| `r` | reclaimable view — build artifacts, caches, VM images |
-| `/` | fuzzy filter · `s` cycle sort · `R` rescan |
-| `o` `e` `y` | reveal in Finder · open in `$EDITOR` · copy path |
-| `?` | help · `q` quit |
+| `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
+| `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
+| `s` | cycle sort: size → count → modified → name · `R` rescan |
+| `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
+| `?` | help · `q` or `esc` quit |
+
+In the confirmation screen: `D` toggles between trash and permanent delete,
+`enter` or `y` commits, `esc` or `q` cancels.
 
 ### Flags
 
 ```
 --cross-device    follow mount points into other filesystems
---cloud           descend into iCloud/Dropbox/OneDrive folders (see below)
+--cloud           descend into iCloud/Dropbox/OneDrive folders
 --apparent        report st_size instead of allocated blocks
+--json            dump the ranked tree as JSON instead of opening the UI
 --min-size 100M   hide entries below a threshold (--json)
---depth N         how deep to print (--json)
+--depth N         how deep to print (--json, default 2)
 --no-cache        ignore any snapshot and always walk from scratch
 --clear-cache     delete every saved snapshot and exit
 ```
 
-## How it measures
+## Sizes
 
-Sizes are **allocated blocks** (`st_blocks × 512`), the same thing `du` reports —
-not file length. Sparse files and APFS-compressed files are counted at what they
-actually cost. The detail pane shows the apparent size alongside when the two
-differ.
+Sizes are allocated blocks (`st_blocks × 512`), matching `du`. Sparse and
+APFS-compressed files are counted at what they actually cost on disk; use
+`--apparent` for file length instead. Where the two differ, the detail pane
+shows both.
 
-A file with several hard links is counted **once**, always against the
-lexicographically first of its paths. First-one-wins would make subtotals jump
-between runs, because the walk is parallel and arrival order is not stable.
+A file with several hard links is counted once, against the lexicographically
+first of its paths.
 
-`fad --json` totals match `du -sk` exactly; there is a test that asserts it.
+## What is not scanned
 
-## What it will not walk into
+- **Other filesystems.** Mount points are shown but not entered. `--cross-device`
+  opts in.
+- **Cloud folders (macOS).** iCloud Drive, Dropbox, OneDrive and similar
+  FileProvider-backed folders are skipped, because reading inside one can block
+  on the network for minutes. `--cloud` opts in. Linux has no equivalent skip.
+- **Directories that cannot be read.** Counted and reported; on macOS, granting
+  your terminal Full Disk Access usually fixes this.
 
-- **Other filesystems.** Mount points are shown but not entered, so a network
-  share or an external drive cannot stall the scan. `--cross-device` opts in.
-  This is what stops an NFS or SMB share, or a FUSE mount like rclone, from
-  hanging a scan on Linux.
-- **Cloud folders (macOS).** iCloud Drive, Dropbox, OneDrive and friends are
-  backed by FileProvider extensions. They sit on the boot volume and report the
-  boot volume's device number, so the mount check cannot see them — but
-  `readdir` inside one can block on the network for *minutes*. They are detected
-  by the `com.apple.file-provider-domain-id` xattr, skipped, and reported in a
-  banner. `--cloud` opts in. Linux needs no equivalent: the clients that can
-  stall a walk are real mounts, and Dropbox and friends sync into plain local
-  directories.
-- **What it cannot read.** Directories that refuse to open are counted and
-  reported, with a hint about granting Full Disk Access to your terminal.
-
-Nothing is skipped silently. If a number is incomplete, the UI says so.
+Anything skipped is reported in a banner, so an incomplete number is never shown
+as a complete one.
 
 ## Deleting
 
-`space` stages; `x` opens a confirmation showing the item count, the total
-reclaimed, the largest items by name, and anything the guard refused. `enter`
-commits.
+`space` stages an item; the staged batch and its total are shown in the right
+pane and the status bar. `x` opens a confirmation showing the item count, the
+total to be reclaimed, the largest items by name, and anything the guard
+refused.
 
-The default is the system trash, and `u` restores the whole batch in place. `D`
-in the confirmation toggles to a permanent delete, and says plainly that it
-cannot be undone.
+Deletion goes to the system trash by default, and `u` restores the whole batch
+to its original location. `D` in the confirmation switches to a permanent
+delete, which cannot be undone.
 
 | | |
 |---|---|
-| macOS | `NSFileManager.trashItemAtURL:`, so Finder's "Put Back" works |
-| Linux | the FreeDesktop.org trash spec: `~/.local/share/Trash`, or the per-filesystem `$topdir/.Trash-$uid` when the item lives on another volume |
+| macOS | the Finder trash — "Put Back" works |
+| Linux | the FreeDesktop.org trash: `~/.local/share/Trash`, or `$topdir/.Trash-$uid` for items on another filesystem |
 
-Both implementations report *where the item landed*, which is what makes fad's
-own undo a plain rename back. On Linux, restoring also removes the `.trashinfo`
-file, so your desktop's trash does not keep showing an entry whose file is gone.
+These paths are always refused: `/`, your home directory, system directories
+(`/System` and `/Users` on macOS; `/usr`, `/etc`, `/home` and friends on Linux),
+the scan root, and any parent of the scan root.
 
-Trashing is always a rename, never a copy — which is why the Linux side picks a
-trash directory by device number rather than by path.
-
-Refused always: `/`, your home directory, the platform's system directories
-(`/System` and `/Users` on macOS, `/usr`, `/etc`, `/home` and friends on Linux),
-the scan root, and anything containing the scan root.
-
-## Where it keeps things
+## Files it writes
 
 | | macOS | Linux |
 |---|---|---|
 | scan snapshots | `~/Library/Caches/fad` | `$XDG_CACHE_HOME/fad` |
 | undo journal | `~/Library/Application Support/fad` | `$XDG_DATA_HOME/fad` |
 
-The journal is deliberately not in a cache directory: a cleaner is entitled to
-wipe a cache, and losing your undo history to one would be a nasty surprise.
-`FAD_CACHE_DIR` and `FAD_STATE_DIR` override both.
-
-## Speed
-
-On a 285 GB home directory with 2.4M files (M-series Mac, APFS):
-
-| | |
-|---|---|
-| first frame | 14 ms |
-| first sizes on screen | ~100 ms |
-| complete totals, from snapshot | ~1.3 s |
-| complete totals, cold | ~21 s |
-| `du -sh` on the same tree | ~3.4× slower |
-
-The UI opens on an empty tree and fills in as a parallel walk streams results —
-it never waits for a scan. The previous scan is kept as a snapshot in
-`~/Library/Caches/fad` and read on a background thread, so complete (if slightly
-stale) totals arrive in about a second while the fresh walk continues behind
-them. Snapshots are only written for scans that ran to completion.
+`FAD_CACHE_DIR` and `FAD_STATE_DIR` override these. Snapshots are only written
+for scans that ran to completion, and `--clear-cache` removes them all.
 
 ## Development
 
 ```sh
-cargo test                                    # du-parity, real trash round-trips, tree arithmetic, rendering
+cargo test                                    # du-parity, trash round-trips, tree arithmetic, rendering
 cargo run --release --example statbench -- ~  # per-entry stat cost
 cargo run --release --example cachebench -- ~ # snapshot build/encode/load timings
 ```
