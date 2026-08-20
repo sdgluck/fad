@@ -114,6 +114,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("d", "duplicate view: files whose contents are byte-for-byte equal"),
         ("s", "cycle sort: size, count, modified, name"),
         ("o / e / y", "Finder / $EDITOR / copy path"),
+        ("i", "never rank this again \u{2014} adds it to your ignore list"),
         ("R", "rescan the selected subtree"),
         ("click", "select \u{b7} on the arrow: open \u{b7} on the left edge: stage"),
         ("wheel", "move the selection"),

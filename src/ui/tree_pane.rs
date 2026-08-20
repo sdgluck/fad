@@ -139,6 +139,24 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
         )));
     }
 
+    // An ignored entry still counts towards every total above it — a size that
+    // quietly omits things is the one failure this tool cannot afford — so what
+    // is hidden has to be said out loud.
+    let (n, bytes) = app.ignored;
+    if n > 0 {
+        out.push(Line::from(Span::styled(
+            truncate_end(
+                &format!(
+                    " \u{25cc} {n} ignored entr{} hidden \u{b7} {} \u{2014} still counted in the totals",
+                    if n == 1 { "y" } else { "ies" },
+                    human(bytes)
+                ),
+                width,
+            ),
+            theme.dim,
+        )));
+    }
+
     let unreadable = app.tree.unreadable_count;
     if unreadable > 0 {
         out.push(Line::from(Span::styled(

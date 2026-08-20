@@ -57,6 +57,7 @@ up.
 | `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
 | `s` | cycle sort: size → count → modified → name · `R` rescan |
 | `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
+| `i` | never rank this again — adds it to your ignore list |
 | `?` | help · `q` or `esc` quit |
 
 The mouse works too: click a row to select it, click its arrow to open or close
@@ -178,14 +179,35 @@ These paths are always refused: `/`, your home directory, system directories
 (`/System` and `/Users` on macOS; `/usr`, `/etc`, `/home` and friends on Linux),
 the scan root, and any parent of the scan root.
 
+## Ignoring things
+
+Everyone has directories they will not delete and do not want to scroll past
+every session. `i` adds the selection to `~/.config/fad/ignore`
+(`$XDG_CONFIG_HOME/fad/ignore`, or `FAD_CONFIG_DIR`), which is a plain text file
+you can also edit by hand:
+
+```text
+# a comment
+/Users/you/VMs                     an absolute path, and everything under it
+~/Pictures/Photos.photoslibrary
+*.sparsebundle                     a glob, matched against each entry's name
+Steam/                             a glob, directories only
+```
+
+Ignoring is not a way to make a number smaller. An ignored entry still counts
+towards every total above it — a size that quietly omits things is the one
+failure this tool cannot afford — so it is hidden from the views, reported in a
+banner, and refused for deletion.
+
 ## Files it writes
 
 | | macOS | Linux |
 |---|---|---|
+| ignore list | `~/.config/fad` | `$XDG_CONFIG_HOME/fad` |
 | scan snapshots | `~/Library/Caches/fad` | `$XDG_CACHE_HOME/fad` |
 | undo journal | `~/Library/Application Support/fad` | `$XDG_DATA_HOME/fad` |
 
-`FAD_CACHE_DIR` and `FAD_STATE_DIR` override these. Snapshots are only written
+`FAD_CONFIG_DIR`, `FAD_CACHE_DIR` and `FAD_STATE_DIR` override these. Snapshots are only written
 for scans that ran to completion, and `--clear-cache` removes them all.
 
 ## Development

@@ -203,6 +203,11 @@ pub struct App {
     pub breakdown: Option<Breakdown>,
     /// Hide subtrees written to more recently than this.
     pub age_filter: AgeFilter,
+    /// The user's persistent ignore list.
+    pub ignore: crate::ignore::Rules,
+    /// What the ignore list hid on the last rebuild, so the tree can say so
+    /// rather than silently omit it.
+    pub ignored: (usize, u64),
     /// Capture the mouse. Off makes the terminal's own text selection work
     /// again, which is why it is a flag and not an assumption.
     pub mouse: bool,
@@ -308,6 +313,8 @@ impl App {
             snapshot_rx: None,
             breakdown: None,
             age_filter: AgeFilter::All,
+            ignore: crate::ignore::Rules::load(),
+            ignored: (0, 0),
             mouse: true,
             basket_cursor: 0,
             tree_list: ratatui::layout::Rect::ZERO,
@@ -438,6 +445,7 @@ impl App {
         let anchor = self.rows.get(self.cursor).map(|r| (r.id, r.header.is_some()));
 
         self.rows.clear();
+        self.ignored = (0, 0);
         if self.dupe_view {
             self.reclaim_cats.clear();
             self.build_dupe_rows();
@@ -677,7 +685,22 @@ impl App {
         }
     }
 
+    /// Is this entry on the user's ignore list? Checked before anything else,
+    /// and tallied, so the tree can report what it is not showing.
+    pub fn is_ignored(&self, id: NodeId) -> bool {
+        if self.ignore.is_empty() {
+            return false;
+        }
+        let n = self.tree.node(id);
+        self.ignore.matches(&self.tree.path(id), &n.name, n.is_dir())
+    }
+
     fn passes_filter(&mut self, id: NodeId) -> bool {
+        if self.is_ignored(id) {
+            self.ignored.0 += 1;
+            self.ignored.1 += self.tree.size(id, self.apparent);
+            return false;
+        }
         if !self.passes_age(id) {
             return false;
         }
@@ -881,6 +904,13 @@ impl App {
         let mut keep = HashSet::new();
         for id in self.staged.clone() {
             let path = self.tree.path(id);
+            // Ignoring something is a standing instruction to leave it alone,
+            // so it has to survive a batch that was staged before the rule was
+            // added — or staged from a view the rule does not filter.
+            if self.is_ignored(id) {
+                self.refused.push((id, "on your ignore list".into()));
+                continue;
+            }
             match delete::guard(&path, &root) {
                 Ok(()) => {
                     keep.insert(id);

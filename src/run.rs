@@ -293,6 +293,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('o') => reveal(app),
         KeyCode::Char('e') => open_editor(app),
         KeyCode::Char('y') => copy_path(app),
+        KeyCode::Char('i') => ignore_selected(app),
         KeyCode::Char('R') => rescan(app),
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
@@ -321,6 +322,27 @@ fn open_editor(app: &mut App) {
     match std::process::Command::new(&editor).arg(&path).spawn() {
         Ok(_) => app.status = Some(format!("opened in {}", editor.to_string_lossy())),
         Err(e) => app.status = Some(format!("could not run $EDITOR: {e}")),
+    }
+}
+
+/// Add the selection to the persistent ignore list. Deliberately the whole
+/// path rather than the name: ignoring `Caches` because of one of them would
+/// hide every other.
+fn ignore_selected(app: &mut App) {
+    let Some(id) = app.selected() else { return };
+    if id == app.tree.root() {
+        app.status = Some("the scan root cannot be ignored".into());
+        return;
+    }
+    let path = app.tree.path(id);
+    match app.ignore.add(&path) {
+        Ok(file) => {
+            // Ignoring something already staged would leave a batch that the
+            // review will refuse; drop it now, while the reason is on screen.
+            app.staged.remove(&id);
+            app.status = Some(format!("ignoring {} \u{2014} edit {}", app.tree.node(id).name, file.display()));
+        }
+        Err(e) => app.status = Some(format!("could not write the ignore list: {e}")),
     }
 }
 
