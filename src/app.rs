@@ -89,6 +89,14 @@ pub struct App {
     pub status: Option<String>,
     /// Showing only what the built-in rules consider reclaimable.
     pub reclaim_view: bool,
+    /// Categories whose items are showing. Headings start closed, so the first
+    /// screen of the reclaimable view is the four totals rather than a wall of
+    /// paths.
+    pub reclaim_open: HashSet<Category>,
+    /// Every category with something in it, and its items, biggest first. Held
+    /// apart from `rows` because a closed category still has to report its
+    /// count and total, and `A` still has to stage all of it.
+    reclaim_cats: Vec<(Category, Vec<NodeId>)>,
     /// The tree on screen came from a snapshot and a fresh walk is running
     /// behind it. Sizes are last-known, not current, and the UI says so.
     pub from_cache: bool,
@@ -190,6 +198,8 @@ impl App {
             filter: String::new(),
             status: None,
             reclaim_view: false,
+            reclaim_open: HashSet::new(),
+            reclaim_cats: Vec::new(),
             from_cache: false,
             pending: None,
             snapshot_rx: None,
@@ -322,6 +332,7 @@ impl App {
         if self.reclaim_view {
             self.build_reclaim_rows();
         } else {
+            self.reclaim_cats.clear();
             let root = self.tree.root();
             let max = self.tree.size(root, self.apparent);
             self.push_row(root, 0, max);
@@ -343,6 +354,7 @@ impl App {
     /// The reclaimable view: every preset match, grouped by category and
     /// ranked by size. The whole point is to make the first screen the answer.
     fn build_reclaim_rows(&mut self) {
+        self.reclaim_cats.clear();
         for cat in Category::all() {
             // Collected before filtering so the fuzzy matcher, which needs
             // `&mut self`, is not borrowing the tree at the same time.
@@ -367,9 +379,12 @@ impl App {
             let max = self.tree.size(items[0], apparent);
 
             self.rows.push(Row { id: items[0], depth: 0, sibling_max: max, header: Some(cat) });
-            for id in items {
-                self.rows.push(Row::node(id, 1, max));
+            if self.reclaim_open.contains(&cat) {
+                for id in &items {
+                    self.rows.push(Row::node(*id, 1, max));
+                }
             }
+            self.reclaim_cats.push((cat, items));
         }
     }
 
@@ -384,13 +399,18 @@ impl App {
         false
     }
 
-    /// Everything the reclaimable view is currently showing, for `A`.
+    /// Everything in a category, whether or not its heading is open. `A` on a
+    /// closed heading stages the lot, and the heading reports the full total.
     pub fn reclaim_items(&self, cat: Category) -> Vec<NodeId> {
-        self.rows
+        self.reclaim_cats
             .iter()
-            .filter(|r| r.header.is_none() && self.tree.node(r.id).preset == Some(cat))
-            .map(|r| r.id)
-            .collect()
+            .find(|(c, _)| *c == cat)
+            .map(|(_, items)| items.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn reclaim_is_open(&self, cat: Category) -> bool {
+        self.reclaim_open.contains(&cat)
     }
 
     fn push_row(&mut self, id: NodeId, depth: u16, sibling_max: u64) {

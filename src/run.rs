@@ -248,6 +248,18 @@ fn move_cursor(app: &mut App, delta: i64) {
 }
 
 fn expand(app: &mut App) {
+    // Category headings open and close like directories, and start closed.
+    if let Some(cat) = app.rows.get(app.cursor).and_then(|r| r.header) {
+        if app.reclaim_open.insert(cat) {
+            return;
+        }
+        // Already open: step onto the first item, matching what expanding an
+        // open directory does.
+        if app.cursor + 1 < app.rows.len() && app.rows[app.cursor + 1].header.is_none() {
+            app.cursor += 1;
+        }
+        return;
+    }
     let Some(id) = app.selected() else { return };
     let n = app.tree.node(id);
     if n.flags & flags::IS_DIR == 0 {
@@ -268,6 +280,10 @@ fn expand(app: &mut App) {
 }
 
 fn collapse(app: &mut App) {
+    if let Some(cat) = app.rows.get(app.cursor).and_then(|r| r.header) {
+        app.reclaim_open.remove(&cat);
+        return;
+    }
     let Some(id) = app.selected() else { return };
     if app.expanded.remove(&id) {
         return;

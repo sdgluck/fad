@@ -84,7 +84,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("j / k, \u{2193} \u{2191}", "move"),
         ("g / G", "first / last"),
         ("ctrl-d / ctrl-u", "half page"),
-        ("l / \u{2192} / enter", "expand"),
+        ("l / \u{2192} / enter", "expand, or open a category"),
         ("h / \u{2190}", "collapse, or jump to parent"),
         ("space", "stage / unstage"),
         ("A", "stage every child of this directory"),

@@ -243,7 +243,9 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
 fn header_line(app: &App, theme: &Theme, cat: crate::presets::Category, selected: bool, width: usize) -> Line<'static> {
     let items = app.reclaim_items(cat);
     let total: u64 = items.iter().map(|id| app.tree.size(*id, app.apparent)).sum();
-    let head = format!(" {} \u{b7} {} \u{b7} {} ", cat.label(), items.len(), human(total));
+    let arrow = if app.reclaim_is_open(cat) { '\u{25be}' } else { '\u{25b8}' };
+    let head =
+        format!(" {arrow} {} \u{b7} {} \u{b7} {} ", cat.label(), items.len(), human(total));
     let note = format!(" {} ", cat.note());
     let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
     let line = Line::from(vec![

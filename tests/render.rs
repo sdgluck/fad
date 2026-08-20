@@ -172,6 +172,9 @@ fn the_cursor_can_step_up_onto_a_reclaimable_heading() {
     let mut app = app_for(dir.path());
 
     app.reclaim_view = true;
+    for cat in fad::presets::Category::all() {
+        app.reclaim_open.insert(cat);
+    }
     app.mark_dirty();
     app.rebuild_rows();
 
@@ -197,4 +200,43 @@ fn the_cursor_can_step_up_onto_a_reclaimable_heading() {
     app.mark_dirty();
     app.rebuild_rows();
     assert_eq!(app.cursor, heading - 1, "cursor stuck at the heading");
+}
+
+#[test]
+fn reclaimable_categories_start_closed_and_open_on_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = |rel: &str, size: usize| {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; size]).unwrap();
+    };
+    mk("proj/Cargo.toml", 64);
+    mk("proj/target/debug/big.rlib", 4 * 1024 * 1024);
+    mk("other/Cargo.toml", 64);
+    mk("other/target/debug/small.rlib", 1024 * 1024);
+    mk("npm/_cacache/chunk.bin", 2 * 1024 * 1024);
+    let mut app = app_for(dir.path());
+
+    app.reclaim_view = true;
+    app.mark_dirty();
+    app.rebuild_rows();
+
+    // Closed: the first screen is the category totals, nothing else.
+    assert!(app.rows.iter().all(|r| r.header.is_some()), "items showing under a closed heading");
+    let headings = app.rows.len();
+    assert_eq!(headings, 2, "expected a build-artifact and a package-cache category");
+
+    // A closed heading still knows what is under it, so `A` can stage it all.
+    let build = fad::presets::Category::BuildArtifact;
+    assert_eq!(app.reclaim_items(build).len(), 2);
+
+    app.reclaim_open.insert(build);
+    app.mark_dirty();
+    app.rebuild_rows();
+    assert_eq!(app.rows.len(), headings + 2, "opening the category did not reveal its items");
+
+    app.reclaim_open.remove(&build);
+    app.mark_dirty();
+    app.rebuild_rows();
+    assert_eq!(app.rows.len(), headings, "closing the category did not hide its items");
 }

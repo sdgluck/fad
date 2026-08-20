@@ -7,7 +7,9 @@
 
 use std::collections::HashSet;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Category {
     /// Virtual machine and container disk images. Usually the single biggest
     /// thing on a developer's Mac.
