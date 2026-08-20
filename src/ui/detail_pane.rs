@@ -68,6 +68,29 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
     lines.push(Line::from(Span::styled(age(n.mtime), theme.dim)));
 
+    // Growth is more actionable than size. A cache that put on 12G this week is
+    // a better target than a stable 20G one.
+    if let Some(growth) = app.breakdown.as_ref().filter(|b| b.id == id).and_then(|b| b.growth) {
+        let when = app.previous_at.map(since).unwrap_or_else(|| "the last scan".into());
+        match growth {
+            Some(delta) if human(delta.unsigned_abs()) != "0B" => {
+                let sign = if delta > 0 { "+" } else { "\u{2212}" };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{sign}{}", human(delta.unsigned_abs())),
+                        if delta > 0 { theme.bar_hot } else { theme.bar },
+                    ),
+                    Span::styled(format!(" since {when}"), theme.dim),
+                ]));
+            }
+            Some(_) => {}
+            None => lines.push(Line::from(Span::styled(
+                format!("new since {when}"),
+                theme.bar_hot,
+            ))),
+        }
+    }
+
     // What it costs to get this back. The generic per-category note is a
     // reassurance; the command is an answer.
     if let Some(cat) = n.preset {
@@ -196,6 +219,18 @@ fn shorten(s: &str, width: usize) -> String {
         return s.to_string();
     }
     format!("…{}", s.chars().skip(count - width + 1).collect::<String>())
+}
+
+/// When the last scan was, phrased the way someone would say it out loud.
+fn since(at: std::time::SystemTime) -> String {
+    let Ok(ago) = at.elapsed() else { return "the last scan".into() };
+    let secs = ago.as_secs();
+    match secs {
+        s if s < 3600 => "an hour ago".into(),
+        s if s < 36 * 3600 => format!("{} hours ago", s / 3600),
+        s if s < 60 * 86400 => format!("{} days ago", s / 86400),
+        s => format!("{} months ago", s / (30 * 86400)),
+    }
 }
 
 /// Rough, human relative time. Precision past "days" is not useful here.

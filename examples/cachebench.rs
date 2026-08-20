@@ -31,7 +31,8 @@ fn main() {
     println!("save (total)    {:>7} ms", t.elapsed().as_millis());
 
     let t = Instant::now();
-    let loaded = fad::cache::load(&std::fs::canonicalize(&root).unwrap()).expect("load failed");
+    let (loaded, _at) =
+        fad::cache::load(&std::fs::canonicalize(&root).unwrap()).expect("load failed");
     println!("load (total)    {:>7} ms", t.elapsed().as_millis());
 
     assert_eq!(loaded.len(), tree.len(), "node count changed across the round trip");

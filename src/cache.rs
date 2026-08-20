@@ -54,12 +54,15 @@ pub fn save(tree: &Tree) -> io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-pub fn load(root: &Path) -> Option<Tree> {
+/// The saved tree, and when it was saved. The timestamp is what turns "40G" on
+/// screen into "+12G since Tuesday", which is the more actionable of the two.
+pub fn load(root: &Path) -> Option<(Tree, std::time::SystemTime)> {
     // Snapshots are keyed by the canonical path, because that is what the scan
     // recorded. Without this, `fad /var/x` and `fad /private/var/x` would each
     // keep their own copy and neither would ever find the other's.
     let root = &std::fs::canonicalize(root).ok()?;
     let path = snapshot_path(root)?;
+    let saved_at = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 8 || &bytes[..4] != MAGIC {
         return None;
@@ -73,7 +76,7 @@ pub fn load(root: &Path) -> Option<Tree> {
     if tree.root_path() != root.as_path() {
         return None;
     }
-    Some(tree)
+    Some((tree, saved_at))
 }
 
 pub fn clear() -> io::Result<()> {

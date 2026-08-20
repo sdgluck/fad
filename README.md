@@ -141,6 +141,15 @@ already share their storage, so deleting one frees nothing.
 
 `A` on a group stages every copy but the newest.
 
+## What grew
+
+`fad` already keeps a snapshot of the last scan of each root. The detail pane
+diffs the selection against it and reports the change: `+12G since 3 days ago`,
+or `new since last week`.
+
+Growth is usually more actionable than size. A cache that put on 12G this week
+is a better target than a stable 20G one.
+
 ## Sizes
 
 Sizes are allocated blocks (`st_blocks × 512`), matching `du`. Sparse and

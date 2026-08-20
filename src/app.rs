@@ -76,6 +76,10 @@ pub struct Breakdown {
     pub exts: Vec<ExtRow>,
     /// Bytes per `AGE_BUCKETS` entry, in the same order.
     pub ages: [u64; 4],
+    /// How much this subtree has changed since the last scan of this root.
+    /// `None` when there is nothing to compare against; `Some(None)` when this
+    /// path is new since then.
+    pub growth: Option<Option<i64>>,
     /// The subtree was larger than the walk budget, so these are a sample.
     pub partial: bool,
     /// The subtree's size when this was computed. A live scan keeps growing the
@@ -195,7 +199,13 @@ pub struct App {
     /// milliseconds — so the snapshot must never be on the startup path. It
     /// arrives when it arrives, and only replaces the live tree if the walk is
     /// still running by then.
-    snapshot_rx: Option<crossbeam_channel::Receiver<Option<Tree>>>,
+    snapshot_rx: Option<crossbeam_channel::Receiver<Option<(Tree, std::time::SystemTime)>>>,
+    /// The previous scan of this root, kept for the one comparison the numbers
+    /// on screen cannot make on their own: what grew. A cache that put on 12G
+    /// this week is a better target than a stable 20G one.
+    previous: Option<Tree>,
+    /// When that scan was taken.
+    pub previous_at: Option<std::time::SystemTime>,
 
     /// Extension and age breakdown for the current selection. Aggregating a
     /// subtree of a million nodes is far too slow to redo every frame, and the
@@ -257,11 +267,19 @@ impl App {
         let Ok(loaded) = rx.try_recv() else { return false };
         self.snapshot_rx = None;
 
-        let Some(snapshot) = loaded else { return false };
+        let Some((snapshot, saved_at)) = loaded else { return false };
         // Worth keeping even when the snapshot is too late to display: an ETA
         // is the one thing a three-minute walk cannot produce on its own.
         self.expected_entries = Some(snapshot.len() as u64);
-        self.install_snapshot(snapshot)
+        self.previous_at = Some(saved_at);
+        if self.install_snapshot(snapshot) {
+            // It is on screen now, and `adopt` will move it into `previous`
+            // when the fresh walk replaces it.
+            return true;
+        }
+        // The walk beat it. It is no use as a display, but it is exactly what
+        // the growth comparison needs.
+        false
     }
 
     /// Put a loaded snapshot on screen and push the tree being filled behind
@@ -292,6 +310,15 @@ impl App {
         true
     }
 
+    /// Hand the app a previous scan directly. The real path runs through
+    /// `poll_snapshot`, which needs a live walk to race; a test wants the
+    /// comparison without the race.
+    pub fn install_snapshot_for_test(&mut self, previous: Tree, at: std::time::SystemTime) {
+        self.previous = Some(previous);
+        self.previous_at = Some(at);
+        self.breakdown = None;
+    }
+
     pub fn new(tree: Tree, scan: Scan, opts: ScanOpts) -> App {
         let root = tree.root();
         let mut app = App {
@@ -318,6 +345,8 @@ impl App {
             from_cache: false,
             pending: None,
             snapshot_rx: None,
+            previous: None,
+            previous_at: None,
             breakdown: None,
             age_filter: AgeFilter::All,
             expected_entries: None,
@@ -402,7 +431,9 @@ impl App {
         let expanded: Vec<PathBuf> = self.expanded.iter().map(|id| self.tree.path(*id)).collect();
         let staged: Vec<PathBuf> = self.staged.iter().map(|id| self.tree.path(*id)).collect();
 
-        self.tree = fresh;
+        // The tree coming off screen is the previous scan, which is exactly
+        // what the growth comparison wants.
+        self.previous = Some(std::mem::replace(&mut self.tree, fresh));
         self.from_cache = false;
         self.breakdown = None;
         self.invalidate_dupes();
@@ -836,6 +867,7 @@ impl App {
             id,
             exts: items,
             ages,
+            growth: self.growth(id),
             partial,
             at_bytes: self.tree.size(id, self.apparent),
             at: Instant::now(),
@@ -876,6 +908,17 @@ impl App {
         let root = self.tree.root_path();
         let free = crate::platform::free_space(root)?;
         Some((free.saturating_add(self.staged_bytes()), free))
+    }
+
+    /// What this path did since the last scan. Resolved by path, not by id:
+    /// arena indices mean nothing across two trees.
+    fn growth(&self, id: NodeId) -> Option<Option<i64>> {
+        let previous = self.previous.as_ref()?;
+        let path = self.tree.path(id);
+        let Some(then) = previous.find_path(&path) else { return Some(None) };
+        let (now, was) =
+            (self.tree.size(id, self.apparent), previous.size(then, self.apparent));
+        Some(Some(now as i64 - was as i64))
     }
 
     pub fn staged_bytes(&self) -> u64 {

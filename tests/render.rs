@@ -129,7 +129,7 @@ fn snapshot_round_trips_and_keeps_the_users_place() {
     let staged_path = app.tree.path(biggest);
 
     fad::cache::save(&app.tree).unwrap();
-    let loaded = fad::cache::load(dir.path()).expect("snapshot did not load");
+    let (loaded, _at) = fad::cache::load(dir.path()).expect("snapshot did not load");
     assert_eq!(
         loaded.node(loaded.root()).total_bytes,
         app.tree.node(root).total_bytes,
@@ -239,4 +239,34 @@ fn reclaimable_categories_start_closed_and_open_on_demand() {
     app.mark_dirty();
     app.rebuild_rows();
     assert_eq!(app.rows.len(), headings, "closing the category did not hide its items");
+}
+
+/// Growth is the comparison the numbers on screen cannot make on their own, so
+/// the tree that comes off screen has to be kept, not dropped.
+#[test]
+fn the_detail_pane_reports_what_grew_since_the_last_scan() {
+    let _guard = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+    let root = dir.path().join("scan");
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    std::fs::write(root.join("cache/a"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+
+    // A saved scan, then the same directory rather larger.
+    let app = app_for(&root);
+    fad::cache::save(&app.tree).unwrap();
+    std::fs::write(root.join("cache/b"), vec![0u8; 6 * 1024 * 1024]).unwrap();
+
+    let mut app2 = app_for(&root);
+    let (snapshot, at) = fad::cache::load(&root).expect("snapshot did not load");
+    // The walk has already finished here, so the snapshot is no use as a
+    // display — it is kept purely for the comparison.
+    app2.install_snapshot_for_test(snapshot, at);
+
+    let cache = app2.tree.find_path(&app2.tree.root_path().join("cache")).unwrap();
+    app2.cursor = app2.rows.iter().position(|r| r.id == cache).unwrap();
+    app2.ensure_breakdown();
+
+    let growth = app2.breakdown.as_ref().unwrap().growth.expect("no comparison was made");
+    assert_eq!(growth, Some(6 * 1024 * 1024), "the 6M that arrived was not reported");
 }
