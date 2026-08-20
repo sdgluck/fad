@@ -12,9 +12,70 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use crate::presets::Category;
 use crate::tree::{NodeId, Sort, Tree, flags};
 
-pub struct ExtBreakdown {
+/// How long ago the last write was, as four buckets. Absolute size is what a
+/// directory *is*; how much of it nobody has touched in two years is what makes
+/// it a candidate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AgeFilter {
+    All,
+    D90,
+    Y1,
+    Y2,
+}
+
+impl AgeFilter {
+    pub fn next(self) -> AgeFilter {
+        match self {
+            AgeFilter::All => AgeFilter::D90,
+            AgeFilter::D90 => AgeFilter::Y1,
+            AgeFilter::Y1 => AgeFilter::Y2,
+            AgeFilter::Y2 => AgeFilter::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AgeFilter::All => "any age",
+            AgeFilter::D90 => "untouched 90 days",
+            AgeFilter::Y1 => "untouched 1 year",
+            AgeFilter::Y2 => "untouched 2 years",
+        }
+    }
+
+    /// How old the newest write in a subtree must be for it to show, in
+    /// seconds. `None` means no age filtering at all.
+    fn cutoff(self) -> Option<i64> {
+        match self {
+            AgeFilter::All => None,
+            AgeFilter::D90 => Some(90 * 86400),
+            AgeFilter::Y1 => Some(365 * 86400),
+            AgeFilter::Y2 => Some(2 * 365 * 86400),
+        }
+    }
+}
+
+/// The four buckets the age histogram reports, newest first. The boundaries
+/// match `AgeFilter` so the histogram reads as a preview of what each filter
+/// step would keep.
+pub const AGE_BUCKETS: [(&str, i64); 4] = [
+    ("<90d", 90 * 86400),
+    ("90d-1y", 365 * 86400),
+    ("1-2y", 2 * 365 * 86400),
+    (">2y", i64::MAX),
+];
+
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub struct Breakdown {
     pub id: NodeId,
-    pub items: Vec<ExtRow>,
+    pub exts: Vec<ExtRow>,
+    /// Bytes per `AGE_BUCKETS` entry, in the same order.
+    pub ages: [u64; 4],
     /// The subtree was larger than the walk budget, so these are a sample.
     pub partial: bool,
     /// The subtree's size when this was computed. A live scan keeps growing the
@@ -109,10 +170,12 @@ pub struct App {
     /// still running by then.
     snapshot_rx: Option<crossbeam_channel::Receiver<Option<Tree>>>,
 
-    /// Extension breakdown for the current selection. Aggregating a subtree of
-    /// a million nodes is far too slow to redo every frame, and the answer only
-    /// changes when the selection moves.
-    pub ext_cache: Option<ExtBreakdown>,
+    /// Extension and age breakdown for the current selection. Aggregating a
+    /// subtree of a million nodes is far too slow to redo every frame, and the
+    /// answer only changes when the selection moves.
+    pub breakdown: Option<Breakdown>,
+    /// Hide subtrees written to more recently than this.
+    pub age_filter: AgeFilter,
 
     /// What the pending commit will do. Reset to Trash after every batch, so a
     /// permanent delete is always a deliberate choice.
@@ -174,7 +237,7 @@ impl App {
         self.expanded = HashSet::from([self.tree.root()]);
         self.staged = staged.iter().filter_map(|p| self.tree.find_path(p)).collect();
         self.refused.clear();
-        self.ext_cache = None;
+        self.breakdown = None;
         self.cursor = 0;
         self.offset = 0;
         self.dirty = true;
@@ -203,7 +266,8 @@ impl App {
             from_cache: false,
             pending: None,
             snapshot_rx: None,
-            ext_cache: None,
+            breakdown: None,
+            age_filter: AgeFilter::All,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             disposal: Disposal::Trash,
             job: None,
@@ -233,7 +297,7 @@ impl App {
         self.staged.clear();
         self.refused.clear();
         self.expanded = HashSet::from([self.tree.root()]);
-        self.ext_cache = None;
+        self.breakdown = None;
         self.cursor = 0;
         self.offset = 0;
         self.mark_dirty();
@@ -281,7 +345,7 @@ impl App {
 
         self.tree = fresh;
         self.from_cache = false;
-        self.ext_cache = None;
+        self.breakdown = None;
 
         self.expanded = expanded.iter().filter_map(|p| self.tree.find_path(p)).collect();
         self.expanded.insert(self.tree.root());
@@ -430,6 +494,9 @@ impl App {
     }
 
     fn passes_filter(&mut self, id: NodeId) -> bool {
+        if !self.passes_age(id) {
+            return false;
+        }
         if self.filter.is_empty() {
             return true;
         }
@@ -439,6 +506,14 @@ impl App {
         // A directory whose own name misses still has to show, or the children
         // that do match become unreachable.
         self.tree.node(id).flags & flags::IS_DIR != 0 && self.subtree_matches(id)
+    }
+
+    /// A subtree shows only when *nothing* in it has been written since the
+    /// cutoff. Testing the newest write rather than the directory's own mtime
+    /// is the difference between "abandoned" and "the folder was reorganised".
+    fn passes_age(&self, id: NodeId) -> bool {
+        let Some(cutoff) = self.age_filter.cutoff() else { return true };
+        self.tree.node(id).last_write() <= now_secs() - cutoff
     }
 
     fn fuzzy_matches(&mut self, id: NodeId) -> bool {
@@ -464,9 +539,9 @@ impl App {
 
     /// Recompute the breakdown if the selection moved. Called once per frame;
     /// the cache makes all but the first call free.
-    pub fn ensure_extensions(&mut self) {
+    pub fn ensure_breakdown(&mut self) {
         let Some(id) = self.selected() else {
-            self.ext_cache = None;
+            self.breakdown = None;
             return;
         };
         // Recomputing costs a subtree walk, so do it when the selection moves,
@@ -474,23 +549,27 @@ impl App {
         // has passed that we are not doing it on every frame of a live scan.
         const THROTTLE: Duration = Duration::from_millis(250);
         let bytes = self.tree.size(id, self.apparent);
-        if let Some(c) = self.ext_cache.as_ref() {
+        if let Some(c) = self.breakdown.as_ref() {
             let fresh = c.id == id && (c.at_bytes == bytes || c.at.elapsed() < THROTTLE);
             if fresh {
                 return;
             }
         }
-        self.ext_cache = Some(self.extensions(id));
+        self.breakdown = Some(self.analyse(id));
     }
 
-    /// Sizes by extension across the whole subtree, not just one level down:
-    /// a directory of directories tells you nothing otherwise.
-    fn extensions(&self, id: NodeId) -> ExtBreakdown {
+    /// Sizes by extension and by age across the whole subtree, not just one
+    /// level down: a directory of directories tells you nothing otherwise.
+    /// Both answers come out of a single walk, because the walk is the
+    /// expensive part and the two are always shown together.
+    fn analyse(&self, id: NodeId) -> Breakdown {
         /// Past this many nodes the answer is already shaped; walking further
         /// would stall the frame for no extra insight.
         const BUDGET: usize = 200_000;
 
         let mut by_ext: HashMap<&str, (u64, u64)> = HashMap::new();
+        let mut ages = [0u64; 4];
+        let now = now_secs();
         let mut stack = vec![id];
         let mut visited = 0usize;
         let mut partial = false;
@@ -506,10 +585,15 @@ impl App {
                 stack.extend_from_slice(&n.children);
                 continue;
             }
+            let bytes = self.tree.self_size(cur, self.apparent);
             let key = extension_of(&n.name);
             let e = by_ext.entry(key).or_default();
-            e.0 += self.tree.self_size(cur, self.apparent);
+            e.0 += bytes;
             e.1 += 1;
+
+            let age = (now - n.mtime).max(0);
+            let bucket = AGE_BUCKETS.iter().position(|(_, max)| age < *max).unwrap_or(3);
+            ages[bucket] += bytes;
         }
 
         let mut items: Vec<ExtRow> = by_ext
@@ -517,10 +601,13 @@ impl App {
             .map(|(ext, (bytes, count))| ExtRow { ext: ext.to_string(), bytes, count })
             .collect();
         items.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
-        items.truncate(8);
-        ExtBreakdown {
+        // Six, not eight: the age histogram below earns the two rows more than
+        // a seventh extension does in a 38-column pane.
+        items.truncate(6);
+        Breakdown {
             id,
-            items,
+            exts: items,
+            ages,
             partial,
             at_bytes: self.tree.size(id, self.apparent),
             at: Instant::now(),

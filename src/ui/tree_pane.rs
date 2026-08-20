@@ -80,12 +80,23 @@ fn header(app: &App) -> Line<'static> {
         spans.push(Span::from(" reclaimable ").bold().reversed());
         spans.push(Span::from(" "));
     }
+    // Rows vanishing with no explanation reads as a bug, so an active age
+    // filter has to be as visible as the reclaimable view is.
+    if app.age_filter != crate::app::AgeFilter::All {
+        spans.push(Span::from(format!(" {} ", app.age_filter.label())).bold().reversed());
+        spans.push(Span::from(" "));
+    }
     Line::from(spans)
 }
 
 fn empty_reason(app: &App) -> String {
     if !app.filter.is_empty() {
         format!(" nothing matches \"{}\" \u{2014} esc to clear", app.filter)
+    } else if app.age_filter != crate::app::AgeFilter::All {
+        format!(
+            " nothing here is {} \u{2014} a cycles the age filter",
+            app.age_filter.label()
+        )
     } else if app.reclaim_view {
         " nothing reclaimable here \u{2014} r for the full tree".to_string()
     } else if app.scanning() {

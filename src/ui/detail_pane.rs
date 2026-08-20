@@ -80,11 +80,36 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         )));
     }
 
-    if let Some(ext) = app.ext_cache.as_ref().filter(|c| c.id == id && !c.items.is_empty()) {
+    if let Some(b) = app.breakdown.as_ref().filter(|c| c.id == id) {
+        let sampled = if b.partial { " (sampled)" } else { "" };
+        if b.ages.iter().any(|v| *v > 0) {
+            lines.push(Line::from(Span::styled(
+                format!("\u{2500}\u{2500} by age{sampled} "),
+                theme.dim,
+            )));
+            let widest = b.ages.iter().copied().max().unwrap_or(0);
+            for (i, (label, _)) in crate::app::AGE_BUCKETS.iter().enumerate() {
+                let bytes = b.ages[i];
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {label:<10}"), theme.normal),
+                    Span::styled(format!("{:>7} ", human(bytes)), theme.emphasis),
+                    // The oldest bucket is the answer to "what can go", so it
+                    // gets the colour that the tree pane reserves for the row
+                    // worth looking at.
+                    Span::styled(
+                        minibar(bytes, widest),
+                        if i == 3 { theme.bar_hot } else { theme.bar },
+                    ),
+                ]));
+            }
+        }
+    }
+
+    if let Some(ext) = app.breakdown.as_ref().filter(|c| c.id == id && !c.exts.is_empty()) {
         let title = if ext.partial { "\u{2500}\u{2500} by extension (sampled) " } else { "\u{2500}\u{2500} by extension " };
         lines.push(Line::from(Span::styled(title, theme.dim)));
-        let widest = ext.items.iter().map(|r| r.bytes).max().unwrap_or(0);
-        for r in &ext.items {
+        let widest = ext.exts.iter().map(|r| r.bytes).max().unwrap_or(0);
+        for r in &ext.exts {
             let label = if r.ext.is_empty() { "(no ext)".to_string() } else { format!(".{}", r.ext) };
             lines.push(Line::from(vec![
                 Span::styled(format!("  {label:<10}"), theme.normal),

@@ -70,6 +70,12 @@ pub struct Node {
     pub file_count: u64,
     pub dir_count: u64,
     pub mtime: i64,
+    /// The most recent mtime of any *file* in this subtree, or `i64::MIN` when
+    /// there are none. Directory mtimes are deliberately excluded: a directory's
+    /// mtime moves whenever a child is added, removed, or renamed, so a project
+    /// nobody has opened in two years looks freshly touched the moment it is
+    /// reorganised. Read it through `last_write`, which resolves the sentinel.
+    pub newest_file_mtime: i64,
     pub kind: Kind,
     pub flags: flags::Flags,
     /// Set when this entry matches a built-in reclaimable rule.
@@ -79,6 +85,13 @@ pub struct Node {
 impl Node {
     pub fn is_dir(&self) -> bool {
         self.flags & flags::IS_DIR != 0
+    }
+
+    /// When this subtree was last written to. Falls back to the entry's own
+    /// mtime for a directory holding no files at all, which is the only thing
+    /// left to report about it.
+    pub fn last_write(&self) -> i64 {
+        if self.newest_file_mtime == i64::MIN { self.mtime } else { self.newest_file_mtime }
     }
 }
 
@@ -121,6 +134,7 @@ impl Tree {
             file_count: 0,
             dir_count: 0,
             mtime: root_meta.mtime,
+            newest_file_mtime: i64::MIN,
             kind: root_meta.kind,
             flags: flags::IS_DIR,
             preset: None,
@@ -224,6 +238,7 @@ impl Tree {
 
         let mut children = Vec::with_capacity(batch.entries.len());
         let mut hardlinks = Vec::new();
+        let mut newest = i64::MIN;
         for (idx, e) in batch.entries.into_iter().enumerate() {
             let mut f = 0u8;
             if e.meta.is_dir() {
@@ -252,6 +267,9 @@ impl Tree {
                 file_count: 0,
                 dir_count: 0,
                 mtime: e.meta.mtime,
+                // A directory's own entry contributes nothing; only the files
+                // under it will raise this, once their batches land.
+                newest_file_mtime: if e.meta.is_dir() { i64::MIN } else { e.meta.mtime },
                 kind: e.meta.kind,
                 flags: f,
                 preset: presets[idx],
@@ -269,6 +287,9 @@ impl Tree {
                 self.skipped.push((id, reason));
             }
             children.push(id);
+            if !e.meta.is_dir() {
+                newest = newest.max(e.meta.mtime);
+            }
             added_bytes += bytes;
             added_len += len;
         }
@@ -283,6 +304,9 @@ impl Tree {
             added_files as i64,
             added_dirs as i64,
         );
+        if newest > i64::MIN {
+            self.bump_newest(parent, newest);
+        }
 
         // Resolved after the rollup so the subtraction never has to underflow a
         // total that has not been added yet.
@@ -292,6 +316,21 @@ impl Tree {
 
         if !self.orphans.is_empty() {
             self.drain_orphans();
+        }
+    }
+
+    /// Raise `newest_file_mtime` on `from` and its ancestors. Stops at the first
+    /// ancestor that is already at least this recent — everything above it must
+    /// be too, so a deep tree does not pay a full root walk per batch.
+    fn bump_newest(&mut self, from: NodeId, mtime: i64) {
+        let mut cur = Some(from);
+        while let Some(id) = cur {
+            let n = &mut self.nodes[id as usize];
+            if n.newest_file_mtime >= mtime {
+                return;
+            }
+            n.newest_file_mtime = mtime;
+            cur = n.parent;
         }
     }
 
@@ -475,6 +514,7 @@ pub struct Snapshot {
     file_count: Vec<u64>,
     dir_count: Vec<u64>,
     mtime: Vec<i64>,
+    newest_file_mtime: Vec<i64>,
     kind: Vec<u8>,
     flags: Vec<u8>,
     preset: Vec<u8>,
@@ -554,6 +594,7 @@ impl Tree {
             file_count: Vec::with_capacity(n),
             dir_count: Vec::with_capacity(n),
             mtime: Vec::with_capacity(n),
+            newest_file_mtime: Vec::with_capacity(n),
             kind: Vec::with_capacity(n),
             flags: Vec::with_capacity(n),
             preset: Vec::with_capacity(n),
@@ -574,6 +615,7 @@ impl Tree {
             snap.file_count.push(node.file_count);
             snap.dir_count.push(node.dir_count);
             snap.mtime.push(node.mtime);
+            snap.newest_file_mtime.push(node.newest_file_mtime);
             snap.kind.push(kind_to_u8(node.kind));
             snap.flags.push(node.flags);
             snap.preset.push(preset_to_u8(node.preset));
@@ -595,6 +637,7 @@ impl Tree {
             || s.file_count.len() != n
             || s.dir_count.len() != n
             || s.mtime.len() != n
+            || s.newest_file_mtime.len() != n
             || s.kind.len() != n
             || s.flags.len() != n
             || s.preset.len() != n
@@ -636,6 +679,7 @@ impl Tree {
                 file_count: s.file_count[i],
                 dir_count: s.dir_count[i],
                 mtime: s.mtime[i],
+                newest_file_mtime: s.newest_file_mtime[i],
                 kind: kind_from_u8(s.kind[i]),
                 flags: s.flags[i],
                 preset: preset_from_u8(s.preset[i]),

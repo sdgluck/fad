@@ -172,6 +172,10 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('u') => undo(app),
         KeyCode::Char('r') => toggle_reclaim(app),
+        KeyCode::Char('a') => {
+            app.age_filter = app.age_filter.next();
+            app.status = Some(format!("showing {}", app.age_filter.label()));
+        }
         KeyCode::Char('o') => reveal(app),
         KeyCode::Char('e') => open_editor(app),
         KeyCode::Char('y') => copy_path(app),

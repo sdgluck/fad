@@ -52,6 +52,7 @@ up.
 | `x` | review and commit the staged batch |
 | `u` | undo the last committed batch |
 | `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
+| `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
 | `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
 | `s` | cycle sort: size → count → modified → name · `R` rescan |
 | `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
@@ -72,6 +73,19 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --no-cache        ignore any snapshot and always walk from scratch
 --clear-cache     delete every saved snapshot and exit
 ```
+
+## Age
+
+Size says what a directory is; age says whether you still want it. The detail
+pane breaks the selection down into four buckets — under 90 days, 90 days to a
+year, one to two years, over two — so 40G of `dev` reads as 34G of `dev` you
+abandoned.
+
+`a` turns that into a filter, hiding any subtree with a recent write in it. The
+test is the newest *file* below an entry, not the directory's own `mtime`:
+a directory's timestamp moves every time a child is renamed, so a project
+nobody has opened in two years would otherwise look freshly touched the moment
+it was reorganised.
 
 ## Sizes
 

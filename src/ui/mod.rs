@@ -20,7 +20,7 @@ pub use theme::Theme;
 pub fn draw(f: &mut Frame, app: &mut App) {
     let theme = Theme::default();
     let area = f.area();
-    app.ensure_extensions();
+    app.ensure_breakdown();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -92,6 +92,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("u", "undo the last committed batch"),
         ("/", "fuzzy filter"),
         ("r", "reclaimable view: build artifacts, caches, VM images"),
+        ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),
         ("s", "cycle sort: size, count, modified, name"),
         ("o / e / y", "Finder / $EDITOR / copy path"),
         ("R", "rescan the selected subtree"),
