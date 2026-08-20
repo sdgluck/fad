@@ -155,3 +155,46 @@ fn a_snapshot_of_another_directory_is_rejected() {
     fad::cache::save(&app.tree).unwrap();
     assert!(fad::cache::load(b.path()).is_none(), "loaded a foreign snapshot");
 }
+
+#[test]
+fn the_cursor_can_step_up_onto_a_reclaimable_heading() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk = |rel: &str, size: usize| {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; size]).unwrap();
+    };
+    // Two categories, both matched the same way on macOS and Linux: a Cargo
+    // build directory and an npm package cache.
+    mk("proj/Cargo.toml", 64);
+    mk("proj/target/debug/big.rlib", 4 * 1024 * 1024);
+    mk("npm/_cacache/chunk.bin", 2 * 1024 * 1024);
+    let mut app = app_for(dir.path());
+
+    app.reclaim_view = true;
+    app.mark_dirty();
+    app.rebuild_rows();
+
+    // The second heading down, so there is a row above it to have come from.
+    let heading = app
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.header.is_some())
+        .nth(1)
+        .map(|(i, _)| i)
+        .expect("fixture should produce two reclaimable categories");
+
+    // A heading shares its id with the first item under it; stepping up from
+    // that item used to snap straight back down onto it.
+    app.cursor = heading + 1;
+    app.cursor -= 1;
+    app.mark_dirty();
+    app.rebuild_rows();
+    assert_eq!(app.cursor, heading, "cursor bounced off the heading");
+
+    app.cursor -= 1;
+    app.mark_dirty();
+    app.rebuild_rows();
+    assert_eq!(app.cursor, heading - 1, "cursor stuck at the heading");
+}

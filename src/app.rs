@@ -316,7 +316,7 @@ impl App {
 
         // Keep the cursor on the same node across a rebuild; sizes arriving
         // mid-scan reorder rows underneath it constantly otherwise.
-        let anchor = self.selected();
+        let anchor = self.rows.get(self.cursor).map(|r| (r.id, r.header.is_some()));
 
         self.rows.clear();
         if self.reclaim_view {
@@ -327,10 +327,13 @@ impl App {
             self.push_row(root, 0, max);
         }
 
-        if let Some(anchor) = anchor {
-            // A heading shares its id with the first item under it, so match the
-            // item row rather than letting the cursor drift up onto the heading.
-            if let Some(i) = self.rows.iter().position(|r| r.header.is_none() && r.id == anchor) {
+        if let Some((id, was_header)) = anchor {
+            // A heading shares its id with the first item under it, so the
+            // heading-ness has to be part of the match or the cursor cannot rest
+            // on a heading: the restore would keep yanking it onto the item.
+            if let Some(i) =
+                self.rows.iter().position(|r| r.id == id && r.header.is_some() == was_header)
+            {
                 self.cursor = i;
             }
         }
