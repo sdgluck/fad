@@ -83,11 +83,26 @@ fn draw_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 ));
                 spans.push(Span::raw(" "));
             }
+            // Its own badge, never folded into the one above. One is bytes on
+            // this disk that will go to the trash; the other is a range of
+            // bytes inside a tool that will not come back. A single figure
+            // spanning both would be true of neither.
+            if !app.staged_tools.is_empty() {
+                spans.push(Span::styled(
+                    format!(
+                        " {} from tools \u{b7} {} ",
+                        app.staged_tools.len(),
+                        app.staged_tool_freed().short()
+                    ),
+                    theme.staged_badge,
+                ));
+                spans.push(Span::raw(" "));
+            }
             if let Some(msg) = &app.status {
                 spans.push(Span::styled(msg.clone(), theme.emphasis));
             } else {
                 spans.push(Span::styled(
-                    "space stage \u{b7} x basket \u{b7} r reclaimable \u{b7} / filter \u{b7} s sort \u{b7} ? help \u{b7} q quit",
+                    "space stage \u{b7} x basket \u{b7} r reclaimable \u{b7} t tools \u{b7} / filter \u{b7} s sort \u{b7} ? help \u{b7} q quit",
                     theme.dim,
                 ));
             }
@@ -113,6 +128,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("U", "the undo history: put any remembered batch back"),
         ("/", "fuzzy filter"),
         ("r", "reclaimable view: build artifacts, caches, VM images"),
+        ("t", "tool storage: what Docker and friends hold that a walk cannot see"),
         ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),
         ("d", "duplicate view: files whose contents are byte-for-byte equal"),
         ("s", "cycle sort: size, count, modified, name"),

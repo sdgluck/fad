@@ -93,6 +93,10 @@ pub struct Breakdown {
 pub enum BasketRow {
     Group { cat: Option<Category>, count: usize, bytes: u64 },
     Item(NodeId),
+    /// The tool half of the batch, which is permanent and is kept visually
+    /// apart from the trashable half for exactly that reason.
+    ToolGroup { count: usize, freed: crate::tools::Freed },
+    ToolItem(crate::tools::ToolKey),
 }
 
 pub struct ExtRow {
@@ -113,11 +117,19 @@ fn extension_of(name: &str) -> &str {
 /// A group heading: a row the cursor can rest on, that opens and closes, and
 /// that `A` stages in one go. The reclaimable and duplicate views are both
 /// lists of groups, and differ only in what a group means.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Heading {
     Category(Category),
     /// Index into `dupes.groups`.
     Dupes(usize),
+    /// One kind of thing one tool is holding: docker's images, podman's
+    /// volumes. Its total comes from the tool, never from adding up the rows
+    /// beneath it.
+    Tool(crate::tools::Source, crate::tools::Kind),
+    /// A tool that is installed but had nothing usable to say. A row rather
+    /// than a banner, because "docker is not running" belongs where docker's
+    /// numbers would have been.
+    ToolStatus(crate::tools::Source),
 }
 
 /// One line of the tree pane.
@@ -130,11 +142,19 @@ pub struct Row {
     /// Group headings are rows too, so the cursor can land on one and stage
     /// everything under it.
     pub header: Option<Heading>,
+    /// Index into `tool_flat` for a row that is not a tree node at all.
+    ///
+    /// `id` is meaningless on such a row and is left at the root. Making `id`
+    /// an enum would be tidier and would touch every one of the thirty-odd
+    /// places that read it; this touches the five that had to learn about tools
+    /// anyway. If a second off-tree source ever needs its own row shape, that
+    /// is the moment to widen `id` — not now.
+    pub tool: Option<u32>,
 }
 
 impl Row {
     fn node(id: NodeId, depth: u16, sibling_max: u64) -> Row {
-        Row { id, depth, sibling_max, header: None }
+        Row { id, depth, sibling_max, header: None, tool: None }
     }
 }
 
@@ -187,6 +207,46 @@ pub struct App {
     /// screen of the reclaimable view is the four totals rather than a wall of
     /// paths.
     pub reclaim_open: HashSet<Category>,
+
+    // -- tool storage: disk a walk cannot see. See `crate::tools`.
+    /// Showing what Docker and friends are holding.
+    pub tools_view: bool,
+    /// The last answer the tools gave.
+    pub tools: Option<crate::tools::Report>,
+    /// A probe in flight. `docker system df` measured just under sixteen
+    /// seconds against a healthy daemon on the machine this was written on, so
+    /// this can never be on the UI thread and the view has to say it is working.
+    tools_rx: Option<crossbeam_channel::Receiver<crate::tools::Report>>,
+    /// When the running probe started, so the view can show how long it has
+    /// been asking. A twenty-second wait with nothing moving reads as a hang.
+    pub tools_started: Option<Instant>,
+    /// When the current answer was taken. Docker's numbers go stale in seconds
+    /// and the view says how old they are.
+    pub tools_at: Option<Instant>,
+    /// Which tool/kind headings are open.
+    pub tools_open: HashSet<(crate::tools::Source, crate::tools::Kind)>,
+    /// Staged tool resources, held apart from `staged` and named by id rather
+    /// than by index.
+    ///
+    /// A parallel set rather than a widened `staged`, because `staged` is
+    /// threaded through ancestry checks and two path round-trips that rebuild
+    /// it after a tree swap — none of which mean anything for a Docker image,
+    /// and all of which would gain a dead arm. It also makes the permanence
+    /// rule structural: two sets, two disposals, and it is not possible to
+    /// accidentally offer to put a removed image back.
+    ///
+    /// Named by `ToolKey` rather than by position because `R` re-probes and
+    /// replaces the report wholesale; an index that meant "the dangling image"
+    /// a moment ago would quietly come to mean something else.
+    pub staged_tools: std::collections::BTreeSet<crate::tools::ToolKey>,
+    /// `(source index, item index)` for each tool row on screen, which is what
+    /// `Row::tool` indexes into.
+    tool_flat: Vec<(usize, usize)>,
+    /// A tool removal in flight. Separate from `job` because it is permanent,
+    /// unjournalled, and measured rather than predicted.
+    pub tool_job: Option<crate::tools::Job>,
+    /// Staged tool items refused at confirm time, and why.
+    pub tools_refused: Vec<(String, String)>,
     /// Every category with something in it, and its items, biggest first. Held
     /// apart from `rows` because a closed category still has to report its
     /// count and total, and `A` still has to stage all of it.
@@ -323,6 +383,15 @@ impl App {
     /// Hand the app a previous scan directly. The real path runs through
     /// `poll_snapshot`, which needs a live walk to race; a test wants the
     /// comparison without the race.
+    /// Put a tools report in place without asking any daemon, so the view can
+    /// be rendered and staged against on a machine that has none.
+    pub fn install_tools_for_test(&mut self, report: crate::tools::Report) {
+        self.tools = Some(report);
+        self.tools_at = Some(Instant::now());
+        self.tools_view = true;
+        self.mark_dirty();
+    }
+
     pub fn install_snapshot_for_test(&mut self, previous: Tree, at: std::time::SystemTime) {
         self.previous = Some(previous);
         self.previous_at = Some(at);
@@ -346,6 +415,16 @@ impl App {
             filter: String::new(),
             status: None,
             reclaim_view: false,
+            tools_view: false,
+            tools: None,
+            tools_rx: None,
+            tools_started: None,
+            tools_at: None,
+            tools_open: HashSet::new(),
+            staged_tools: std::collections::BTreeSet::new(),
+            tool_flat: Vec::new(),
+            tool_job: None,
+            tools_refused: Vec::new(),
             dupe_view: false,
             dupes: None,
             dupes_rx: None,
@@ -396,6 +475,10 @@ impl App {
         self.snapshot_rx = None;
         self.staged.clear();
         self.refused.clear();
+        // `staged_tools` deliberately survives this. Rescanning the filesystem
+        // says nothing about Docker's image store, and a `ToolKey` is not an
+        // arena index that a new tree invalidates. It looks like an omission
+        // among all this clearing, so: it is not one.
         self.expanded = HashSet::from([self.tree.root()]);
         self.breakdown = None;
         self.invalidate_dupes();
@@ -490,8 +573,17 @@ impl App {
         self.scan.is_none() && self.pending.is_none() && !self.from_cache
     }
 
+    /// The tree node under the cursor, if the cursor is on one at all.
+    ///
+    /// A tool row carries the root's id as a placeholder — it has no node —
+    /// so this has to return `None` there, or `o`, `e`, `i` and `y` would all
+    /// quietly act on the scan root instead.
     pub fn selected(&self) -> Option<NodeId> {
-        self.rows.get(self.cursor).map(|r| r.id)
+        let row = self.rows.get(self.cursor)?;
+        if row.tool.is_some() {
+            return None;
+        }
+        Some(row.id)
     }
 
     pub fn mark_dirty(&mut self) {
@@ -505,31 +597,40 @@ impl App {
         }
         self.dirty = false;
 
-        // Keep the cursor on the same node across a rebuild; sizes arriving
+        // Keep the cursor on the same row across a rebuild; sizes arriving
         // mid-scan reorder rows underneath it constantly otherwise.
-        let anchor = self.rows.get(self.cursor).map(|r| (r.id, r.header.is_some()));
+        //
+        // The whole row identity, not just the node id. A heading shares its id
+        // with the first item under it, so heading-ness has to be part of the
+        // match or the cursor could never rest on a heading. And in the tools
+        // view *every* row carries the root's id as a placeholder — there are no
+        // nodes there — so without the heading and the item index in the key,
+        // every rebuild would snap the cursor back to the first row of the same
+        // shape, and a rebuild follows every keypress. That is exactly what it
+        // did: j and k moved the cursor and this put it straight back.
+        let anchor = self.rows.get(self.cursor).map(|r| (r.id, r.header, r.tool));
 
         self.rows.clear();
         self.ignored = (0, 0);
-        if self.dupe_view {
+        if self.tools_view {
             self.reclaim_cats.clear();
+            self.build_tool_rows();
+        } else if self.dupe_view {
+            self.reclaim_cats.clear();
+            self.tool_flat.clear();
             self.build_dupe_rows();
         } else if self.reclaim_view {
             self.build_reclaim_rows();
         } else {
             self.reclaim_cats.clear();
+            self.tool_flat.clear();
             let root = self.tree.root();
             let max = self.tree.size(root, self.apparent);
             self.push_row(root, 0, max);
         }
 
-        if let Some((id, was_header)) = anchor {
-            // A heading shares its id with the first item under it, so the
-            // heading-ness has to be part of the match or the cursor cannot rest
-            // on a heading: the restore would keep yanking it onto the item.
-            if let Some(i) =
-                self.rows.iter().position(|r| r.id == id && r.header.is_some() == was_header)
-            {
+        if let Some(key) = anchor {
+            if let Some(i) = self.rows.iter().position(|r| (r.id, r.header, r.tool) == key) {
                 self.cursor = i;
             }
         }
@@ -568,6 +669,7 @@ impl App {
                 depth: 0,
                 sibling_max: max,
                 header: Some(Heading::Category(cat)),
+                tool: None,
             });
             if self.reclaim_open.contains(&cat) {
                 for id in &items {
@@ -576,6 +678,239 @@ impl App {
             }
             self.reclaim_cats.push((cat, items));
         }
+    }
+
+    // ---------------------------------------------------------------- tools
+
+    /// Ask every tool what it is holding.
+    ///
+    /// Fired on the first `t` and never at startup: opening a disk-usage tool
+    /// is not consent to shell out to a container daemon, and the answer would
+    /// be stale by the time anyone looked at it anyway.
+    pub fn start_tool_probe(&mut self) {
+        if self.tools_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::tools::Report::probe());
+        });
+        self.tools_rx = Some(rx);
+        self.tools_started = Some(Instant::now());
+        self.mark_dirty();
+    }
+
+    /// Collect a finished probe. Returns true if the view needs a redraw.
+    pub fn poll_tools(&mut self) -> bool {
+        let Some(rx) = self.tools_rx.as_ref() else { return false };
+        let Ok(report) = rx.try_recv() else { return false };
+        self.tools_rx = None;
+        self.tools_started = None;
+        self.tools_at = Some(Instant::now());
+        // Anything staged that the fresh answer does not know about is already
+        // gone, or was never there. Dropping it is the same rule the tree
+        // follows after a rescan.
+        self.staged_tools.retain(|k| report.get(k).is_some());
+        self.tools = Some(report);
+        self.mark_dirty();
+        true
+    }
+
+    pub fn tool_probe_running(&self) -> bool {
+        self.tools_rx.is_some()
+    }
+
+    /// The resource a row points at, if it points at one.
+    pub fn tool_of(&self, row: &Row) -> Option<&crate::tools::Resource> {
+        let (s, i) = *self.tool_flat.get(row.tool? as usize)?;
+        self.tools.as_ref()?.sources.get(s)?.items.get(i)
+    }
+
+    pub fn tool_at_cursor(&self) -> Option<&crate::tools::Resource> {
+        self.tool_of(self.rows.get(self.cursor)?)
+    }
+
+    pub fn tools_is_open(&self, source: crate::tools::Source, kind: crate::tools::Kind) -> bool {
+        self.tools_open.contains(&(source, kind))
+    }
+
+    /// Everything one tool is holding of one kind, whether or not the heading is
+    /// open — `A` on a closed heading has to stage the lot.
+    pub fn tool_items(
+        &self,
+        source: crate::tools::Source,
+        kind: crate::tools::Kind,
+    ) -> Vec<crate::tools::ToolKey> {
+        let Some(report) = self.tools.as_ref() else { return Vec::new() };
+        let Some(sr) = report.source(source) else { return Vec::new() };
+        sr.items_of(kind).into_iter().map(|i| sr.items[i].key()).collect()
+    }
+
+    /// This resource's storage is a file under the current scan root, so the
+    /// tree has already counted it.
+    ///
+    /// The inverse of the shared-layer trap and just as easy to fall into: a
+    /// VM disk image under `$HOME` is in the headline total already, and a view
+    /// that presents it as newly discovered space is the same lie the other way
+    /// round.
+    pub fn tool_in_tree(&self, path: Option<&std::path::Path>) -> bool {
+        path.is_some_and(|p| p.starts_with(self.tree.root_path()))
+    }
+
+    /// The tools view: one heading per tool and kind, each carrying the tool's
+    /// own deduplicated total.
+    fn build_tool_rows(&mut self) {
+        self.tool_flat.clear();
+        let root = self.tree.root();
+        let Some(report) = self.tools.as_ref() else { return };
+
+        // Scale every bar against the largest single figure on screen, so a
+        // 17G build cache and a 700M image look as different as they are.
+        let widest = report
+            .sources
+            .iter()
+            .flat_map(|s| s.totals.iter().map(|(_, _, r)| *r))
+            .chain(report.items().map(|r| r.bytes))
+            .max()
+            .unwrap_or(0);
+
+        let mut rows: Vec<Row> = Vec::new();
+        let mut flat: Vec<(usize, usize)> = Vec::new();
+
+        for (si, sr) in report.sources.iter().enumerate() {
+            if sr.status != crate::tools::Status::Ok {
+                rows.push(Row {
+                    id: root,
+                    depth: 0,
+                    sibling_max: widest,
+                    header: Some(Heading::ToolStatus(sr.source)),
+                    tool: None,
+                });
+                continue;
+            }
+            for kind in sr.kinds() {
+                let items = sr.items_of(kind);
+                // A kind the tool reports nothing for and holds nothing of is
+                // not worth a line.
+                if items.is_empty() && sr.total(kind).is_none_or(|(s, _)| s == 0) {
+                    continue;
+                }
+                rows.push(Row {
+                    id: root,
+                    depth: 0,
+                    sibling_max: widest,
+                    header: Some(Heading::Tool(sr.source, kind)),
+                    tool: None,
+                });
+                if !self.tools_is_open(sr.source, kind) {
+                    continue;
+                }
+                for i in items {
+                    flat.push((si, i));
+                    rows.push(Row {
+                        id: root,
+                        depth: 1,
+                        sibling_max: widest,
+                        header: None,
+                        tool: Some((flat.len() - 1) as u32),
+                    });
+                }
+            }
+        }
+
+        self.rows = rows;
+        self.tool_flat = flat;
+    }
+
+    /// Stage or unstage the resource under the cursor.
+    pub fn toggle_tool_stage(&mut self, key: crate::tools::ToolKey) {
+        if !self.staged_tools.remove(&key) {
+            self.staged_tools.insert(key);
+        }
+    }
+
+    /// What a staged batch of tool items would free. See `tools::Freed`.
+    pub fn staged_tool_freed(&self) -> crate::tools::Freed {
+        match self.tools.as_ref() {
+            Some(report) => crate::tools::freed(report, &self.staged_tools),
+            None => crate::tools::Freed::Exact(0),
+        }
+    }
+
+    /// Staged tool bytes that will really come back to the user's disk.
+    ///
+    /// Anything inside a VM image that does not shrink frees space inside that
+    /// image and nothing on the host, so it must not reach the "free space
+    /// after this batch" line.
+    pub fn staged_tool_host_bytes(&self) -> u64 {
+        let Some(report) = self.tools.as_ref() else { return 0 };
+        self.staged_tools
+            .iter()
+            .filter_map(|k| report.get(k).map(|r| (k, r)))
+            .filter(|(k, _)| {
+                report.source(k.source).is_some_and(|s| s.backing.frees_host_space())
+            })
+            .map(|(_, r)| r.bytes)
+            .sum()
+    }
+
+    /// Drop anything the tool now says cannot go, and say why.
+    ///
+    /// Re-checked here rather than trusted from staging time, because the
+    /// daemon's state moves underneath us: a container can start between `t`
+    /// and `enter`, and the image it is now using must not be in the batch.
+    pub fn review_tool_batch(&mut self) {
+        self.tools_refused.clear();
+        let Some(report) = self.tools.as_ref() else {
+            self.staged_tools.clear();
+            return;
+        };
+        let mut keep = std::collections::BTreeSet::new();
+        for key in self.staged_tools.clone() {
+            match report.get(&key) {
+                Some(r) if r.removable() => {
+                    keep.insert(key);
+                }
+                Some(r) => self
+                    .tools_refused
+                    .push((r.name.clone(), r.blocked.clone().unwrap_or_default())),
+                None => self.tools_refused.push((key.id.clone(), "no longer there".into())),
+            }
+        }
+        self.staged_tools = keep;
+    }
+
+    /// The staged tool items in removal order, biggest first.
+    pub fn tool_batch_items(&self) -> Vec<(crate::tools::ToolKey, String, u64)> {
+        let Some(report) = self.tools.as_ref() else { return Vec::new() };
+        let mut v: Vec<_> = self
+            .staged_tools
+            .iter()
+            .filter_map(|k| report.get(k))
+            .map(|r| (r.key(), r.name.clone(), r.bytes))
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v
+    }
+
+    /// Fold a finished removal back in: whatever went is no longer staged, and
+    /// the next `t` will get fresh numbers.
+    pub fn poll_tool_job(&mut self) -> bool {
+        let Some(job) = self.tool_job.as_mut() else { return false };
+        if !job.poll() {
+            return false;
+        }
+        let gone: Vec<crate::tools::ToolKey> = job
+            .done
+            .iter()
+            .filter(|o| o.result.is_ok())
+            .map(|o| o.key.clone())
+            .collect();
+        for key in gone {
+            self.staged_tools.remove(&key);
+        }
+        self.mark_dirty();
+        true
     }
 
     /// The duplicate view: one heading per group of identical files, the
@@ -610,6 +945,7 @@ impl App {
                 depth: 0,
                 sibling_max: widest,
                 header: Some(Heading::Dupes(i)),
+                tool: None,
             });
             if self.dupes_open.contains(&i) {
                 for id in shown {
@@ -901,7 +1237,27 @@ impl App {
             rows.push(BasketRow::Group { cat, count: items.len(), bytes });
             rows.extend(items.into_iter().map(BasketRow::Item));
         }
+        // Last, and under its own heading. These do not go to the trash and `u`
+        // will not bring them back, so they are never mixed in among things
+        // that will.
+        if !self.staged_tools.is_empty() {
+            rows.push(BasketRow::ToolGroup {
+                count: self.staged_tools.len(),
+                freed: self.staged_tool_freed(),
+            });
+            rows.extend(self.staged_tools.iter().cloned().map(BasketRow::ToolItem));
+        }
         rows
+    }
+
+    /// The name to show for a staged tool item, or its id if the report has
+    /// moved on underneath us.
+    pub fn tool_name(&self, key: &crate::tools::ToolKey) -> String {
+        self.tools
+            .as_ref()
+            .and_then(|r| r.get(key))
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| key.id.clone())
     }
 
     /// Free space once this batch lands, and the total, for the one number the
@@ -909,7 +1265,12 @@ impl App {
     pub fn after_commit(&self) -> Option<(u64, u64)> {
         let root = self.tree.root_path();
         let free = crate::platform::free_space(root)?;
-        Some((free.saturating_add(self.staged_bytes()), free))
+        // Only tool bytes that really come back to this disk. Everything inside
+        // a VM image that does not shrink frees space inside that image and
+        // nothing here, and putting it in this figure would make the one number
+        // the user came for the one number that is wrong.
+        let gained = self.staged_bytes().saturating_add(self.staged_tool_host_bytes());
+        Some((free.saturating_add(gained), free))
     }
 
     /// What this path did since the last scan. Resolved by path, not by id:
@@ -921,6 +1282,16 @@ impl App {
         let (now, was) =
             (self.tree.size(id, self.apparent), previous.size(then, self.apparent));
         Some(Some(now as i64 - was as i64))
+    }
+
+    /// Nothing staged on either axis.
+    ///
+    /// The two sets are never added together — the whole point of keeping them
+    /// apart — but "is there a batch" is one question, and every early-return
+    /// that used to ask `staged.is_empty()` has to ask this instead or a batch
+    /// of nothing but Docker images would look like no batch at all.
+    pub fn nothing_staged(&self) -> bool {
+        self.staged.is_empty() && self.staged_tools.is_empty()
     }
 
     pub fn staged_bytes(&self) -> u64 {
@@ -965,6 +1336,7 @@ impl App {
     /// Staged items in commit order, largest first, with anything the guard
     /// refuses split off so the modal can show it rather than fail silently.
     pub fn review_batch(&mut self) {
+        self.review_tool_batch();
         let root = self.tree.root_path().to_path_buf();
         self.refused.clear();
         let mut keep = HashSet::new();
@@ -995,14 +1367,51 @@ impl App {
         ids.iter().map(|id| (self.tree.path(*id), self.tree.size(*id, self.apparent))).collect()
     }
 
+    /// Start the batch.
+    ///
+    /// Up to two jobs, because the two halves are not the same operation and
+    /// must not be made to look like it: files go to the trash and can be put
+    /// back, tool resources are handed to the daemon that owns them and are
+    /// gone. `Mode::Deleting` polls both.
     pub fn commit(&mut self) {
         let items = self.batch_items();
-        if items.is_empty() {
+        let tools = self.tool_batch_items();
+        if items.is_empty() && tools.is_empty() {
             return;
         }
-        self.job = Some(Job::start(items, self.disposal));
+        if !items.is_empty() {
+            self.job = Some(Job::start(items, self.disposal));
+        }
+        if !tools.is_empty() {
+            self.tool_job = Some(crate::tools::Job::start(tools));
+        }
         self.mode = Mode::Deleting;
         self.mark_dirty();
+    }
+
+    /// Any tool item in the current batch lives inside a VM disk that will not
+    /// shrink, so the space it frees does not reach this disk.
+    ///
+    /// Reads the running job's own items rather than `staged_tools`, which is
+    /// emptied as each removal lands — by the time the measured figure is worth
+    /// captioning, the staged set is gone.
+    pub fn stuck_in_vm(&self) -> bool {
+        let Some(report) = self.tools.as_ref() else { return false };
+        let touched: Vec<crate::tools::Source> = match self.tool_job.as_ref() {
+            Some(job) => job.done.iter().map(|o| o.key.source).collect(),
+            None => self.staged_tools.iter().map(|k| k.source).collect(),
+        };
+        report
+            .sources
+            .iter()
+            .filter(|s| !s.backing.frees_host_space())
+            .any(|s| touched.contains(&s.source))
+    }
+
+    /// Both jobs have finished, or there were none.
+    pub fn batch_finished(&self) -> bool {
+        self.job.as_ref().is_none_or(|j| j.is_finished())
+            && self.tool_job.as_ref().is_none_or(|j| j.is_finished())
     }
 
     /// Fold finished deletions into the tree so sizes drop as they land.
@@ -1045,6 +1454,18 @@ impl App {
         self.job = None;
         self.disposal = Disposal::Trash;
         self.refused.clear();
+        if self.tool_job.take().is_some() {
+            // The report on screen described a store that has just changed
+            // underneath it. Keeping it would show sizes for things that are
+            // gone, so it is dropped and the next `t` asks again.
+            self.tools = None;
+            self.tools_at = None;
+            self.staged_tools.clear();
+            self.tools_refused.clear();
+            if self.tools_view {
+                self.start_tool_probe();
+            }
+        }
         self.mode = Mode::Normal;
         self.mark_dirty();
     }

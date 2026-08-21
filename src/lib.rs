@@ -11,6 +11,7 @@ pub mod presets;
 pub mod reclaim;
 pub mod run;
 pub mod scan;
+pub mod tools;
 pub mod trash;
 pub mod tree;
 pub mod ui;

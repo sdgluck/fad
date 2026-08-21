@@ -58,6 +58,7 @@ sign of movement reads as a hang.
 | `u` | undo the last committed batch |
 | `U` | undo history — put any of the last 20 batches back |
 | `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
+| `t` | tool storage — what Docker and friends hold that a walk cannot see |
 | `d` | duplicate view — files whose contents are byte-for-byte equal |
 | `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
 | `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
@@ -86,9 +87,10 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --cloud           descend into iCloud/Dropbox/OneDrive folders
 --apparent        report st_size instead of allocated blocks
 --reclaim         open in the reclaimable view; with --json, print that set
---yes             with --reclaim, delete instead of opening the UI
---max 10G         with --reclaim --yes, stop once this much is staged
---dry-run         with --reclaim --yes, print what would go and delete nothing
+--tools           open in the tool storage view; with --json, print that report
+--yes             with --reclaim or --tools, act instead of opening the UI
+--max 10G         with --yes, stop once this much is staged
+--dry-run         with --yes, print what would go and remove nothing
 --permanent       with --reclaim --yes, delete outright instead of trashing
 --since           print what changed since the last saved scan of this root
 --print-path      print the selected path on exit, for `cd "$(fad --print-path)"`
@@ -148,6 +150,110 @@ already share their storage, so deleting one frees nothing.
 
 `A` on a group stages every copy but the newest.
 
+## Tool storage
+
+Press `t` and `fad` asks Docker, Podman and Time Machine what they are holding.
+
+A walk cannot answer this. On macOS everything Docker owns lives inside one VM
+disk image, so a scan can only report it as a single opaque forty-gigabyte file;
+on Linux it is under `/var/lib/docker`, outside a home-directory scan and
+unreadable without root. Time Machine's local snapshots are worse — they are
+below the filesystem rather than in it, and `du` cannot see them at all. On the
+machine this was written on, `t` found 17G of cold Docker build cache that no
+amount of scanning would ever have surfaced.
+
+```
+┌ /Users/you  285G  294014 dirs, 2411907 files   tool storage ─┬ selection ──────────────┐
+│ ▾ docker · build cache · 1 · 19G  17G reclaimable ────────── │ images                  │
+│     cold build cache                       17G ████████████  │ docker                  │
+│ ▾ docker · images · 2 · 3.7G  1.4G reclaimable ───────────── │ 3.7G held in total      │
+│     nginx:latest                 724M ▍       +2.3G shared   │ 1.4G of that is spare   │
+│     <dangling>                   724M ▍       +2.3G shared   │ docker's own figure,    │
+│                                                              │ not a sum of the rows   │
+│ ⚠ docker: this will not free space on your disk              │                         │
+│   inside Docker.raw, 68G here, never shrinks                 │                         │
+└──────────────────────────────────────────────────────────────┴─────────────────────────┘
+```
+
+Nothing is asked of any daemon until `t` is pressed. `docker system df` is not a
+lookup — the daemon walks its own store to answer it, and sixteen seconds is a
+normal reply on a busy machine — so the probe runs in the background, the header
+counts the seconds while it waits, and every call is killed at a deadline rather
+than allowed to hang the UI behind a wedged daemon.
+
+A tool nobody has installed is not mentioned. One that is installed but not
+answering gets a row saying so, where its numbers would have been, because
+"docker is holding 20G" is the wrong thing to imply when we do not know.
+
+### The sizes here are on a different axis
+
+None of this is under the scan root, and none of it is added to the headline
+total. Two things follow that `fad` will not fudge.
+
+**Image sizes overlap.** Two images built on the same base each report the whole
+base. On this machine that is two images reporting 3.24GB apiece — 6.48GB
+summed — for 3.995GB of actual storage. So a heading shows the *tool's own*
+deduplicated figure and never a sum of the rows beneath it, and each row shows
+what it owns outright with the shared part reported separately and never counted:
+
+```
+nginx:latest      724M ▍   +2.3G shared
+```
+
+Removing that image gives back 724M. Removing every image that shares the base
+gives back all of it, and staging them all says so exactly. Anything in between
+is reported as a floor — `at least 1.4G` — because which layers a subset
+releases is not something `docker system df` will tell us. Whatever the estimate,
+the figure reported *afterwards* is measured by asking the tool again.
+
+**Removing something may free nothing.** Inside a VM disk image that does not
+shrink — Docker Desktop, Colima — deleting an image frees space inside that file
+and nothing on your disk until it is compacted. `fad` asks the daemon which
+backend it is, says so in a banner, and leaves those bytes out of the "free
+after this batch" line. OrbStack trims its own disk, so there the space really
+does come back and there is no warning to make. Native Linux has neither
+problem.
+
+When that disk image is itself under the scan root, the banner says so too: the
+tree above already counts it, and these are not two separate piles.
+
+### Removing things
+
+`space` stages a resource, and it joins the same basket as everything else — but
+under its own heading, and it never mixes in among the files. There is no trash
+for `docker image rm`. The confirmation says `no trash, no undo, whatever D
+says`, and `D` does not reach that half of the batch.
+
+`fad` will not touch a running container, an image a container is using, or a
+volume something is attached to. Those are shown, greyed, with the reason. The
+check runs again at the confirmation, so a container that started while you were
+staging cannot have its image pulled out from under it. Build cache is one row
+rather than six hundred, because `builder prune` is the only handle any Docker
+CLI offers and a list of individually unremovable records is a menu of things
+that do not work.
+
+`y` copies the exact command instead, for anyone who would rather run it
+themselves.
+
+### From a script
+
+```sh
+fad --tools --json                    # the whole report
+fad --tools --yes --dry-run           # what a cleanup would take
+fad --tools --yes --max 10G           # take up to 10G of it
+```
+
+`--tools --yes` only ever offers what the tool itself reports as unused, prints
+every command before running it, and is the one scripted path in `fad` that
+cannot be undone. `--max` skips rather than stops, the same rule `--reclaim`
+follows.
+
+The JSON lists every source, including ones that said nothing usable — a script
+has to be able to tell "no Docker here" from "Docker with nothing to clean".
+Each source carries its own totals and its backing caveat, and there is
+deliberately no grand total: adding a host-backed source to one living inside a
+VM disk produces exactly the number this view exists to refuse to print.
+
 ## What grew
 
 `fad` already keeps a snapshot of the last scan of each root. The detail pane
@@ -163,6 +269,7 @@ is a better target than a stable 20G one.
 fad --reclaim --yes --dry-run ~/dev     # what a cleanup would take
 fad --reclaim --yes --max 10G ~/dev     # take up to 10G of it, to the trash
 fad --since ~/dev                       # what changed since the last scan
+fad --tools --yes --dry-run             # what docker would give back
 cd "$(fad --print-path)"                # quit on a directory, land in it
 ```
 
@@ -194,6 +301,9 @@ first of its paths.
 
 - **Other filesystems.** Mount points are shown but not entered. `--cross-device`
   opts in.
+- **Anything a daemon is holding.** Docker's image store, Podman's, Time
+  Machine's local snapshots. A walk cannot attribute a VM disk image and cannot
+  see an APFS snapshot at all, so `t` asks the tools instead.
 - **Cloud folders (macOS).** iCloud Drive, Dropbox, OneDrive and similar
   FileProvider-backed folders are skipped, because reading inside one can block
   on the network for minutes. `--cloud` opts in. Linux has no equivalent skip.
@@ -267,6 +377,7 @@ for scans that ran to completion, and `--clear-cache` removes them all.
 cargo test                                    # du-parity, trash round-trips, tree arithmetic, rendering
 cargo run --release --example statbench -- ~  # per-entry stat cost
 cargo run --release --example cachebench -- ~ # snapshot build/encode/load timings
+cargo run --example toolprobe                 # what the tools view will show
 ```
 
 To run the suite on Linux from a Mac:
@@ -275,6 +386,11 @@ To run the suite on Linux from a Mac:
 docker run --rm -v "$PWD":/src:ro -w /work rust:latest bash -c \
   'cp -r /src/src /src/tests /src/examples /src/Cargo.toml /src/Cargo.lock /work/ && cargo test'
 ```
+
+The tool tests never run `docker`: the parsers are pure functions over captured
+output in `tests/fixtures`, and `FAD_DOCKER_BIN` / `FAD_PODMAN_BIN` /
+`FAD_TMUTIL_BIN` point the probe at a stub when one is wanted. The suite passes
+on a machine with no container runtime installed.
 
 Tests that redirect `HOME`, `XDG_DATA_HOME`, `FAD_STATE_DIR` or `FAD_CACHE_DIR`
 must hold `common::env_lock()` for their whole body — environment variables are

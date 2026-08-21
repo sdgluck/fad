@@ -84,6 +84,23 @@ fn header(app: &App) -> Line<'static> {
         spans.push(Span::from(" reclaimable ").bold().reversed());
         spans.push(Span::from(" "));
     }
+    if app.tools_view {
+        // Deliberately not a size. The one number that would fit here would
+        // have to span a host disk and a VM's insides, and adding those
+        // together is the thing this view exists to refuse to do.
+        let label = if app.tool_probe_running() {
+            match app.tools_started.map(|t| t.elapsed().as_secs()) {
+                // `docker system df` walks its own store; sixteen seconds with
+                // nothing wrong is normal. Show the clock so it reads as work.
+                Some(secs) if secs >= 2 => format!(" tools \u{b7} asking\u{2026} {secs}s "),
+                _ => " tools \u{b7} asking\u{2026} ".to_string(),
+            }
+        } else {
+            " tool storage ".to_string()
+        };
+        spans.push(Span::from(label).bold().reversed());
+        spans.push(Span::from(" "));
+    }
     if app.dupe_view {
         let label = match app.dupes.as_ref() {
             Some(r) => format!(" duplicates \u{b7} {} reclaimable ", human(r.wasted())),
@@ -116,6 +133,14 @@ fn empty_reason(app: &App) -> String {
             " duplicates need a finished scan \u{2014} R to rescan".to_string()
         } else {
             " no duplicates over 1M \u{2014} d for the full tree".to_string()
+        }
+    } else if app.tools_view {
+        if app.tool_probe_running() {
+            " asking each tool what it is holding\u{2026}".to_string()
+        } else if app.tools.is_none() {
+            " nothing asked yet \u{2014} t again to ask".to_string()
+        } else {
+            " no container runtime or snapshot store found on this machine".to_string()
         }
     } else if app.reclaim_view {
         " nothing reclaimable here \u{2014} r for the full tree".to_string()
@@ -228,6 +253,41 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
         )));
     }
 
+    // The one thing a size in this view cannot say for itself: whether removing
+    // it gives the user's disk anything back, and whether the tree has counted
+    // it already.
+    if app.tools_view {
+        if let Some(report) = app.tools.as_ref() {
+            for sr in &report.sources {
+                for (i, note) in sr.backing.notes().iter().enumerate() {
+                    // The tool's name once, on the first line only; the rest
+                    // are continuations of the same warning.
+                    // A tight prefix on purpose: every character here is one
+                    // the warning itself does not get.
+                    let lead =
+                        if i == 0 { format!(" \u{26a0} {}: ", sr.source.label()) } else { "   ".into() };
+                    out.push(Line::from(Span::styled(
+                        truncate_end(&format!("{lead}{note}"), width),
+                        theme.warn,
+                    )));
+                }
+                if sr.backing.notes().is_empty() {
+                    continue;
+                }
+                if app.tool_in_tree(sr.backing.disk().map(|p| p.as_path())) {
+                    out.push(Line::from(Span::styled(
+                        truncate_end(
+                            " \u{26a0} that file is under the scan root, so the tree above \
+                              already counts it \u{2014} these are not two separate piles",
+                            width,
+                        ),
+                        theme.warn,
+                    )));
+                }
+            }
+        }
+    }
+
     let cloud = app
         .tree
         .skipped
@@ -306,7 +366,12 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
         return match h {
             Heading::Category(cat) => category_line(app, theme, cat, i == app.cursor, width),
             Heading::Dupes(g) => dupe_line(app, theme, g, i == app.cursor, width),
+            Heading::Tool(src, kind) => tool_line(app, theme, src, kind, i == app.cursor, width),
+            Heading::ToolStatus(src) => tool_status_line(app, theme, src, i == app.cursor, width),
         };
+    }
+    if row.tool.is_some() {
+        return tool_row_line(app, theme, &row, i == app.cursor, width);
     }
     let n = app.tree.node(row.id);
     let selected = i == app.cursor;
@@ -400,6 +465,129 @@ fn category_line(app: &App, theme: &Theme, cat: crate::presets::Category, select
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.dim),
         Span::styled("\u{2500}".repeat(rule), theme.dim),
+    ]);
+    if selected { line.style(theme.selection) } else { line }
+}
+
+/// A tool-and-kind heading: `\u{25b8} images \u{b7} 2 \u{b7} 3.7G   1.4G reclaimable`.
+///
+/// The total is the tool's own deduplicated figure, never a sum of the rows
+/// underneath. Docker's image layers are shared, so adding up what each image
+/// reports overstates the disk — on the machine this was written on, by 62%.
+fn tool_line(
+    app: &App,
+    theme: &Theme,
+    source: crate::tools::Source,
+    kind: crate::tools::Kind,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let report = app.tools.as_ref();
+    let sr = report.and_then(|r| r.source(source));
+    let count = sr.map(|s| s.items_of(kind).len()).unwrap_or(0);
+    let arrow = if app.tools_is_open(source, kind) { '\u{25be}' } else { '\u{25b8}' };
+
+    let total = sr.and_then(|s| s.total(kind));
+    let head = match total {
+        Some((size, _)) => format!(
+            " {arrow} {} \u{b7} {} \u{b7} {} \u{b7} {} ",
+            source.label(),
+            kind.label(),
+            count,
+            human(size)
+        ),
+        None => format!(" {arrow} {} \u{b7} {} \u{b7} {} ", source.label(), kind.label(), count),
+    };
+
+    // What the tool itself says is going spare. The heading's job is to make
+    // that the first thing read.
+    let note = match total {
+        Some((_, recl)) if recl > 0 => format!(" {} reclaimable ", human(recl)),
+        _ => format!(" {} ", kind.note()),
+    };
+    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let line = Line::from(vec![
+        Span::styled(head, theme.emphasis),
+        Span::styled(note, theme.dim),
+        Span::styled("\u{2500}".repeat(rule), theme.dim),
+    ]);
+    if selected { line.style(theme.selection) } else { line }
+}
+
+/// A tool that is there but had nothing usable to say.
+///
+/// A row rather than a banner, because "docker is not running" belongs exactly
+/// where docker's numbers would have been. A tool nobody has installed never
+/// reaches here — it is not mentioned at all.
+fn tool_status_line(
+    app: &App,
+    theme: &Theme,
+    source: crate::tools::Source,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let msg = app
+        .tools
+        .as_ref()
+        .and_then(|r| r.source(source))
+        .and_then(|s| s.status.line(source))
+        .unwrap_or_else(|| format!("{} said nothing", source.program()));
+    let line = Line::from(Span::styled(truncate_end(&format!(" \u{26a0} {msg}"), width), theme.warn));
+    if selected { line.style(theme.selection) } else { line }
+}
+
+/// One resource. Same shape as a tree row so the eye does not have to relearn
+/// the column layout, with two additions the tree never needs: the storage this
+/// shares with its siblings, and the reason it cannot be removed.
+fn tool_row_line(
+    app: &App,
+    theme: &Theme,
+    row: &crate::app::Row,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let Some(r) = app.tool_of(row) else { return Line::from("") };
+    let staged = app.staged_tools.contains(&r.key());
+
+    let marker = if staged { "\u{25cf}" } else { " " };
+    // A size we do not have is left blank, not shown as zero. `tmutil` will not
+    // size a snapshot and it is not getting an invented figure.
+    let size = if r.sized() { human(r.bytes) } else { "\u{2014}".to_string() };
+    let bar = if r.sized() { bar(r.bytes, row.sibling_max) } else { " ".repeat(BAR_WIDTH) };
+
+    let suffix = if let Some(why) = &r.blocked {
+        format!(" {why}")
+    } else if r.shared() > 0 {
+        // Carried, never counted: removing this alone frees `bytes`, not
+        // `bytes + shared`.
+        format!(" +{} shared", human(r.shared()))
+    } else {
+        String::new()
+    };
+
+    let indent = "  ".repeat(row.depth as usize);
+    let fixed = 1 + indent.len() + 2 + 8 + 1 + BAR_WIDTH + 1 + suffix.chars().count();
+    let name_w = width.saturating_sub(fixed).max(6);
+    let name = truncate(&r.name, name_w);
+
+    let name_style = if staged {
+        theme.staged
+    } else if r.blocked.is_some() {
+        theme.skipped
+    } else {
+        theme.normal
+    };
+
+    let line = Line::from(vec![
+        Span::styled(marker.to_string(), theme.staged),
+        Span::raw(indent),
+        Span::styled("  ".to_string(), theme.dim),
+        Span::styled(format!("{name:<name_w$}"), name_style),
+        Span::raw(" "),
+        Span::styled(format!("{size:>8}"), theme.emphasis),
+        Span::raw(" "),
+        Span::styled(bar, theme.bar),
+        Span::styled(suffix, if r.blocked.is_some() { theme.warn } else { theme.dim }),
     ]);
     if selected { line.style(theme.selection) } else { line }
 }

@@ -49,6 +49,13 @@ struct Args {
     #[arg(long)]
     reclaim: bool,
 
+    /// What container runtimes and snapshot stores are holding: docker images,
+    /// volumes, build cache, Time Machine local snapshots. Opens the UI in that
+    /// view, or with --json prints the report and exits. This storage is not
+    /// under the scan root and is never added to its totals.
+    #[arg(long)]
+    tools: bool,
+
     /// Ignore any saved snapshot and always walk from scratch.
     #[arg(long)]
     no_cache: bool,
@@ -62,8 +69,9 @@ struct Args {
     #[arg(long)]
     print_path: bool,
 
-    /// With --reclaim, actually delete instead of opening the UI. Only ever
-    /// touches entries the built-in rules recognise.
+    /// With --reclaim or --tools, act instead of opening the UI. With --tools
+    /// it only ever touches resources the tool itself reports as unused, and
+    /// removal there is permanent: there is no trash for `docker image rm`.
     #[arg(long)]
     yes: bool,
 
@@ -135,6 +143,19 @@ fn main() {
         }
     };
 
+    // Asking the tools has nothing to do with the walk, so it does not wait for
+    // one. `--tools --json` on a big home directory should not cost a scan it
+    // will not print.
+    if args.tools && (args.json || args.yes) {
+        let report = fad::tools::Report::probe();
+        std::process::exit(if args.json {
+            print_tools_json(&report);
+            0
+        } else {
+            tools_now(&report, &args)
+        });
+    }
+
     if args.json {
         scan.finish(&mut tree);
         tree.sort_all_by_size(args.apparent);
@@ -166,6 +187,10 @@ fn main() {
     app.apparent = args.apparent;
     app.mouse = !args.no_mouse;
     app.reclaim_view = args.reclaim;
+    if args.tools {
+        app.tools_view = true;
+        app.start_tool_probe();
+    }
     if !args.no_cache {
         app.load_snapshot_async();
     }
@@ -274,6 +299,191 @@ fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
     println!("reclaimed {}", human(job.freed()));
     if !args.permanent {
         println!("still in the trash until you empty it");
+    }
+    i32::from(!failures.is_empty())
+}
+
+/// The tools report as JSON.
+///
+/// Every source appears, including the ones that said nothing usable: a script
+/// has to be able to tell "no Docker here" from "Docker with nothing to clean",
+/// and an absent key does not say which.
+///
+/// There is deliberately no top-level total. Adding a host-backed source to one
+/// living inside a VM disk produces exactly the number this view exists to
+/// refuse to print.
+fn print_tools_json(report: &fad::tools::Report) {
+    use serde_json::{Map, Value, json};
+
+    let sources: Vec<Value> = report
+        .sources
+        .iter()
+        .map(|s| {
+            let mut o = Map::new();
+            o.insert("source".into(), json!(s.source.label()));
+            o.insert("status".into(), json!(status_word(&s.status)));
+            if let Some(line) = s.status.line(s.source) {
+                o.insert("status_detail".into(), json!(line));
+            }
+            o.insert(
+                "backing".into(),
+                json!(match &s.backing {
+                    fad::tools::Backing::Host => "host",
+                    fad::tools::Backing::VmDisk { shrinks: true, .. } => "vm_disk_auto_shrink",
+                    fad::tools::Backing::VmDisk { .. } => "vm_disk",
+                }),
+            );
+            if let fad::tools::Backing::VmDisk { disk, host_bytes, .. } = &s.backing {
+                o.insert(
+                    "vm_disk".into(),
+                    json!({
+                        "path": disk.as_ref().map(|p| p.display().to_string()),
+                        "host_bytes": host_bytes,
+                    }),
+                );
+            }
+            // The caveat travels with the data. A script that prints "freed
+            // 4G" off this without it would be as wrong as the UI would be.
+            if !s.backing.notes().is_empty() {
+                o.insert("note".into(), json!(s.backing.notes().join("; ")));
+            }
+            o.insert(
+                "totals".into(),
+                Value::Array(
+                    s.totals
+                        .iter()
+                        .map(|(k, size, recl)| {
+                            json!({
+                                "kind": k.label(),
+                                "bytes": size,
+                                "size": human(*size),
+                                "reclaimable_bytes": recl,
+                                "reclaimable": human(*recl),
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+            o.insert(
+                "items".into(),
+                Value::Array(s.items.iter().map(tool_item_json).collect()),
+            );
+            Value::Object(o)
+        })
+        .collect();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "sources": sources,
+            "totals_are_not_sums_of_items":
+                "each source's totals come from the tool itself; item sizes are \
+                 per-item unique storage and shared bytes are reported separately",
+        }))
+        .unwrap()
+    );
+}
+
+fn tool_item_json(r: &fad::tools::Resource) -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "kind": r.kind.label(),
+        "id": r.id,
+        "name": r.name,
+        // What removing this alone frees. Summable across items; `shared_bytes`
+        // is not, and is why the two are separate fields.
+        "bytes": r.sized().then_some(r.bytes),
+        "size": r.sized().then(|| human(r.bytes)),
+        "shared_bytes": r.shared(),
+        "reported_by_tool": r.reported,
+        "idle": r.idle,
+        "blocked": r.blocked,
+        "last_used": r.last_used,
+        "restore_with": r.restore,
+        "remove_with": fad::tools::remove_line(&r.key()),
+    })
+}
+
+fn status_word(s: &fad::tools::Status) -> &'static str {
+    use fad::tools::Status;
+    match s {
+        Status::Missing => "missing",
+        Status::NotRunning(_) => "not_running",
+        Status::Ok => "ok",
+        Status::Failed(_) => "failed",
+        Status::TimedOut => "timed_out",
+        Status::Unsupported { .. } => "unsupported",
+    }
+}
+
+/// `--tools --yes`: remove what the tools themselves call unused.
+///
+/// As deliberately narrow as `--reclaim --yes`, and narrower in one way: it
+/// only ever offers what the tool reports as idle and unheld, and it prints
+/// every command before running it. It is also the one scripted path in fad
+/// that cannot be undone, so it says so before it starts.
+fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
+    let chosen = report.candidates(args.min_size);
+    let items: Vec<&fad::tools::Resource> =
+        chosen.iter().filter_map(|k| report.get(k)).collect();
+
+    // Same rule as --reclaim --max: skip anything that would take the batch
+    // over the cap rather than stopping at the first overshoot.
+    let mut running = 0u64;
+    let items: Vec<&fad::tools::Resource> = items
+        .into_iter()
+        .filter(|r| match args.max {
+            Some(max) if running + r.bytes > max => false,
+            _ => {
+                running += r.bytes;
+                true
+            }
+        })
+        .collect();
+
+    if items.is_empty() {
+        println!("fad: nothing the tools report as unused");
+        return 0;
+    }
+
+    for r in &items {
+        println!("{:>8}  {}", human(r.bytes), fad::tools::remove_line(&r.key()));
+    }
+    // Report-aware, so that taking *every* image of a kind reports the tool's
+    // own exact total rather than a floor: with nothing left behind to hold a
+    // shared layer, the shared bytes go too.
+    let set: std::collections::BTreeSet<_> = items.iter().map(|r| r.key()).collect();
+    let amount = fad::tools::freed(report, &set).label();
+    println!(
+        "{}: {} item(s), {amount}",
+        if args.dry_run { "would remove" } else { "removing permanently" },
+        items.len()
+    );
+    for s in &report.sources {
+        for note in s.backing.notes() {
+            println!("note: {} \u{2014} {note}", s.source.label());
+        }
+    }
+    if args.dry_run {
+        return 0;
+    }
+
+    let batch: Vec<_> = items.iter().map(|r| (r.key(), r.name.clone(), r.bytes)).collect();
+    let mut job = fad::tools::Job::start(batch);
+    while !job.is_finished() {
+        job.poll();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    job.poll();
+
+    let failures = job.failures();
+    for o in &failures {
+        eprintln!("fad: {}: {}", o.label, o.result.as_ref().err().cloned().unwrap_or_default());
+    }
+    // Measured by asking the tools again, not by adding up what we hoped for.
+    match job.measured {
+        Some(bytes) => println!("freed {} (measured)", human(bytes)),
+        None => println!("removed {} item(s)", job.done.len() - failures.len()),
     }
     i32::from(!failures.is_empty())
 }

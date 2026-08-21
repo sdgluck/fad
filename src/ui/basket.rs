@@ -15,15 +15,27 @@ use super::Theme;
 use crate::app::{App, BasketRow};
 use crate::format::human;
 
+/// Two counts, never one sum: the trashable half and the permanent half are
+/// different operations and adding their totals would imply one number that is
+/// true of neither.
+fn title(app: &App) -> String {
+    let files = format!(" staged \u{b7} {} item(s) \u{b7} {} ", app.staged.len(), human(app.staged_bytes()));
+    if app.staged_tools.is_empty() {
+        return files;
+    }
+    format!(
+        "{files}+ {} from tools \u{b7} {} ",
+        app.staged_tools.len(),
+        app.staged_tool_freed().short()
+    )
+}
+
 pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let rows = app.basket_rows();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.staged)
-        .title(
-            format!(" staged \u{b7} {} item(s) \u{b7} {} ", app.staged.len(), human(app.staged_bytes()))
-                .bold(),
-        );
+        .title(title(app).bold());
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -31,6 +43,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let mut lines = Vec::new();
 
     // The number people are actually here for, when the platform will tell us.
+    // Tool bytes reach it only where they really come back to this disk; see
+    // `App::after_commit`.
     if let Some((after, before)) = app.after_commit() {
         lines.push(Line::from(vec![
             Span::styled("free after this batch  ", theme.dim),
@@ -61,6 +75,31 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Line::from(vec![
                     Span::styled(head, theme.emphasis),
                     Span::styled("\u{2500}".repeat(rule), theme.dim),
+                ])
+            }
+            BasketRow::ToolGroup { count, freed } => {
+                // A floor, not a figure, whenever these share layers: what the
+                // extra comes to depends on which of them share what.
+                let head = format!(" tool storage \u{b7} {count} \u{b7} {} ", freed.label());
+                let note = " permanent \u{b7} no trash, no undo ";
+                let rule = width
+                    .saturating_sub(head.chars().count() + note.chars().count() + 1);
+                Line::from(vec![
+                    Span::styled(head, theme.staged),
+                    Span::styled(note, theme.warn),
+                    Span::styled("\u{2500}".repeat(rule), theme.dim),
+                ])
+            }
+            BasketRow::ToolItem(key) => {
+                let name = app.tool_name(key);
+                let cmd = crate::tools::remove_display(key);
+                let room = width.saturating_sub(4);
+                Line::from(vec![
+                    Span::styled("  \u{25cf} ", theme.staged),
+                    Span::styled(
+                        super::compress(&format!("{name}   {cmd}"), room),
+                        theme.normal,
+                    ),
                 ])
             }
             BasketRow::Item(id) => {

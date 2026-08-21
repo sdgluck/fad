@@ -70,6 +70,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
         app.poll_scan();
         app.poll_job();
         app.poll_dupes();
+        app.poll_tools();
+        app.poll_tool_job();
 
         let tick = if app.scanning() { SCAN_TICK } else { IDLE_TICK };
         if last_draw.elapsed() >= tick {
@@ -159,6 +161,8 @@ fn click(app: &mut App, column: u16, row: u16) {
         let open = match r.header {
             Some(Heading::Category(c)) => app.reclaim_is_open(c),
             Some(Heading::Dupes(g)) => app.dupes_is_open(g),
+            Some(Heading::Tool(src, kind)) => app.tools_is_open(src, kind),
+            Some(Heading::ToolStatus(_)) => false,
             None => app.expanded.contains(&r.id),
         };
         if open { collapse(app) } else { expand(app) }
@@ -220,16 +224,22 @@ fn basket_key(app: &mut App, k: KeyEvent) {
                     let cat = *cat;
                     app.staged.retain(|id| app.tree.node(*id).preset != cat);
                 }
+                Some(BasketRow::ToolItem(key)) => {
+                    let key = key.clone();
+                    app.staged_tools.remove(&key);
+                }
+                Some(BasketRow::ToolGroup { .. }) => app.staged_tools.clear(),
                 None => {}
             }
             let len = app.basket_rows().len();
             app.basket_cursor = app.basket_cursor.min(len.saturating_sub(1));
-            if app.staged.is_empty() {
+            if app.nothing_staged() {
                 app.mode = Mode::Normal;
             }
         }
         KeyCode::Char('C') => {
             app.staged.clear();
+            app.staged_tools.clear();
             app.mode = Mode::Normal;
             app.status = Some("batch cleared".into());
         }
@@ -249,7 +259,8 @@ fn confirm_key(app: &mut App, k: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.disposal = Disposal::Trash;
             app.refused.clear();
-            app.mode = if app.staged.is_empty() { Mode::Normal } else { Mode::Basket };
+            app.tools_refused.clear();
+            app.mode = if app.nothing_staged() { Mode::Normal } else { Mode::Basket };
         }
         // Uppercase on purpose: a permanent delete should never be one
         // relaxed keystroke away from a recoverable one.
@@ -266,8 +277,8 @@ fn confirm_key(app: &mut App, k: KeyEvent) {
 }
 
 fn deleting_key(app: &mut App, k: KeyEvent) {
-    let done = app.job.as_ref().is_some_and(|j| j.is_finished());
-    if done && matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+    // Both halves, or the modal closes while a removal is still running.
+    if app.batch_finished() && matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
         app.finish_job();
     }
 }
@@ -317,7 +328,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             app.status = Some(format!("sorting by {}", app.sort.label()));
         }
         KeyCode::Char('x') => {
-            if app.staged.is_empty() {
+            if app.nothing_staged() {
                 app.status = Some("nothing staged".into());
             } else {
                 app.basket_cursor = 0;
@@ -332,6 +343,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('r') => toggle_reclaim(app),
         KeyCode::Char('d') => toggle_dupes(app),
+        KeyCode::Char('t') => toggle_tools(app),
         KeyCode::Char('a') => {
             app.age_filter = app.age_filter.next();
             app.status = Some(format!("showing {}", app.age_filter.label()));
@@ -340,7 +352,17 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('e') => open_editor(app),
         KeyCode::Char('y') => copy_path(app),
         KeyCode::Char('i') => ignore_selected(app),
-        KeyCode::Char('R') => rescan(app),
+        KeyCode::Char('R') => {
+            // In the tools view there is no tree to rescan: R means ask the
+            // tools again, which is the only thing here that goes stale.
+            if app.tools_view {
+                app.tools = None;
+                app.start_tool_probe();
+                app.status = Some("asking again\u{2026}".into());
+            } else {
+                rescan(app)
+            }
+        }
         KeyCode::Char('?') => app.mode = Mode::Help,
         _ => {}
     }
@@ -348,6 +370,10 @@ fn normal_key(app: &mut App, k: KeyEvent) {
 }
 
 fn reveal(app: &mut App) {
+    if app.tool_at_cursor().is_some() {
+        app.status = Some("this is not a file \u{2014} y copies the command that removes it".into());
+        return;
+    }
     let Some(id) = app.selected() else { return };
     let path = app.tree.path(id);
     match crate::platform::reveal(&path) {
@@ -393,6 +419,20 @@ fn ignore_selected(app: &mut App) {
 }
 
 fn copy_path(app: &mut App) {
+    // On a tool row there is no path to copy, and the useful thing to put on
+    // the clipboard is the command that would remove it — which is also the
+    // whole of what fad offers anyone who would rather not let it do the
+    // removing.
+    if let Some(r) = app.tool_at_cursor() {
+        let cmd = crate::tools::remove_line(&r.key());
+        return match crate::platform::copy_to_clipboard(&cmd) {
+            Ok(()) => app.status = Some(format!("copied: {cmd}")),
+            Err(_) => {
+                app.status =
+                    Some(format!("no clipboard \u{2014} {}", crate::platform::clipboard_hint()))
+            }
+        };
+    }
     let Some(id) = app.selected() else { return };
     let path = app.tree.path(id);
     match crate::platform::copy_to_clipboard(&path.to_string_lossy()) {
@@ -443,6 +483,10 @@ fn expand(app: &mut App) {
         let opened = match h {
             Heading::Category(cat) => app.reclaim_open.insert(cat),
             Heading::Dupes(i) => app.dupes_open.insert(i),
+            Heading::Tool(src, kind) => app.tools_open.insert((src, kind)),
+            // Nothing under it to open: it is the tool saying why it has
+            // nothing to say.
+            Heading::ToolStatus(_) => false,
         };
         if opened {
             return;
@@ -478,6 +522,8 @@ fn collapse(app: &mut App) {
         match h {
             Heading::Category(cat) => app.reclaim_open.remove(&cat),
             Heading::Dupes(i) => app.dupes_open.remove(&i),
+            Heading::Tool(src, kind) => app.tools_open.remove(&(src, kind)),
+            Heading::ToolStatus(_) => false,
         };
         return;
     }
@@ -499,8 +545,26 @@ fn toggle_stage(app: &mut App) {
         app.status = Some(match h {
             Heading::Category(_) => "A stages the whole category".into(),
             Heading::Dupes(_) => "A stages every copy but the newest".to_string(),
+            Heading::Tool(..) => "A stages everything under this heading".into(),
+            Heading::ToolStatus(src) => {
+                format!("nothing to stage \u{2014} {} said nothing usable", src.program())
+            }
         });
         return;
+    }
+    // A tool row is not a tree node, and the daemon's own answer decides
+    // whether it can go at all.
+    if let Some(row) = app.rows.get(app.cursor).copied() {
+        if row.tool.is_some() {
+            let Some(r) = app.tool_of(&row) else { return };
+            if let Some(why) = r.blocked.clone() {
+                app.status = Some(format!("{} \u{2014} {why}", r.name));
+                return;
+            }
+            let key = r.key();
+            app.toggle_tool_stage(key);
+            return;
+        }
     }
     let Some(id) = app.selected() else { return };
     if id == app.tree.root() {
@@ -549,14 +613,56 @@ fn toggle_dupes(app: &mut App) {
     app.status = Some("hashing candidates\u{2026}".into());
 }
 
+/// The tools view. Nothing is asked of any daemon until this is pressed.
+fn toggle_tools(app: &mut App) {
+    app.tools_view = !app.tools_view;
+    app.cursor = 0;
+    app.offset = 0;
+    if !app.tools_view {
+        return;
+    }
+    // All three of these are lists of groups; showing two at once would mean
+    // two different things by the same heading.
+    app.reclaim_view = false;
+    app.dupe_view = false;
+    if app.tools.is_some() || app.tool_probe_running() {
+        return;
+    }
+    app.start_tool_probe();
+    app.status = Some("asking docker\u{2026}".into());
+}
+
 fn stage_children(app: &mut App) {
     // On a category heading, `A` means the whole category. On a duplicate
     // group it means every copy *but one* — staging all of them would delete
     // the file, which is never what "these are duplicates" is asking for.
     if let Some(h) = app.rows.get(app.cursor).and_then(|r| r.header) {
+        // On a tool heading it means everything the tool will let go of.
+        if let Heading::Tool(src, kind) = h {
+            let keys: Vec<crate::tools::ToolKey> = app
+                .tool_items(src, kind)
+                .into_iter()
+                .filter(|k| {
+                    app.tools.as_ref().and_then(|r| r.get(k)).is_some_and(|r| r.removable())
+                })
+                .collect();
+            if keys.is_empty() {
+                app.status = Some("nothing here can be removed while it is in use".into());
+                return;
+            }
+            let all = keys.iter().all(|k| app.staged_tools.contains(k));
+            for k in keys {
+                if all { app.staged_tools.remove(&k); } else { app.staged_tools.insert(k); }
+            }
+            return;
+        }
+        if matches!(h, Heading::ToolStatus(_)) {
+            return;
+        }
         let items = match h {
             Heading::Category(cat) => app.reclaim_items(cat),
             Heading::Dupes(i) => app.dupe_items(i).into_iter().skip(1).collect(),
+            Heading::Tool(..) | Heading::ToolStatus(_) => unreachable!("handled above"),
         };
         if items.is_empty() {
             return;

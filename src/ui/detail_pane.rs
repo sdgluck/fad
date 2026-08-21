@@ -21,6 +21,179 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     draw_staged(f, app, theme, split[1]);
 }
 
+/// A tool heading: what the tool says about this kind as a whole, and the
+/// caveats that apply to all of it.
+///
+/// `None` for any other heading, which keeps the tree's own detail pane
+/// untouched.
+fn tool_heading_detail(
+    app: &App,
+    theme: &Theme,
+    heading: crate::app::Heading,
+) -> Option<Vec<Line<'static>>> {
+    use crate::app::Heading;
+    let report = app.tools.as_ref()?;
+    let mut lines = Vec::new();
+
+    let source = match heading {
+        Heading::Tool(source, kind) => {
+            let sr = report.source(source)?;
+            let items = sr.items_of(kind);
+            lines.push(Line::from(Span::styled(kind.label().to_string(), theme.emphasis)));
+            lines.push(Line::from(Span::styled(source.label().to_string(), theme.dim)));
+
+            if let Some((size, reclaimable)) = sr.total(kind) {
+                lines.push(Line::from(vec![
+                    Span::styled(human(size), theme.emphasis),
+                    Span::styled(" held in total", theme.dim),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled(human(reclaimable), theme.emphasis),
+                    Span::styled(" of that is going spare", theme.dim),
+                ]));
+                // The one thing a reader might reasonably try to check for
+                // themselves, and would get a different answer to.
+                lines.push(Line::from(Span::styled(
+                    format!("{}'s own figure, not a sum of the rows", source.program()),
+                    theme.dim,
+                )));
+                if items.iter().any(|i| sr.items[*i].shared() > 0) {
+                    lines.push(Line::from(Span::styled(
+                        "these share layers, so adding the rows up would count                          the shared ones more than once",
+                        theme.dim,
+                    )));
+                }
+            }
+
+            let blocked = items.iter().filter(|i| !sr.items[**i].removable()).count();
+            if blocked > 0 {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("{blocked} in use and left alone"),
+                    theme.warn,
+                )));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(kind.note().to_string(), theme.dim)));
+            lines.push(Line::from(Span::styled(
+                "A stages everything here that can go",
+                theme.dim,
+            )));
+            source
+        }
+        Heading::ToolStatus(source) => {
+            let sr = report.source(source)?;
+            lines.push(Line::from(Span::styled(source.label().to_string(), theme.emphasis)));
+            if let Some(line) = sr.status.line(source) {
+                lines.push(Line::from(Span::styled(line, theme.warn)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "nothing is being claimed about its disk, because we do not know",
+                theme.dim,
+            )));
+            source
+        }
+        _ => return None,
+    };
+
+    if let Some(sr) = report.source(source) {
+        let notes = sr.backing.notes();
+        if !notes.is_empty() {
+            lines.push(Line::from(""));
+            for n in notes {
+                lines.push(Line::from(Span::styled(n, theme.warn)));
+            }
+        }
+    }
+    Some(lines)
+}
+
+/// The selection, when the selection is something a tool is holding.
+///
+/// The one number a tree row never has to explain is what its size means. Here
+/// it does: what removing this alone frees, what it shares with its siblings,
+/// what the tool itself calls it, and — because it is the whole point — the
+/// exact command that would do it.
+fn tool_detail(app: &App, theme: &Theme) -> Vec<Line<'static>> {
+    let Some(r) = app.tool_at_cursor() else { return Vec::new() };
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(r.name.clone(), theme.emphasis)));
+    lines.push(Line::from(Span::styled(
+        format!("{} \u{b7} {}", r.source.label(), r.kind.label()),
+        theme.dim,
+    )));
+
+    if r.sized() {
+        lines.push(Line::from(vec![
+            Span::styled(human(r.bytes), theme.emphasis),
+            Span::styled(" freed by removing this", theme.dim),
+        ]));
+        if r.shared() > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("{} more is shared with other {} and stays", human(r.shared()), r.kind.label()),
+                theme.dim,
+            )));
+        }
+        // Docker counts in powers of ten and fad counts in powers of two, so
+        // the two figures will not match digit for digit. Showing the tool's
+        // own string is the difference between a unit and a discrepancy.
+        if !r.reported.is_empty() && r.reported != human(r.bytes) {
+            lines.push(Line::from(Span::styled(
+                format!("{} says {}", r.source.program(), r.reported),
+                theme.dim,
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("{} does not report a size", r.source.program()),
+            theme.warn,
+        )));
+    }
+
+    if let Some(last) = &r.last_used {
+        lines.push(Line::from(Span::styled(last.clone(), theme.dim)));
+    }
+
+    lines.push(Line::from(""));
+    if let Some(why) = &r.blocked {
+        lines.push(Line::from(Span::styled(format!("in use \u{2014} {why}"), theme.warn)));
+        lines.push(Line::from(Span::styled("fad will not remove it", theme.warn)));
+    } else {
+        lines.push(Line::from(Span::styled("removed with", theme.dim)));
+        lines.push(Line::from(Span::styled(crate::tools::remove_display(&r.key()), theme.emphasis)));
+        lines.push(Line::from(Span::styled("permanent \u{2014} no trash, no undo", theme.staged)));
+    }
+
+    // The same promise `rebuild_command` makes for a build directory: not
+    // "your next build handles it" but the command itself.
+    if let Some(restore) = &r.restore {
+        lines.push(Line::from(Span::styled("put back with", theme.dim)));
+        lines.push(Line::from(Span::styled(restore.clone(), theme.emphasis)));
+    }
+
+    if !r.detail.is_empty() {
+        lines.push(Line::from(""));
+        for d in &r.detail {
+            lines.push(Line::from(Span::styled(d.clone(), theme.dim)));
+        }
+    }
+
+    if let Some(p) = &r.path {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            super::compress(&p.display().to_string(), 36),
+            theme.dim,
+        )));
+        if app.tool_in_tree(Some(p)) {
+            lines.push(Line::from(Span::styled("the tree above already counts this", theme.warn)));
+        }
+    }
+    lines
+}
+
 fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -28,6 +201,26 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .title(" selection ".to_string());
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // A tool row has no node behind it, so it gets its own pane rather than a
+    // tree row's shape with the fields blanked out. A tool *heading* has none
+    // either — it carries the root's id as a placeholder, and without this the
+    // pane would describe the scan root as if that were the selection.
+    if let Some(row) = app.rows.get(app.cursor).copied() {
+        if row.tool.is_some() {
+            f.render_widget(
+                Paragraph::new(tool_detail(app, theme)).wrap(Wrap { trim: true }),
+                inner,
+            );
+            return;
+        }
+        if let Some(h) = row.header {
+            if let Some(lines) = tool_heading_detail(app, theme, h) {
+                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+                return;
+            }
+        }
+    }
 
     let Some(id) = app.selected() else { return };
     let n = app.tree.node(id);

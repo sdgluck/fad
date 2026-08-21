@@ -18,36 +18,98 @@ use super::compress;
 
 pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let items = app.batch_items();
+    let tools = app.tool_batch_items();
     let total: u64 = items.iter().map(|(_, b)| b).sum();
     let permanent = app.disposal == Disposal::Permanent;
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{} ", items.len()), theme.emphasis),
-        Span::styled("item(s), ", theme.normal),
-        Span::styled(human(total), theme.emphasis),
-        Span::styled(" reclaimed", theme.normal),
-    ])];
+    // Fewer of each when both halves are present, so neither is pushed off.
+    let shown = if tools.is_empty() { 8 } else { 4 };
 
-    lines.push(Line::from(if permanent {
-        Span::styled("permanently deleted — this cannot be undone", theme.staged)
-    } else {
-        Span::styled("moved to the Trash — u puts them back", theme.normal)
-    }));
-    lines.push(Line::from(""));
+    let mut lines = Vec::new();
 
-    // Show the biggest handful; the tail is what the count is for.
-    const SHOWN: usize = 8;
-    for (path, bytes) in items.iter().take(SHOWN) {
+    if !items.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(format!("{:>8}  ", human(*bytes)), theme.emphasis),
-            Span::styled(compress(&path.display().to_string(), 52), theme.dim),
+            Span::styled(format!("{} ", items.len()), theme.emphasis),
+            Span::styled("item(s), ", theme.normal),
+            Span::styled(human(total), theme.emphasis),
+            Span::styled(" reclaimed", theme.normal),
         ]));
+        lines.push(Line::from(if permanent {
+            Span::styled("permanently deleted — this cannot be undone", theme.staged)
+        } else {
+            Span::styled("moved to the Trash — u puts them back", theme.normal)
+        }));
+        lines.push(Line::from(""));
+
+        // Show the biggest handful; the tail is what the count is for.
+        for (path, bytes) in items.iter().take(shown) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>8}  ", human(*bytes)), theme.emphasis),
+                Span::styled(compress(&path.display().to_string(), 52), theme.dim),
+            ]));
+        }
+        if items.len() > shown {
+            lines.push(Line::from(Span::styled(
+                format!("        … and {} more", items.len() - shown),
+                theme.dim,
+            )));
+        }
     }
-    if items.len() > SHOWN {
+
+    // The permanent half, always in its own block. `D` does not reach it: there
+    // is no trash for `docker image rm`, so there is no choice to offer, and
+    // sitting it among things that *can* come back is how someone reads one
+    // line and assumes it applies to both.
+    if !tools.is_empty() {
+        if !items.is_empty() {
+            lines.push(Line::from(""));
+        }
+        let freed = app.staged_tool_freed();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", tools.len()), theme.staged),
+            Span::styled("from tools, ", theme.normal),
+            Span::styled(freed.label(), theme.staged),
+            Span::styled(" freed", theme.normal),
+        ]));
         lines.push(Line::from(Span::styled(
-            format!("        … and {} more", items.len() - SHOWN),
-            theme.dim,
+            "handed back to the tool — no trash, no undo, whatever D says",
+            theme.staged,
         )));
+        if !freed.is_exact() {
+            // "at least" is not hedging, and saying why stops it reading as
+            // hedging.
+            lines.push(Line::from(Span::styled(
+                "a floor because these share layers; the figure after is measured",
+                theme.dim,
+            )));
+        }
+        if let Some(note) = host_note(app) {
+            lines.push(Line::from(Span::styled(note, theme.warn)));
+        }
+        for (key, name, bytes) in tools.iter().take(shown) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>8}  ", human(*bytes)), theme.staged),
+                Span::styled(
+                    compress(&format!("{name}   {}", crate::tools::remove_display(key)), 52),
+                    theme.dim,
+                ),
+            ]));
+        }
+        if tools.len() > shown {
+            lines.push(Line::from(Span::styled(
+                format!("        … and {} more", tools.len() - shown),
+                theme.dim,
+            )));
+        }
+        if !app.tools_refused.is_empty() {
+            lines.push(Line::from(Span::styled("in use, left alone:", theme.warn)));
+            for (name, why) in app.tools_refused.iter().take(2) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {name} — {why}"),
+                    theme.warn,
+                )));
+            }
+        }
     }
 
     if !app.refused.is_empty() {
@@ -70,37 +132,70 @@ pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ),
         Span::styled(" D ", theme.emphasis),
         Span::styled(
-            if permanent { "back to Trash   " } else { "delete permanently   " },
+            if items.is_empty() {
+                "\u{2014}   "
+            } else if permanent {
+                "back to Trash   "
+            } else {
+                "delete permanently   "
+            },
             theme.dim,
         ),
         Span::styled(" esc ", theme.emphasis),
         Span::styled("cancel", theme.dim),
     ]));
 
-    let title = if permanent { " permanently delete " } else { " move to Trash " };
-    popup(f, theme, area, title, lines, permanent);
+    let title = if !tools.is_empty() && !items.is_empty() {
+        " delete and remove "
+    } else if !tools.is_empty() {
+        " remove permanently "
+    } else if permanent {
+        " permanently delete "
+    } else {
+        " move to Trash "
+    };
+    // Anything unrecoverable in the batch makes the whole frame the warning
+    // colour, whichever half it came from.
+    popup(f, theme, area, title, lines, permanent || !tools.is_empty());
+}
+
+/// Whether the staged tool bytes actually return to this disk, when they do not
+/// all do so.
+fn host_note(app: &App) -> Option<String> {
+    let report = app.tools.as_ref()?;
+    let stuck: Vec<&str> = report
+        .sources
+        .iter()
+        .filter(|s| !s.backing.frees_host_space())
+        .filter(|s| app.staged_tools.iter().any(|k| k.source == s.source))
+        .map(|s| s.source.label())
+        .collect();
+    if stuck.is_empty() {
+        return None;
+    }
+    Some(format!(
+        // Short enough to survive the popup's width: the clause that matters
+        // is the one about free space, and a longer sentence loses it.
+        "{} keeps this in a VM disk \u{2014} free space will not move yet",
+        stuck.join(" and ")
+    ))
 }
 
 pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let Some(job) = app.job.as_ref() else { return };
-    let done = job.done.len();
-    let failures = job.failures();
+    let mut lines = Vec::new();
+    let mut total = 0usize;
+    let mut done = 0usize;
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{done}/{} ", job.total), theme.emphasis),
-        Span::styled("done · ", theme.dim),
-        Span::styled(human(job.freed()), theme.emphasis),
-        Span::styled(" reclaimed", theme.dim),
-    ])];
-    lines.push(Line::from(progress_bar(done, job.total, 44)));
-
-    if !failures.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("{} failed:", failures.len()),
-            theme.warn,
-        )));
-        for o in failures.iter().take(4) {
+    if let Some(job) = app.job.as_ref() {
+        total += job.total;
+        done += job.done.len();
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}/{} ", job.done.len(), job.total), theme.emphasis),
+            Span::styled("deleted · ", theme.dim),
+            Span::styled(human(job.freed()), theme.emphasis),
+            Span::styled(" reclaimed", theme.dim),
+        ]));
+        for o in job.failures().iter().take(3) {
             let why = o.result.as_ref().err().cloned().unwrap_or_default();
             lines.push(Line::from(Span::styled(
                 format!("  {} — {why}", compress(&o.path.display().to_string(), 40)),
@@ -109,19 +204,69 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    lines.push(Line::from(""));
-    if job.is_finished() {
-        let hint = if job.disposal == Disposal::Trash && failures.len() < job.total {
-            "enter to close · u to undo this batch"
-        } else {
-            "enter to close"
+    if let Some(job) = app.tool_job.as_ref() {
+        total += job.total;
+        done += job.done.len();
+        // Once the measurement lands it replaces the estimate outright. The
+        // predicted figure was bounds; this one is the tools' own totals before
+        // and after, which is the only number here that was not a guess.
+        let (amount, label) = match job.measured {
+            Some(b) => (human(b), " freed, measured"),
+            None if job.is_finished() => (human(job.expected()), " freed, measuring…"),
+            None => (human(job.expected()), " freed so far"),
         };
-        lines.push(Line::from(Span::styled(hint, theme.dim)));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}/{} ", job.done.len(), job.total), theme.staged),
+            Span::styled("removed · ", theme.dim),
+            Span::styled(amount, theme.staged),
+            Span::styled(label, theme.dim),
+        ]));
+        for o in job.failures().iter().take(3) {
+            let why = o.result.as_ref().err().cloned().unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("  {} — {why}", compress(&o.label, 40)),
+                theme.warn,
+            )));
+        }
+        if job.measured.is_some() && !app.stuck_in_vm() {
+            // Nothing to caveat: the space is really back.
+        } else if job.measured.is_some() {
+            lines.push(Line::from(Span::styled(
+                "that came back inside the VM disk, not on your own",
+                theme.warn,
+            )));
+        }
+    }
+
+    lines.push(Line::from(progress_bar(done, total, 44)));
+    lines.push(Line::from(""));
+
+    let finished = app.batch_finished();
+    if finished {
+        let undoable = app
+            .job
+            .as_ref()
+            .is_some_and(|j| j.disposal == Disposal::Trash && j.failures().len() < j.total);
+        lines.push(Line::from(Span::styled(
+            if undoable {
+                "enter to close · u to undo the deleted files"
+            } else {
+                "enter to close"
+            },
+            theme.dim,
+        )));
     } else {
         lines.push(Line::from(Span::styled("working…", theme.dim)));
     }
 
-    popup(f, theme, area, " deleting ", lines, false);
+    let title = if app.tool_job.is_some() && app.job.is_some() {
+        " deleting and removing "
+    } else if app.tool_job.is_some() {
+        " removing "
+    } else {
+        " deleting "
+    };
+    popup(f, theme, area, title, lines, app.tool_job.is_some());
 }
 
 fn progress_bar(done: usize, total: usize, width: usize) -> Line<'static> {
