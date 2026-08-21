@@ -270,3 +270,202 @@ fn the_detail_pane_reports_what_grew_since_the_last_scan() {
     let growth = app2.breakdown.as_ref().unwrap().growth.expect("no comparison was made");
     assert_eq!(growth, Some(6 * 1024 * 1024), "the 6M that arrived was not reported");
 }
+
+/// The overview block that says where inside the selection the size is, so
+/// finding the one child that matters does not mean expanding the tree by hand.
+#[test]
+fn the_detail_pane_says_where_the_size_is_concentrated() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    // The root has three children, ranked Movies 9M, dev 8M, Library 3M.
+    app.cursor = 0;
+    app.rebuild_rows();
+
+    let out = render(&mut app, 100, 30);
+    println!("{out}");
+
+    assert!(out.contains("where it goes"), "no concentration block:\n{out}");
+    let block = out.split("where it goes").nth(1).unwrap();
+    let rows: Vec<&str> = block.lines().skip(1).take(3).collect();
+    assert!(rows[0].contains("Movies"), "biggest child is not first: {rows:?}\n{out}");
+    assert!(rows[1].contains("dev"), "children out of order: {rows:?}\n{out}");
+    assert!(rows[2].contains("Library"), "children out of order: {rows:?}\n{out}");
+    // 9M of 20M, and the share is what makes it worth opening.
+    assert!(rows[0].contains("44%"), "no share of the selection: {rows:?}\n{out}");
+}
+
+/// The root is the whole scan by definition, and it has no parent to be a share
+/// of. Both facts have to be said correctly rather than divided by zero.
+#[test]
+fn share_of_the_scan_is_everything_at_the_root_and_a_fraction_below_it() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    app.cursor = 0;
+    app.rebuild_rows();
+    let out = render(&mut app, 100, 30);
+    assert!(out.contains("100% of scan"), "root is not the whole scan:\n{out}");
+    assert!(!out.contains("of parent"), "the root was given a parent:\n{out}");
+
+    // Directly under the root, the parent share would be the same number twice.
+    app.cursor = 1;
+    app.rebuild_rows();
+    let out = render(&mut app, 100, 30);
+    println!("{out}");
+    assert!(!out.contains("100% of scan"), "a child is the whole scan:\n{out}");
+    assert!(!out.contains("of parent"), "the root was quoted twice:\n{out}");
+
+    // A grandchild has two genuinely different shares. dev/fad is 8M of dev's
+    // 8M but only 40% of the scan.
+    let root = app.tree.root();
+    let dev = *app.tree.node(root).children.iter()
+        .find(|c| app.tree.node(**c).name.as_ref() == "dev").unwrap();
+    app.expanded.insert(dev);
+    app.mark_dirty();
+    app.rebuild_rows();
+    app.cursor = (0..app.rows.len())
+        .find(|i| app.tree.node(app.rows[*i].id).name.as_ref() == "fad")
+        .expect("dev/fad is not on screen");
+    let out = render(&mut app, 100, 30);
+    println!("{out}");
+    assert!(out.contains("of parent"), "no share of the parent:\n{out}");
+}
+
+/// The pane fills itself: as many breakdowns as the rows allow, in a fixed
+/// order, and `S` moves that order round so the ones that did not fit can be
+/// reached.
+#[test]
+fn the_detail_pane_shows_every_breakdown_that_fits() {
+    use fad::app::Panel;
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.cursor = 0;
+    app.rebuild_rows();
+
+    // Tall enough for all four, so all four are there and none is a top-N.
+    let out = render(&mut app, 100, 40);
+    println!("{out}");
+    for section in ["by extension", "by age", "biggest files", "file sizes"] {
+        assert!(out.contains(section), "{section} did not fit:\n{out}");
+    }
+    assert!(out.contains("huge.rlib"), "the biggest files are not listed:\n{out}");
+    // Nothing is held back, so there is nothing for the key to reveal.
+    assert!(!out.contains("\u{b7} S"), "a full pane offered more:\n{out}");
+
+    // Short enough that only some fit. The leader is the extensions, and the
+    // pane says so rather than quietly dropping the rest.
+    let short = render(&mut app, 100, 26);
+    println!("{short}");
+    assert!(short.contains("\u{b7} S"), "a cut pane offered nothing:\n{short}");
+    let head = short.split("── ").nth(2).unwrap();
+    assert!(head.starts_with("by extension"), "wrong leader: {head}");
+    assert!(!short.contains("file sizes"), "everything fit after all:\n{short}");
+
+    // S moves the order round, so what did not fit comes to the front.
+    app.cycle_panel();
+    assert_eq!(app.panel, Panel::Ages);
+    let next = render(&mut app, 100, 26);
+    println!("{next}");
+    let head = next.split("── ").nth(2).unwrap();
+    assert!(head.starts_with("by age"), "S did not move the order on: {head}");
+
+    // Every breakdown is reachable: whatever did not fit at first is on screen
+    // within a lap of the key, which is the whole promise the hint makes.
+    let mut seen = short.contains("file sizes") || next.contains("file sizes");
+    for _ in 0..2 {
+        app.cycle_panel();
+        seen |= render(&mut app, 100, 26).contains("file sizes");
+    }
+    assert!(seen, "a breakdown could not be reached by pressing S");
+
+    // Four presses come back to where it started.
+    app.cycle_panel();
+    assert_eq!(app.panel, Panel::Extensions);
+}
+
+/// A file has no children, so there is nothing to say about where its size is.
+#[test]
+fn a_file_gets_no_concentration_block() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alone.bin"), vec![0u8; 4096]).unwrap();
+    let mut app = app_for(dir.path());
+    app.cursor = 1;
+    app.rebuild_rows();
+    assert_eq!(app.tree.node(app.selected().unwrap()).name.as_ref(), "alone.bin");
+
+    let out = render(&mut app, 100, 24);
+    println!("{out}");
+    assert!(!out.contains("where it goes"), "a file was broken down by child:\n{out}");
+    assert!(!out.contains("of parent") || out.contains("100% of parent"));
+}
+
+/// The biggest-files panel is the one that tells a single huge file apart from
+/// a directory of small ones, so its order has to be exactly right, and the
+/// size classes have to account for every file in the subtree.
+#[test]
+fn the_breakdown_ranks_the_biggest_files_and_classes_all_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.cursor = 0;
+    app.rebuild_rows();
+    app.ensure_breakdown();
+
+    let b = app.breakdown.as_ref().unwrap();
+    let names: Vec<&str> = b.biggest.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(&names[..2], &["holiday.mov", "huge.rlib"], "not largest first: {names:?}");
+    assert!(b.biggest.windows(2).all(|w| w[0].bytes >= w[1].bytes), "{names:?}");
+
+    let counted: u64 = b.sizes.iter().map(|(_, c)| c).sum();
+    assert_eq!(counted, app.tree.node(app.tree.root()).file_count, "files went unclassed");
+}
+
+/// With more children than the block can list, the three rows are only half the
+/// answer: whether they are the whole problem is the other half.
+#[test]
+fn a_directory_of_many_children_reports_what_the_top_three_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.bin"), vec![0u8; 8 * 1024 * 1024]).unwrap();
+    for i in 0..6 {
+        std::fs::write(dir.path().join(format!("small{i}.bin")), vec![0u8; 4096]).unwrap();
+    }
+    let mut app = app_for(dir.path());
+    app.cursor = 0;
+    app.rebuild_rows();
+
+    let out = render(&mut app, 100, 30);
+    println!("{out}");
+    assert!(out.contains("top 3 of 7 hold"), "no verdict line:\n{out}");
+    // One file is essentially all of it, so the verdict has to say so.
+    assert!(out.contains("top 3 of 7 hold 99%"), "wrong share:\n{out}");
+}
+
+/// The pane does not scroll. On a short terminal the breakdowns are what give
+/// way, never the path, the size, or where it goes — and a cut list says how
+/// much of itself is showing rather than passing a top-N off as the whole
+/// thing.
+#[test]
+fn a_short_pane_cuts_the_breakdowns_and_says_it_cut_them() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.cursor = 0;
+    app.rebuild_rows();
+
+    let out = render(&mut app, 100, 22);
+    println!("{out}");
+    assert!(out.contains("on disk"), "the size was clipped:\n{out}");
+    assert!(out.contains("where it goes"), "the overview was clipped:\n{out}");
+    assert!(out.contains("top 5 of 6"), "a cut list claimed to be whole:\n{out}");
+    // Nothing may spill past the pane into the staged box below it.
+    assert!(out.contains("staged"), "the staged box was pushed off:\n{out}");
+
+    // With the room for it, the same list is whole and says nothing about tops.
+    let tall = render(&mut app, 100, 40);
+    assert!(tall.contains("by extension"), "no breakdown:\n{tall}");
+    assert!(!tall.contains("top 5 of 6"), "a whole list claimed to be cut:\n{tall}");
+}

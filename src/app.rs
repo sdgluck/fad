@@ -1,6 +1,7 @@
 //! Everything the UI needs to know, and everything a keypress can change.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,61 @@ pub const AGE_BUCKETS: [(&str, i64); 4] = [
     (">2y", i64::MAX),
 ];
 
+/// The four classes the file-size distribution reports, largest first. The
+/// boundaries are the ones that change what you would do about a directory: a
+/// file over 100M is worth deleting on its own, and a file under 1M is only
+/// ever worth deleting in bulk. A directory holding 168G either way is two
+/// completely different afternoons.
+/// Each entry is a label and the smallest file that belongs in it.
+pub const SIZE_CLASSES: [(&str, u64); 4] = [
+    (">100M", 100 << 20),
+    ("10-100M", 10 << 20),
+    ("1-10M", 1 << 20),
+    ("<1M", 0),
+];
+
+/// Which breakdown leads the lower half of the detail pane. As many as fit are
+/// shown, in this order, wrapping round; `S` moves the start on by one, which
+/// on a short pane is the only way to reach the ones that did not fit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Panel {
+    Extensions,
+    Ages,
+    Biggest,
+    Sizes,
+}
+
+impl Panel {
+    pub fn next(self) -> Panel {
+        match self {
+            Panel::Extensions => Panel::Ages,
+            Panel::Ages => Panel::Biggest,
+            Panel::Biggest => Panel::Sizes,
+            Panel::Sizes => Panel::Extensions,
+        }
+    }
+
+    /// All four, this one first. The order never changes; `S` only chooses
+    /// where it starts, so on a pane that fits two the pair rotates and on one
+    /// that fits all four nothing is ever hidden.
+    pub fn rotation(self) -> [Panel; 4] {
+        let mut out = [self; 4];
+        for i in 1..4 {
+            out[i] = out[i - 1].next();
+        }
+        out
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Panel::Extensions => "by extension",
+            Panel::Ages => "by age",
+            Panel::Biggest => "biggest files",
+            Panel::Sizes => "file sizes",
+        }
+    }
+}
+
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -82,6 +138,17 @@ pub struct Breakdown {
     pub growth: Option<Option<i64>>,
     /// The subtree was larger than the walk budget, so these are a sample.
     pub partial: bool,
+    /// The biggest children of the selection, largest first, and how many
+    /// children there are in all. Read straight off the node rather than out of
+    /// the walk, so it stays exact even when `partial` is set.
+    pub children: Vec<ChildRow>,
+    pub child_count: usize,
+    /// The largest individual files anywhere in the subtree. One 68G disk image
+    /// and 700k small files are the same headline and completely different
+    /// work, and nothing else on this pane tells them apart.
+    pub biggest: Vec<FileRow>,
+    /// Bytes and file count per `SIZE_CLASSES` entry, in the same order.
+    pub sizes: [(u64, u64); 4],
     /// The subtree's size when this was computed. A live scan keeps growing the
     /// tree under the cursor, and a breakdown taken when the node was empty
     /// would otherwise stay empty for the rest of the session.
@@ -103,6 +170,18 @@ pub struct ExtRow {
     pub ext: String,
     pub bytes: u64,
     pub count: u64,
+}
+
+/// One child of the selection, for the "where it goes" block.
+pub struct ChildRow {
+    pub name: String,
+    pub bytes: u64,
+}
+
+/// One file, for the biggest-files panel.
+pub struct FileRow {
+    pub name: String,
+    pub bytes: u64,
 }
 
 /// The trailing extension, lowercased, or a bucket for names without one.
@@ -273,6 +352,8 @@ pub struct App {
     /// subtree of a million nodes is far too slow to redo every frame, and the
     /// answer only changes when the selection moves.
     pub breakdown: Option<Breakdown>,
+    /// Which of the four breakdowns the detail pane leads with.
+    pub panel: Panel,
     /// Hide subtrees written to more recently than this.
     pub age_filter: AgeFilter,
     /// How many entries the last snapshot of this root held. The only honest
@@ -437,6 +518,7 @@ impl App {
             previous: None,
             previous_at: None,
             breakdown: None,
+            panel: Panel::Extensions,
             age_filter: AgeFilter::All,
             expected_entries: None,
             ignore: crate::ignore::Rules::load(),
@@ -1134,6 +1216,17 @@ impl App {
         children.iter().any(|c| self.fuzzy_matches(*c))
     }
 
+    /// Move the detail pane on to the next breakdown. Nothing else depends on
+    /// it: the rows are unchanged and the breakdown already holds all four
+    /// answers, so this is a pure redraw.
+    ///
+    /// On a pane tall enough for all four this only reorders them. That is the
+    /// honest behaviour — there is nothing left to reveal — and it keeps one
+    /// rule for the key rather than two.
+    pub fn cycle_panel(&mut self) {
+        self.panel = self.panel.next();
+    }
+
     /// Recompute the breakdown if the selection moved. Called once per frame;
     /// the cache makes all but the first call free.
     pub fn ensure_breakdown(&mut self) {
@@ -1164,8 +1257,16 @@ impl App {
         /// would stall the frame for no extra insight.
         const BUDGET: usize = 200_000;
 
+        /// How many of the biggest files to keep. Five fits the pane and is
+        /// enough to tell "one huge file" from "a directory of huge files".
+        const BIGGEST: usize = 5;
+
         let mut by_ext: HashMap<&str, (u64, u64)> = HashMap::new();
         let mut ages = [0u64; 4];
+        let mut sizes = [(0u64, 0u64); 4];
+        // A bounded min-heap: the smallest of the leaders is on top, so each
+        // file costs one comparison and only a contender costs a push.
+        let mut biggest: BinaryHeap<Reverse<(u64, NodeId)>> = BinaryHeap::new();
         let now = now_secs();
         let mut stack = vec![id];
         let mut visited = 0usize;
@@ -1191,22 +1292,61 @@ impl App {
             let age = (now - n.mtime).max(0);
             let bucket = AGE_BUCKETS.iter().position(|(_, max)| age < *max).unwrap_or(3);
             ages[bucket] += bytes;
+
+            // SIZE_CLASSES runs largest first, so the first class whose floor
+            // this file clears is its class.
+            let class = SIZE_CLASSES.iter().position(|(_, min)| bytes >= *min).unwrap_or(3);
+            sizes[class].0 += bytes;
+            sizes[class].1 += 1;
+
+            if biggest.len() < BIGGEST {
+                biggest.push(Reverse((bytes, cur)));
+            } else if biggest.peek().is_some_and(|Reverse((b, _))| bytes > *b) {
+                biggest.pop();
+                biggest.push(Reverse((bytes, cur)));
+            }
         }
+
+        let mut biggest: Vec<FileRow> = biggest
+            .into_iter()
+            .map(|Reverse((bytes, id))| FileRow { name: self.tree.node(id).name.to_string(), bytes })
+            .collect();
+        biggest.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
+
+        // Not from the walk: one level down is exact whatever the budget did,
+        // and this is the block that answers "where is it".
+        let kids = &self.tree.node(id).children;
+        let child_count = kids.len();
+        let mut children: Vec<ChildRow> = kids
+            .iter()
+            .map(|c| ChildRow {
+                name: self.tree.node(*c).name.to_string(),
+                bytes: self.tree.size(*c, self.apparent),
+            })
+            .collect();
+        children.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
+        children.truncate(3);
 
         let mut items: Vec<ExtRow> = by_ext
             .into_iter()
             .map(|(ext, (bytes, count))| ExtRow { ext: ext.to_string(), bytes, count })
             .collect();
         items.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
-        // Six, not eight: the age histogram below earns the two rows more than
-        // a seventh extension does in a 38-column pane.
-        items.truncate(6);
+        // The extension list has the lower half of the pane to itself now that
+        // `S` cycles the breakdowns, so it can afford more than the six it got
+        // when it shared the space with the age histogram. The renderer trims
+        // to whatever the terminal actually gives it.
+        items.truncate(10);
         Breakdown {
             id,
             exts: items,
             ages,
             growth: self.growth(id),
             partial,
+            children,
+            child_count,
+            biggest,
+            sizes,
             at_bytes: self.tree.size(id, self.apparent),
             at: Instant::now(),
         }

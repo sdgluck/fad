@@ -132,6 +132,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),
         ("d", "duplicate view: files whose contents are byte-for-byte equal"),
         ("s", "cycle sort: size, count, modified, name"),
+        ("S", "bring the next detail breakdown to the top, when they do not all fit"),
         ("o / e / y", "Finder / $EDITOR / copy path"),
         ("i", "never rank this again \u{2014} adds it to your ignore list"),
         ("R", "rescan the selected subtree"),

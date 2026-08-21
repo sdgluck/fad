@@ -327,6 +327,10 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             app.sort = app.sort.next();
             app.status = Some(format!("sorting by {}", app.sort.label()));
         }
+        KeyCode::Char('S') => {
+            app.cycle_panel();
+            app.status = Some(format!("{} first", app.panel.label()));
+        }
         KeyCode::Char('x') => {
             if app.nothing_staged() {
                 app.status = Some("nothing staged".into());

@@ -11,16 +11,26 @@ items go to the system trash by default and can be restored with one keystroke.
 Runs on macOS and Linux.
 
 ```
-┌ /Users/you  285G  294014 dirs, 2411907 files ────────┬ selection ──────────────┐
-│ ▾ you                              285G ████████████ │ /Users/you/Library      │
-│   ▾ Library                        168G ████████████ │ 168G · 712041 files     │
-│     ▸ Containers                    38G ██▊          │ modified 2 hours ago    │
-│     ▸ Caches                       6.2G ▌            │ ── by extension         │
-│   ▸ dev                             40G ██▊     ●    │   .js     438M ████████ │
-│   ▸ Pictures                        23G █▋           │   .rlib   422M ███████  │
-│                                                      │ ── staged · 1 · 40G ──  │
-│ ⚠ 2 cloud folder(s) not counted — rerun with --cloud │ ● dev              40G  │
-└──────────────────────────────────────────────────────┴─────────────────────────┘
+┌ /Users/you  285G  294014 dirs, 2411907 files ────────┬ selection ────────────────┐
+│ ▾ you                              285G ████████████ │ /Users/you/Library        │
+│   ▾ Library                        168G ████████████ │ 168G on disk              │
+│     ▸ Containers                    38G ██▊          │ 59% of scan               │
+│     ▸ Caches                       6.2G ▌            │ 712041 files · 41027 dirs │
+│   ▸ dev                             40G ██▊     ●    │ modified 2 hours ago      │
+│   ▸ Pictures                        23G █▋           │ ── where it goes          │
+│                                                      │   Containers  38G 23% ███ │
+│                                                      │   Caches     6.2G  4% ▊   │
+│                                                      │   Developer  2.1G  1% ▎   │
+│                                                      │   top 3 of 41 hold 82%    │
+│                                                      │ ── by extension           │
+│                                                      │   .js    438M  12k ████   │
+│                                                      │   .rlib  422M  358 ███    │
+│                                                      │ ── biggest files          │
+│                                                      │   Docker.raw   68G ████   │
+│                                                      │   vm.qcow2     12G ▉      │
+│                                                      │ ── staged · 1 · 40G ──    │
+│ ⚠ 2 cloud folder(s) not counted — rerun with --cloud │ ● dev              40G    │
+└──────────────────────────────────────────────────────┴───────────────────────────┘
  1 staged · 40G   space stage · x commit · r reclaimable · / filter · ? help
 ```
 
@@ -63,6 +73,7 @@ sign of movement reads as a hang.
 | `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
 | `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
 | `s` | cycle sort: size → count → modified → name · `R` rescan |
+| `S` | bring the next detail breakdown to the top, when they do not all fit |
 | `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
 | `i` | never rank this again — adds it to your ignore list |
 | `?` | help · `q` or `esc` quit |
@@ -101,6 +112,52 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --no-cache        ignore any snapshot and always walk from scratch
 --clear-cache     delete every saved snapshot and exit
 ```
+
+## Where the size is
+
+A size tells you a directory is worth opening. It does not tell you what to open
+next, and on 168G with forty children that is the only question left.
+
+The detail pane answers it without you expanding anything. Under the headline it
+gives the selection's share of the whole scan — 40G is a lot of anything and
+nothing at all out of 2T — and then the three biggest children with what each
+holds, closed off by the line that actually decides your afternoon:
+
+```
+── where it goes
+  Containers  38G 23% ███
+  Caches     6.2G  4% ▊
+  Developer  2.1G  1% ▎
+  top 3 of 41 hold 82%
+```
+
+`top 3 of 41 hold 82%` and `top 3 of 41 hold 19%` are two different problems.
+The first is three deletions; the second is not worth starting.
+
+Below that come four breakdowns of the whole subtree — not one level down,
+which for a directory of directories says nothing:
+
+| | |
+|---|---|
+| by extension | what kind of thing it is, with how many of them |
+| by age | the four buckets, and how much nobody has touched in two years |
+| biggest files | the largest individual files anywhere below here |
+| file sizes | how the bytes split across `<1M`, `1-10M`, `10-100M`, `>100M` |
+
+The last two are the pair that tell 168G in one disk image apart from 168G in
+seven hundred thousand small files. Same headline, same age, completely
+different work — one is a keystroke and the other is a lost afternoon.
+
+As many of the four as the terminal has rows for are shown at once, so on a tall
+window there is nothing to press and nothing hidden. When they do not all fit,
+`S` moves the order round and brings the next one to the top.
+
+None of this is ever quietly incomplete. The subtree walk behind it is capped,
+so on a very large selection the answers are a sample and every heading says
+`(sampled)`. A list the pane was too short to finish says how much of itself you
+are looking at — `by extension · top 7 of 10 · S` — rather than passing a top
+seven off as the whole set. And the `· S` only appears when pressing it would
+show you something you cannot already see.
 
 ## Age
 
