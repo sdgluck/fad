@@ -528,3 +528,22 @@ fn a_cross_device_scan_says_the_free_figure_is_one_volumes() {
     println!("{out}");
     assert!(out.contains("crosses filesystems"), "no caveat for a multi-volume scan:\n{out}");
 }
+
+/// The find overlay shows paths, not names: two hundred things called
+/// `node_modules` are told apart by where they are and nothing else.
+#[test]
+fn the_find_overlay_shows_where_each_hit_is() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    app.mode = fad::app::Mode::Search;
+    app.search = "rlib".into();
+    app.run_search();
+
+    let out = render(&mut app, 100, 24);
+    println!("{out}");
+    assert!(out.contains("find"), "no title:\n{out}");
+    assert!(out.contains("dev/fad/target/debug/huge.rlib"), "no path for the hit:\n{out}");
+    assert!(out.contains("go there"), "no footer:\n{out}");
+}

@@ -73,7 +73,8 @@ sign of movement reads as a hang.
 | `d` | duplicate view — files whose contents are byte-for-byte equal |
 | `L` | in the duplicate view — make the copies share one copy of the storage |
 | `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
-| `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
+| `/` | fuzzy filter — narrow what is on screen (`enter` to keep it, `esc` to clear) |
+| `f` | find — every entry in the tree by name, biggest first, `enter` to go there |
 | `s` | cycle sort: size → count → modified → name · `R` rescan |
 | `S` | bring the next detail breakdown to the top, when they do not all fit |
 | `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
@@ -160,6 +161,36 @@ so on a very large selection the answers are a sample and every heading says
 are looking at — `by extension · top 7 of 10 · S` — rather than passing a top
 seven off as the whole set. And the `· S` only appears when pressing it would
 show you something you cannot already see.
+
+## Finding one thing
+
+`/` narrows what is on screen. `f` answers the other question: where in all of
+this is the thing called that. It matches every entry in the tree, at any depth,
+open or not, and ranks the hits by size — because "where is the big one" is what
+is being asked, and a tidier match that costs nothing is not the answer.
+
+```
+┌ find ────────────────────────────────────────────────────┐
+│ › simulator█                                             │
+│                                                          │
+│  Library/Developer/CoreSimulator/Devices              14G │
+│  Library/Developer/CoreSimulator/Caches              2.1G │
+│  dev/app/ios/build/Simulator.runtime                 8.0M │
+│                                                          │
+│ enter  go there    ↑ ↓ choose    esc back                │
+└──────────────────────────────────────────────────────────┘
+```
+
+Hits are shown by path, not by name: two hundred things called `node_modules`
+are told apart by where they are and nothing else. `enter` puts the cursor on
+one and opens every directory above it on the way down.
+
+If the hit is behind something you turned on — a filter, an age filter — that is
+undone to get there, and the status line says which, because dropping it
+silently would be as confusing as refusing to move.
+
+The list is the hundred biggest matches. When there are more it says how many,
+so "not found" and "not shown" never look the same.
 
 ## Age
 

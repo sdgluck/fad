@@ -5,6 +5,7 @@ mod basket;
 mod detail_pane;
 mod history;
 mod modal;
+mod search;
 mod theme;
 mod tree_pane;
 
@@ -57,6 +58,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.mode {
         Mode::Help => draw_help(f, &theme, area),
+        Mode::Search => search::draw(f, app, &theme, area),
         Mode::Basket => basket::draw(f, app, &theme, area),
         Mode::History => history::draw(f, app, &theme, area),
         Mode::Confirm => modal::draw_confirm(f, app, &theme, area),
@@ -135,7 +137,8 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("u", "undo the last committed batch"),
         ("E", "empty what fad put in the trash \u{2014} the space is not back until you do"),
         ("U", "the undo history: put any remembered batch back"),
-        ("/", "fuzzy filter"),
+        ("/", "fuzzy filter: narrow what is on screen"),
+        ("f", "find: every entry in the tree by name, biggest first, and jump to one"),
         ("r", "reclaimable view: build artifacts, caches, VM images"),
         ("t", "tool storage: what Docker and friends hold that a walk cannot see"),
         ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),

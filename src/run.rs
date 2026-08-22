@@ -103,6 +103,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
 fn on_key(app: &mut App, k: KeyEvent) {
     match app.mode {
         Mode::Filter => filter_key(app, k),
+        Mode::Search => search_key(app, k),
         Mode::Help => {
             app.mode = Mode::Normal;
             app.mark_dirty();
@@ -313,6 +314,45 @@ fn filter_key(app: &mut App, k: KeyEvent) {
     app.mark_dirty();
 }
 
+/// Searching the whole tree. Everything here is live: the list is rebuilt on
+/// every keystroke, so what is on screen is always what the query says.
+fn search_key(app: &mut App, k: KeyEvent) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    match k.code {
+        KeyCode::Esc => {
+            app.search.clear();
+            app.search_hits.clear();
+            app.mode = Mode::Normal;
+        }
+        KeyCode::Enter => {
+            app.mode = Mode::Normal;
+            app.status = app.jump_to_hit();
+        }
+        KeyCode::Down | KeyCode::Char('n') if ctrl => {
+            app.search_cursor =
+                (app.search_cursor + 1).min(app.search_hits.len().saturating_sub(1))
+        }
+        KeyCode::Up | KeyCode::Char('p') if ctrl => {
+            app.search_cursor = app.search_cursor.saturating_sub(1)
+        }
+        KeyCode::Down => {
+            app.search_cursor =
+                (app.search_cursor + 1).min(app.search_hits.len().saturating_sub(1))
+        }
+        KeyCode::Up => app.search_cursor = app.search_cursor.saturating_sub(1),
+        KeyCode::Backspace => {
+            app.search.pop();
+            app.run_search();
+        }
+        KeyCode::Char(c) => {
+            app.search.push(c);
+            app.run_search();
+        }
+        _ => return,
+    }
+    app.mark_dirty();
+}
+
 fn normal_key(app: &mut App, k: KeyEvent) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     app.status = None;
@@ -337,6 +377,13 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('/') => {
             app.mode = Mode::Filter;
             app.filter.clear();
+        }
+        // The other question: not "narrow what I am looking at" but "where in
+        // all of this is the thing called that".
+        KeyCode::Char('f') => {
+            app.mode = Mode::Search;
+            app.search.clear();
+            app.run_search();
         }
         KeyCode::Char('s') => {
             app.sort = app.sort.next();

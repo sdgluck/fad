@@ -16,7 +16,7 @@ use crate::tree::{NodeId, Sort, Tree, flags};
 /// How long ago the last write was, as four buckets. Absolute size is what a
 /// directory *is*; how much of it nobody has touched in two years is what makes
 /// it a candidate.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgeFilter {
     All,
     D90,
@@ -242,6 +242,8 @@ pub enum Mode {
     Normal,
     /// Typing into the fuzzy filter.
     Filter,
+    /// Typing into the search: every entry in the tree, wherever it is.
+    Search,
     Help,
     /// The staging basket: the whole batch on one screen, editable.
     Basket,
@@ -272,6 +274,14 @@ pub struct App {
     pub apparent: bool,
     pub mode: Mode,
     pub filter: String,
+    /// What is being searched for across the whole tree.
+    pub search: String,
+    /// What the search found: node and size, biggest first.
+    pub search_hits: Vec<(NodeId, u64)>,
+    /// Index into `search_hits`.
+    pub search_cursor: usize,
+    /// There were more matches than the list will hold.
+    pub search_more: usize,
     pub status: Option<String>,
     /// Showing only what the built-in rules consider reclaimable.
     pub reclaim_view: bool,
@@ -507,6 +517,10 @@ impl App {
             apparent: false,
             mode: Mode::Normal,
             filter: String::new(),
+            search: String::new(),
+            search_hits: Vec::new(),
+            search_cursor: 0,
+            search_more: 0,
             status: None,
             reclaim_view: false,
             tools_view: false,
@@ -1317,6 +1331,129 @@ impl App {
         // keystroke into a full-tree walk.
         let children = self.tree.node(id).children.clone();
         children.iter().any(|c| self.fuzzy_matches(*c))
+    }
+
+    // --------------------------------------------------------------- search
+
+    /// Everything in the tree whose name matches, wherever it is, biggest
+    /// first.
+    ///
+    /// A different question from the one `/` answers. The filter narrows what
+    /// is already on screen and keeps the shape of the tree around it; this
+    /// finds the 8G thing called `*Simulator*` that is four levels down a
+    /// branch nobody has opened. Ranked by size rather than by match quality,
+    /// because "where is the big one" is the question being asked — a tidier
+    /// match that costs nothing is not the answer.
+    pub fn run_search(&mut self) {
+        /// Enough to choose from without turning the list into its own
+        /// haystack. Anything past this is reported as a count.
+        const KEEP: usize = 100;
+
+        self.search_hits.clear();
+        self.search_more = 0;
+        self.search_cursor = 0;
+        if self.search.is_empty() {
+            return;
+        }
+        let apparent = self.apparent;
+        // Smart case, matching `/`: a lowercase query is case-insensitive, and
+        // typing a capital means you meant it.
+        self.matcher.config.ignore_case = !self.search.chars().any(char::is_uppercase);
+
+        // A bounded min-heap, so the whole arena costs one comparison a node
+        // and only a contender costs a push.
+        let mut best: BinaryHeap<Reverse<(u64, NodeId)>> = BinaryHeap::new();
+        let mut found = 0usize;
+        for id in 0..self.tree.len() as NodeId {
+            let n = self.tree.node(id);
+            if n.flags & flags::DELETED != 0 {
+                continue;
+            }
+            if !self.name_matches(id) {
+                continue;
+            }
+            found += 1;
+            let bytes = self.tree.size(id, apparent);
+            if best.len() < KEEP {
+                best.push(Reverse((bytes, id)));
+            } else if best.peek().is_some_and(|Reverse((b, _))| bytes > *b) {
+                best.pop();
+                best.push(Reverse((bytes, id)));
+            }
+        }
+        self.search_more = found.saturating_sub(best.len());
+        let mut hits: Vec<(NodeId, u64)> =
+            best.into_iter().map(|Reverse((bytes, id))| (id, bytes)).collect();
+        hits.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        self.search_hits = hits;
+    }
+
+    /// Does this entry's name match the search?
+    ///
+    /// The cheap check first. The whole arena is walked on every keystroke, and
+    /// a name that does not contain the query's first character cannot match at
+    /// all — which throws away almost everything for the price of a byte
+    /// comparison, and leaves the matcher to run on what is left.
+    fn name_matches(&mut self, id: NodeId) -> bool {
+        let name = self.tree.node(id).name.clone();
+        let Some(first) = self.search.chars().next() else { return false };
+        let ignore_case = self.matcher.config.ignore_case;
+        let present = name.chars().any(|c| {
+            c == first || (ignore_case && c.eq_ignore_ascii_case(&first))
+        });
+        if !present {
+            return false;
+        }
+        let (mut hb, mut nb) = (Vec::new(), Vec::new());
+        let haystack = Utf32Str::new(&name, &mut hb);
+        let needle = Utf32Str::new(&self.search, &mut nb);
+        self.matcher.fuzzy_match(haystack, needle).is_some()
+    }
+
+    /// Put the cursor on the search hit under the search cursor, opening every
+    /// directory above it on the way.
+    ///
+    /// Returns what to tell the user, because getting there can mean undoing
+    /// something they set up: a hit inside a filtered-out branch is not
+    /// reachable until the filter goes, and dropping it silently would be as
+    /// confusing as refusing to move.
+    pub fn jump_to_hit(&mut self) -> Option<String> {
+        let (id, _) = *self.search_hits.get(self.search_cursor)?;
+        // The group views are lists, not the tree, and the row this is looking
+        // for does not exist in any of them.
+        self.reclaim_view = false;
+        self.dupe_view = false;
+        self.tools_view = false;
+
+        let mut cur = self.tree.node(id).parent;
+        while let Some(p) = cur {
+            self.expanded.insert(p);
+            cur = self.tree.node(p).parent;
+        }
+        self.mark_dirty();
+        self.rebuild_rows();
+
+        if let Some(i) = self.rows.iter().position(|r| r.id == id && r.tool.is_none()) {
+            self.cursor = i;
+            return None;
+        }
+        // Hidden by something the user turned on. Turn it off rather than
+        // leave the cursor somewhere else with no explanation.
+        let was = (!self.filter.is_empty(), self.age_filter != AgeFilter::All);
+        self.filter.clear();
+        self.age_filter = AgeFilter::All;
+        self.mark_dirty();
+        self.rebuild_rows();
+        if let Some(i) = self.rows.iter().position(|r| r.id == id && r.tool.is_none()) {
+            self.cursor = i;
+        }
+        match was {
+            (true, true) => Some("cleared the filter and the age filter to get there".into()),
+            (true, false) => Some("cleared the filter to get there".into()),
+            (false, true) => Some("cleared the age filter to get there".into()),
+            // Ignored, then: it is in the tree and will not be shown.
+            (false, false) => Some("that is on your ignore list, so the tree will not show it".into()),
+        }
     }
 
     /// Move the detail pane on to the next breakdown. Nothing else depends on
