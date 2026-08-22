@@ -112,6 +112,8 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --json            dump the ranked tree as JSON instead of opening the UI
 --min-size 100M   hide entries below a threshold (--json)
 --depth N         how deep to print (--json, default 2)
+--init zsh        print shell integration: completions and a `fad-cd` function
+--man             print this tool's man page, in roff
 --no-mouse        do not capture the mouse, so text selection keeps working
 --no-cache        ignore any snapshot and always walk from scratch
 --clear-cache     delete every saved snapshot and exit
@@ -396,6 +398,7 @@ fad --reclaim --yes --max 10G ~/dev     # take up to 10G of it, to the trash
 fad --since ~/dev                       # what changed since the last scan
 fad --tools --yes --dry-run             # what docker would give back
 cd "$(fad --print-path)"                # quit on a directory, land in it
+eval "$(fad --init zsh)"                # completions, and a fad-cd that does that
 ```
 
 `--reclaim --yes` is deliberately narrow. It only ever considers entries the
@@ -411,6 +414,28 @@ nothing at all when the biggest candidate happens to be 3G.
 first, then leaves the fresh walk behind as the new baseline, so it can be run
 on a timer. It answers "what did that install just add?", which no single scan
 can.
+
+### In your shell
+
+```sh
+eval "$(fad --init zsh)"                     # in ~/.zshrc — bash and fish too
+fad --man > /usr/local/share/man/man1/fad.1  # and man fad works
+```
+
+That gives you completions for every flag, and `fad-cd`: run `fad`, quit on a
+directory, and land in it. Nothing can change your shell's directory from a
+child process, so this is the one thing a shell function is needed for. Quitting
+on a file lands you in the directory holding it — `cd` into a 40G disk image is
+not what anyone meant.
+
+Both are generated from the argument parser itself, so they describe the flags
+this binary has rather than a copy that drifts away from it.
+
+`--print-path` draws the interface on your terminal device rather than on
+standard output, which is what makes `cd "$(fad --print-path)"` work at all: a
+command substitution swallows standard output, so a UI drawn there would be a
+blank screen for the length of the session and a shell buffer full of escape
+codes at the end of it.
 
 ## Free space
 

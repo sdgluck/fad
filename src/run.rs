@@ -30,9 +30,56 @@ pub struct Outcome {
     pub selected: Option<std::path::PathBuf>,
 }
 
-pub fn run(mut app: App) -> io::Result<Outcome> {
+/// Where the UI is drawn.
+///
+/// Normally standard output. But `--print-path` puts a path on standard output
+/// for a shell to read, and the whole point of it is `cd "$(fad --print-path)"`
+/// — where the substitution swallows standard output, so drawing the UI there
+/// means drawing it into the shell's buffer and showing the user a blank
+/// terminal for the length of the session. The interface goes to the terminal
+/// device instead and leaves stdout for the one line that is meant to be read
+/// by a program.
+pub enum Screen {
+    Stdout(io::Stdout),
+    Tty(std::fs::File),
+}
+
+impl io::Write for Screen {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Screen::Stdout(o) => o.write(buf),
+            Screen::Tty(f) => f.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Screen::Stdout(o) => o.flush(),
+            Screen::Tty(f) => f.flush(),
+        }
+    }
+}
+
+impl Screen {
+    /// The terminal device when stdout is wanted for something else, falling
+    /// back to stdout when there is no controlling terminal — a session with
+    /// neither is not going to run a UI anyway, and failing here would be a
+    /// worse error message than whatever comes next.
+    fn open(keep_stdout_clean: bool) -> Screen {
+        if !keep_stdout_clean {
+            return Screen::Stdout(io::stdout());
+        }
+        match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            Ok(f) => Screen::Tty(f),
+            Err(_) => Screen::Stdout(io::stdout()),
+        }
+    }
+}
+
+type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<Screen>>;
+
+pub fn run(mut app: App, keep_stdout_clean: bool) -> io::Result<Outcome> {
     let mouse = app.mouse;
-    let mut terminal = enter(mouse)?;
+    let mut terminal = enter(mouse, keep_stdout_clean)?;
     let result = event_loop(&mut terminal, &mut app);
     // Restore the terminal first: whatever went wrong, the user should not be
     // left staring at a broken shell.
@@ -42,9 +89,9 @@ pub fn run(mut app: App) -> io::Result<Outcome> {
     Ok(Outcome { tree: app.tree_is_complete().then_some(app.tree), selected })
 }
 
-fn enter(mouse: bool) -> io::Result<ratatui::DefaultTerminal> {
+fn enter(mouse: bool, keep_stdout_clean: bool) -> io::Result<Term> {
     enable_raw_mode()?;
-    let mut out = io::stdout();
+    let mut out = Screen::open(keep_stdout_clean);
     execute!(out, EnterAlternateScreen)?;
     if mouse {
         execute!(out, EnableMouseCapture)?;
@@ -54,7 +101,7 @@ fn enter(mouse: bool) -> io::Result<ratatui::DefaultTerminal> {
     Ok(terminal)
 }
 
-fn leave(terminal: &mut ratatui::DefaultTerminal, mouse: bool) -> io::Result<()> {
+fn leave(terminal: &mut Term, mouse: bool) -> io::Result<()> {
     disable_raw_mode()?;
     if mouse {
         execute!(terminal.backend_mut(), DisableMouseCapture)?;
@@ -64,7 +111,7 @@ fn leave(terminal: &mut ratatui::DefaultTerminal, mouse: bool) -> io::Result<()>
     Ok(())
 }
 
-fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Result<()> {
+fn event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
     let mut last_draw = Instant::now() - SCAN_TICK;
     loop {
         app.poll_scan();

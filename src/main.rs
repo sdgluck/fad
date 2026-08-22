@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser, ValueEnum};
 
 use fad::app::App;
 use fad::format::human;
@@ -93,10 +93,28 @@ struct Args {
     #[arg(long)]
     since: bool,
 
+    /// Print shell integration for your shell and exit: completions, and a
+    /// `fad-cd` function that leaves you in the directory you quit on.
+    /// Put `eval "$(fad --init zsh)"` in your shell's startup file.
+    #[arg(long, value_name = "SHELL")]
+    init: Option<Shell>,
+
+    /// Print this tool's man page, in roff, and exit.
+    #[arg(long)]
+    man: bool,
+
     /// Do not capture the mouse. Clicking and the wheel stop working; your
     /// terminal's own text selection starts working again.
     #[arg(long)]
     no_mouse: bool,
+}
+
+/// The shells `--init` knows how to write for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Shell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 fn parse_size(s: &str) -> Result<u64, String> {
@@ -116,6 +134,24 @@ fn parse_size(s: &str) -> Result<u64, String> {
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(shell) = args.init {
+        print_init(shell);
+        return;
+    }
+
+    if args.man {
+        let mut out = Vec::new();
+        // Straight from the parser, so the flags in the man page are the flags
+        // this binary has rather than a copy that drifts.
+        if let Err(e) = clap_mangen::Man::new(Args::command()).render(&mut out) {
+            eprintln!("fad: could not render the man page: {e}");
+            std::process::exit(1);
+        }
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&out);
+        return;
+    }
 
     if args.clear_cache {
         match fad::cache::clear() {
@@ -195,7 +231,9 @@ fn main() {
         app.load_snapshot_async();
     }
     let save = !args.no_cache;
-    match run::run(app) {
+    // With --print-path the shell is reading stdout, so the interface has to go
+    // somewhere else. See `run::Screen`.
+    match run::run(app, args.print_path) {
         Ok(outcome) => {
             // Quit before the walk finished leaves an incomplete tree, and the
             // previous snapshot — which at least was whole — stays put.
@@ -217,6 +255,45 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// Everything the shell needs: completions from the parser itself, and the
+/// wrapper that makes `--print-path` worth having.
+///
+/// One command rather than two, because a user who has to be told about
+/// completions and separately about `fad-cd` will set up neither.
+fn print_init(shell: Shell) {
+    let mut cmd = Args::command();
+    let target = match shell {
+        Shell::Bash => clap_complete::Shell::Bash,
+        Shell::Zsh => clap_complete::Shell::Zsh,
+        Shell::Fish => clap_complete::Shell::Fish,
+    };
+    clap_complete::generate(target, &mut cmd, "fad", &mut std::io::stdout());
+
+    // `fad` on its own cannot change your shell's directory — nothing can, from
+    // a child process — so the one thing a shell function is needed for is the
+    // thing it does. Landing on a file means landing in the directory holding
+    // it: `cd` into a 40G disk image is not what anyone meant.
+    let sh = r#"
+fad-cd() {
+  local target
+  target="$(command fad --print-path "$@")" || return
+  [ -n "$target" ] || return
+  [ -d "$target" ] || target="$(dirname -- "$target")"
+  cd -- "$target"
+}
+"#;
+    let fish = r#"
+function fad-cd --description 'run fad and cd to where you left the cursor'
+  set -l target (command fad --print-path $argv)
+  or return
+  test -n "$target"; or return
+  test -d "$target"; or set target (dirname -- "$target")
+  cd -- "$target"
+end
+"#;
+    println!("{}", if shell == Shell::Fish { fish } else { sh });
 }
 
 fn print_json(tree: &Tree, args: &Args) {
