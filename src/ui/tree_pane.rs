@@ -218,7 +218,7 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled(
             truncate_end(
                 &format!(
-                    " \u{26a0} {} in the trash from {n} item(s) \u{2014} not reclaimed until you empty it",
+                    " \u{26a0} {} in the trash from {n} item(s) \u{2014} E empties it, and only then is it reclaimed",
                     human(bytes)
                 ),
                 width,

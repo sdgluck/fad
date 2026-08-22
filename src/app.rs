@@ -249,6 +249,8 @@ pub enum Mode {
     History,
     /// Reviewing the staged batch before committing it.
     Confirm,
+    /// Confirming that the trash should be taken out.
+    EmptyTrash,
     /// A batch is being deleted, or has just finished.
     Deleting,
 }
@@ -388,6 +390,10 @@ pub struct App {
     /// Set while a batch is being deleted, and kept afterwards so the modal can
     /// report what happened.
     pub job: Option<Job>,
+    /// The running job is the trash going out, not a batch going in. The same
+    /// machinery, and the same modal, but it must not say "deleted" about
+    /// things that were deleted some time ago and are only now unrecoverable.
+    pub emptying: bool,
     /// Staged items the guard refused, shown in the confirm modal.
     pub refused: Vec<(NodeId, String)>,
 
@@ -532,6 +538,7 @@ impl App {
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
             disposal: Disposal::Trash,
             job: None,
+            emptying: false,
             refused: Vec::new(),
             dirty: true,
             should_quit: false,
@@ -1400,6 +1407,39 @@ impl App {
             .unwrap_or_else(|| key.id.clone())
     }
 
+    /// Take out what fad put in the trash.
+    ///
+    /// Only fad's own entries: it knows exactly where each one landed because
+    /// it wrote them down, and everything else in the user's trash was put
+    /// there by someone else for reasons fad does not know.
+    ///
+    /// Nothing is removed from the journal. Those batches stay on the history
+    /// screen and start reporting themselves as emptied and unrestorable,
+    /// which is precisely what has happened to them.
+    pub fn empty_trash(&mut self) {
+        let items: Vec<(PathBuf, u64)> =
+            delete::trashed_entries().into_iter().map(|(to, _, bytes)| (to, bytes)).collect();
+        if items.is_empty() {
+            self.mode = Mode::Normal;
+            self.status = Some("nothing of fad's is still in the trash".into());
+            return;
+        }
+        self.emptying = true;
+        self.job = Some(Job::erase(items));
+        self.mode = Mode::Deleting;
+        self.mark_dirty();
+    }
+
+    /// Free space once the trash goes out, and what it is now.
+    ///
+    /// The mirror of `after_commit`, and the reason emptying is worth a screen
+    /// of its own: this is the only figure in fad where the bytes are already
+    /// deleted and the space still has not moved.
+    pub fn after_empty(&self) -> Option<(u64, u64)> {
+        let free = crate::platform::free_space(self.tree.root_path())?;
+        Some((free.saturating_add(self.trash_pending.1), free))
+    }
+
     /// Free space once this batch lands, and the total, for the one number the
     /// user actually came for.
     pub fn after_commit(&self) -> Option<(u64, u64)> {
@@ -1592,6 +1632,7 @@ impl App {
     pub fn finish_job(&mut self) {
         self.refresh_history();
         self.job = None;
+        self.emptying = false;
         self.disposal = Disposal::Trash;
         self.refused.clear();
         if self.tool_job.take().is_some() {

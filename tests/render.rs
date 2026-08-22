@@ -469,3 +469,25 @@ fn a_short_pane_cuts_the_breakdowns_and_says_it_cut_them() {
     assert!(tall.contains("by extension"), "no breakdown:\n{tall}");
     assert!(!tall.contains("top 5 of 6"), "a whole list claimed to be cut:\n{tall}");
 }
+
+/// The screen between a keystroke and the last recoverable copy of something.
+/// It has to state all three consequences: the space arrives, the undo stops
+/// working, and nobody else's trash is touched.
+#[test]
+fn the_empty_trash_screen_states_what_it_costs() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    app.trash_pending = (3, 40 << 30);
+    app.mode = fad::app::Mode::EmptyTrash;
+
+    let out = render(&mut app, 100, 24);
+    println!("{out}");
+    assert!(out.contains("empty the trash"), "no title:\n{out}");
+    assert!(out.contains("40G"), "the amount is missing:\n{out}");
+    assert!(out.contains("cannot be undone"), "no warning that this is final:\n{out}");
+    assert!(out.contains("left where it is"), "does not say other trash is spared:\n{out}");
+}

@@ -67,6 +67,7 @@ sign of movement reads as a hang.
 | `x` | open the staging basket — review, unstage, commit |
 | `u` | undo the last committed batch |
 | `U` | undo history — put any of the last 20 batches back |
+| `E` | empty the trash — only what `fad` put there, and only then is it reclaimed |
 | `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
 | `t` | tool storage — what Docker and friends hold that a walk cannot see |
 | `d` | duplicate view — files whose contents are byte-for-byte equal |
@@ -391,7 +392,36 @@ one back; `U` opens the history, where any of them can be restored, and says
 which ones have since been emptied out of the trash and cannot be.
 
 Trashing reclaims nothing until the trash goes out, so a banner reports what
-`fad` has put there and not yet seen emptied.
+`fad` has put there and not yet seen emptied — and `E` takes it out.
+
+`E` empties **only what `fad` trashed**. It knows exactly where each item
+landed because it wrote it down, and everything else in your trash was put there
+by someone else for reasons `fad` does not know. Every path is checked to be
+inside a real trash directory before anything is removed, because the alternative
+— a hand-edited or corrupted journal pointing at a live file — is the one
+mistake this tool cannot take back.
+
+The screen before it says all three things that change:
+
+```
+┌ empty the trash ───────────────────────────────────┐
+│ 12 item(s) fad trashed, 40G                        │
+│ removed from the trash for good — cannot be undone │
+│ 3 batch(es) in the undo history can no longer be   │
+│   put back                                         │
+│ free space  71G → 111G                             │
+│                                                    │
+│     28G  /Users/you/dev/fad/target                 │
+│    6.2G  /Users/you/Library/Caches/big.cache       │
+│                                                    │
+│ anything else in your trash is left where it is    │
+└────────────────────────────────────────────────────┘
+```
+
+The journal is not rewritten. Those batches stay on the `U` screen and start
+reporting themselves as emptied and unrestorable, which is precisely what has
+happened to them — quietly dropping the record would lose the only evidence that
+the deletion ever took place.
 
 These paths are always refused: `/`, your home directory, system directories
 (`/System` and `/Users` on macOS; `/usr`, `/etc`, `/home` and friends on Linux),

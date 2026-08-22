@@ -100,6 +100,28 @@ impl Job {
         Job { rx, disposal, total, done: Vec::new(), finished: false }
     }
 
+    /// Take a set of already-trashed paths out of the trash for good.
+    ///
+    /// The same machinery as a batch, because it is the same shape of work —
+    /// a list of paths, one outcome each, on a thread so a forty-gigabyte
+    /// `remove_dir_all` cannot freeze the UI. What differs is only what is
+    /// done to each path, and that nothing is journalled: these entries are
+    /// already in the journal, and after this they are the record of a batch
+    /// that can no longer be put back.
+    pub fn erase(items: Vec<(PathBuf, u64)>) -> Job {
+        let total = items.len();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        std::thread::spawn(move || {
+            for (path, bytes) in items {
+                let result = trash::erase(&path).map(|_| None).map_err(|e| e.to_string());
+                if tx.send(Outcome { path, bytes, result }).is_err() {
+                    break;
+                }
+            }
+        });
+        Job { rx, disposal: Disposal::Permanent, total, done: Vec::new(), finished: false }
+    }
+
     /// Collect finished items. Returns true if anything new arrived.
     pub fn poll(&mut self) -> bool {
         let before = self.done.len();
@@ -221,6 +243,28 @@ impl Batch {
 /// What fad has put in the trash and not yet seen emptied. Deleting to the
 /// trash reclaims nothing until the trash goes out, which is a real enough
 /// footgun to say out loud.
+/// Every item fad trashed that is still sitting in the trash: where it is now,
+/// where it came from, and what it costs.
+///
+/// Only fad's own entries, and only ones still in a real trash directory. What
+/// else is in the user's trash is not fad's to touch, and is never counted here
+/// or taken out.
+pub fn trashed_entries() -> Vec<(PathBuf, PathBuf, u64)> {
+    read_journal()
+        .iter()
+        .flat_map(|b| b.entries.iter())
+        .filter(|e| trash::is_trash_path(&e.to) && e.to.exists())
+        .map(|e| (e.to.clone(), e.from.clone(), e.bytes))
+        .collect()
+}
+
+/// How many remembered batches would stop being restorable if the trash were
+/// emptied now. The cost of the keystroke, in the only currency the undo
+/// history deals in.
+pub fn batches_still_restorable() -> usize {
+    read_journal().iter().filter(|b| b.recoverable().0 > 0).count()
+}
+
 pub fn still_in_trash() -> (usize, u64) {
     read_journal()
         .iter()

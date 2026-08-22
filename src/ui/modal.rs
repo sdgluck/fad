@@ -159,6 +159,80 @@ pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     popup(f, theme, area, title, lines, permanent || !tools.is_empty());
 }
 
+/// Taking the trash out.
+///
+/// Its own screen rather than a line in the confirmation, because it is the
+/// opposite operation: nothing here is about to be deleted — it already was —
+/// and the only thing that changes is that the space finally arrives and the
+/// undo stops working. Both of those are worth saying before the keystroke.
+pub fn draw_empty_trash(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let (count, bytes) = app.trash_pending;
+    let entries = crate::delete::trashed_entries();
+    let batches = crate::delete::batches_still_restorable();
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{count} "), theme.emphasis),
+            Span::styled("item(s) fad trashed, ", theme.normal),
+            Span::styled(human(bytes), theme.emphasis),
+        ]),
+        Line::from(Span::styled(
+            "removed from the trash for good — this cannot be undone",
+            theme.staged,
+        )),
+    ];
+    if batches > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{batches} batch(es) in the undo history can no longer be put back",
+                ),
+            theme.warn,
+        )));
+    }
+    // The whole reason the key exists: until now this was the one number fad
+    // could not move.
+    if let Some((after, before)) = app.after_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("free space  ", theme.dim),
+            Span::styled(human(before), theme.normal),
+            Span::styled(" \u{2192} ", theme.dim),
+            Span::styled(human(after), theme.emphasis),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // Only fad's own entries, and the screen says so rather than leaving the
+    // user to wonder what happened to the rest of their trash.
+    let mut biggest = entries;
+    biggest.sort_by(|a, b| b.2.cmp(&a.2));
+    for (_, from, bytes) in biggest.iter().take(6) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>8}  ", human(*bytes)), theme.emphasis),
+            Span::styled(compress(&from.display().to_string(), 52), theme.dim),
+        ]));
+    }
+    if biggest.len() > 6 {
+        lines.push(Line::from(Span::styled(
+            format!("        \u{2026} and {} more", biggest.len() - 6),
+            theme.dim,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "anything else in your trash is left where it is",
+        theme.dim,
+    )));
+    lines.push(Line::from(vec![
+        Span::styled(" enter ", theme.mode_badge),
+        Span::styled(" empty the trash   ", theme.normal),
+        Span::styled(" esc ", theme.emphasis),
+        Span::styled("cancel", theme.dim),
+    ]));
+
+    popup(f, theme, area, " empty the trash ", lines, true);
+}
+
 /// Whether the staged tool bytes actually return to this disk, when they do not
 /// all do so.
 fn host_note(app: &App) -> Option<String> {
@@ -191,7 +265,9 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         done += job.done.len();
         lines.push(Line::from(vec![
             Span::styled(format!("{}/{} ", job.done.len(), job.total), theme.emphasis),
-            Span::styled("deleted · ", theme.dim),
+            // The bytes were deleted when the batch was committed; what is
+            // happening now is only that they stop being held.
+            Span::styled(if app.emptying { "emptied · " } else { "deleted · " }, theme.dim),
             Span::styled(human(job.freed()), theme.emphasis),
             Span::styled(" reclaimed", theme.dim),
         ]));
@@ -259,7 +335,9 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         lines.push(Line::from(Span::styled("working…", theme.dim)));
     }
 
-    let title = if app.tool_job.is_some() && app.job.is_some() {
+    let title = if app.emptying {
+        " emptying the trash "
+    } else if app.tool_job.is_some() && app.job.is_some() {
         " deleting and removing "
     } else if app.tool_job.is_some() {
         " removing "

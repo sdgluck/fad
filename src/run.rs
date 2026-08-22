@@ -109,6 +109,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         Mode::Basket => basket_key(app, k),
         Mode::History => history_key(app, k),
         Mode::Confirm => confirm_key(app, k),
+        Mode::EmptyTrash => empty_key(app, k),
         Mode::Deleting => deleting_key(app, k),
         Mode::Normal => normal_key(app, k),
     }
@@ -276,6 +277,18 @@ fn confirm_key(app: &mut App, k: KeyEvent) {
     app.mark_dirty();
 }
 
+/// Taking the trash out. Uppercase `y` is not required here the way `D` is in
+/// the confirmation — the items are already deleted, and this only closes the
+/// gap between fad's arithmetic and the volume's.
+fn empty_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+        KeyCode::Enter | KeyCode::Char('y') => app.empty_trash(),
+        _ => {}
+    }
+    app.mark_dirty();
+}
+
 fn deleting_key(app: &mut App, k: KeyEvent) {
     // Both halves, or the modal closes while a removal is still running.
     if app.batch_finished() && matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
@@ -345,6 +358,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             app.history_cursor = 0;
             app.mode = Mode::History;
         }
+        KeyCode::Char('E') => empty_trash(app),
         KeyCode::Char('r') => toggle_reclaim(app),
         KeyCode::Char('d') => toggle_dupes(app),
         KeyCode::Char('t') => toggle_tools(app),
@@ -578,6 +592,18 @@ fn toggle_stage(app: &mut App) {
     if !app.staged.remove(&id) {
         app.stage(id);
     }
+}
+
+/// Trashing reclaims nothing until the trash goes out, and until now the only
+/// thing fad could do about that was print a banner and send the user
+/// elsewhere. This closes that loop, and only over what fad itself put there.
+fn empty_trash(app: &mut App) {
+    app.refresh_history();
+    if app.trash_pending.0 == 0 {
+        app.status = Some("nothing of fad's is in the trash".into());
+        return;
+    }
+    app.mode = Mode::EmptyTrash;
 }
 
 fn toggle_reclaim(app: &mut App) {
