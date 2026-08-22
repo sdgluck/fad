@@ -71,6 +71,7 @@ sign of movement reads as a hang.
 | `r` | reclaimable view — build artifacts, package caches, app caches, VM images |
 | `t` | tool storage — what Docker and friends hold that a walk cannot see |
 | `d` | duplicate view — files whose contents are byte-for-byte equal |
+| `L` | in the duplicate view — make the copies share one copy of the storage |
 | `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
 | `/` | fuzzy filter (`enter` to keep it, `esc` to clear) |
 | `s` | cycle sort: size → count → modified → name · `R` rescan |
@@ -203,10 +204,44 @@ same ends is a *likely* duplicate, and inviting you to delete one on that basis
 is how a tool like this destroys your work. If the read budget runs out, the
 unverified groups are counted in a banner and never listed.
 
-Only files over 1M are considered, and hardlinked copies are skipped: they
-already share their storage, so deleting one frees nothing.
+Only files over 1M are considered, and copies that already share their storage
+are skipped — hardlinks, and anything cloned — because deleting one of those
+frees nothing. That matters more on a Mac than it sounds: APFS clones on `cp`,
+and so does the standard library's own file copy, so a great many byte-identical
+pairs have never cost anything twice. Listing them would be inviting you to
+delete a file for no gain.
 
 `A` on a group stages every copy but the newest.
+
+### Or keep every copy
+
+`L` is the other answer, and usually the better one. Instead of deleting all but
+the newest copy, it makes the others *share* the newest one's storage: the same
+bytes come back, and every path goes on working. On APFS and on btrfs or XFS
+these are copy-on-write clones, so writing to either path afterwards splits them
+apart again and neither can surprise the other.
+
+```
+2 copies now share storage with the newest — 128M back on the volume,
+though du still counts both
+```
+
+That last clause is not a hedge. `du` reports a clone at its full size, `fad`'s
+sizes are `du`'s, and so the tree above will go on showing both copies at what
+they used to cost. The number that moves is the free-space figure in the header,
+which is the one this was ever about. The group leaves the duplicate list,
+because there is no longer anything to reclaim by deleting either half of it.
+
+Nothing is staged, nothing goes to the trash, and this does not pass through the
+basket — nothing is being removed. Each replacement is built beside its target
+and renamed into place, so an interruption leaves either the old file or the new
+one and never half of either, and the destination keeps its own permissions and
+its own modification time: only where its bytes live is different.
+
+Where the filesystem has no clone operation — ext4, HFS+, a network mount — `L`
+says so and does nothing. There is deliberately no fallback to a hard link: a
+hard link would make writing to one path change the other, which is a different
+thing from what you asked for and a considerably worse one.
 
 ## Tool storage
 

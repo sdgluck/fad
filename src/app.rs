@@ -1069,6 +1069,93 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Make every copy in a group share one copy of the storage, instead of
+    /// deleting all but one of them.
+    ///
+    /// The other half of what the duplicate view can offer, and the better half
+    /// where the filesystem supports it: the same bytes come back, and every
+    /// path goes on working. Nothing is staged and nothing goes to the trash,
+    /// because nothing is being removed — which is also why this does not go
+    /// through the basket.
+    ///
+    /// The tree is deliberately left alone afterwards. `du` counts a clone at
+    /// its full size, `fad`'s sizes are `du`'s, and quietly zeroing one here
+    /// would produce a number that jumped back up on the next rescan. What
+    /// moves instead is the free-space figure in the header, which is the one
+    /// that was ever really the point.
+    pub fn clone_group(&mut self, group: usize) -> String {
+        let items = self.dupe_items(group);
+        let Some((keep, copies)) = items.split_first() else {
+            return "nothing to share".into();
+        };
+        if copies.is_empty() {
+            return "only one copy left".into();
+        }
+        let keep_path = self.tree.path(*keep);
+        let bytes_each =
+            self.dupes.as_ref().and_then(|r| r.groups.get(group)).map(|g| g.bytes_each);
+        let Some(bytes_each) = bytes_each else { return "that group has gone".into() };
+
+        let (mut shared, mut freed) = (0usize, 0u64);
+        let mut refused: Option<String> = None;
+        for id in copies {
+            let path = self.tree.path(*id);
+            match crate::clone::share(&keep_path, &path, bytes_each) {
+                Ok(()) => {
+                    shared += 1;
+                    // Allocated blocks, not length: what came back is what the
+                    // second copy was costing the volume.
+                    freed += self.tree.self_size(*id, false);
+                }
+                // Nothing on this filesystem will work, so stop rather than
+                // fail the same way once per copy.
+                Err(crate::clone::Refusal::Unsupported) => {
+                    return crate::clone::Refusal::Unsupported.to_string();
+                }
+                Err(e) => refused = Some(e.to_string()),
+            }
+        }
+
+        if shared > 0 {
+            self.drop_shared_group(group);
+            self.mark_dirty();
+        }
+        match (shared, refused) {
+            (0, Some(why)) => why,
+            (0, None) => "nothing to share".into(),
+            (n, why) => {
+                let mut msg = format!(
+                    "{n} cop{} now share{} storage with the newest \u{2014} {} back on the volume, though du still counts both",
+                    if n == 1 { "y" } else { "ies" },
+                    if n == 1 { "s" } else { "" },
+                    crate::format::human(freed)
+                );
+                if let Some(why) = why {
+                    msg.push_str(&format!(" \u{b7} one refused: {why}"));
+                }
+                msg
+            }
+        }
+    }
+
+    /// Take a group off the list once its copies share their storage. They are
+    /// still byte-for-byte identical, and there is no longer anything to
+    /// reclaim by deleting one — which is the only reason the view lists them.
+    fn drop_shared_group(&mut self, group: usize) {
+        let Some(report) = self.dupes.as_mut() else { return };
+        if group < report.groups.len() {
+            report.groups.remove(group);
+        }
+        // The open set is keyed by position, so every index above the one that
+        // went now means a different group.
+        self.dupes_open = self
+            .dupes_open
+            .iter()
+            .filter(|i| **i != group)
+            .map(|i| if *i > group { i - 1 } else { *i })
+            .collect();
+    }
+
     /// Node ids are arena indices, so a duplicate report is only ever about
     /// the tree it was computed from. Any tree swap has to throw it away —
     /// carrying it over would point "delete this copy" at an unrelated file.

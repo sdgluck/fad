@@ -332,6 +332,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
 
         KeyCode::Char(' ') => toggle_stage(app),
         KeyCode::Char('A') => stage_children(app),
+        KeyCode::Char('L') => share_storage(app),
 
         KeyCode::Char('/') => {
             app.mode = Mode::Filter;
@@ -605,6 +606,32 @@ fn empty_trash(app: &mut App) {
         return;
     }
     app.mode = Mode::EmptyTrash;
+}
+
+/// The other thing to do about a duplicate: keep every copy and stop paying
+/// for all but one of them.
+fn share_storage(app: &mut App) {
+    if !app.dupe_view {
+        app.status = Some("L shares storage between duplicate copies \u{2014} press d first".into());
+        return;
+    }
+    // From a copy as well as from the heading: having walked into a group to
+    // look at the paths is exactly when the user decides what to do about it.
+    let group = match app.rows.get(app.cursor).and_then(|r| r.header) {
+        Some(Heading::Dupes(g)) => Some(g),
+        Some(_) => None,
+        None => (0..=app.cursor)
+            .rev()
+            .find_map(|i| match app.rows.get(i).and_then(|r| r.header) {
+                Some(Heading::Dupes(g)) => Some(g),
+                _ => None,
+            }),
+    };
+    let Some(group) = group else {
+        app.status = Some("no duplicate group here".into());
+        return;
+    };
+    app.status = Some(app.clone_group(group));
 }
 
 fn toggle_reclaim(app: &mut App) {

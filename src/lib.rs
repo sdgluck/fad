@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cache;
+pub mod clone;
 pub mod delete;
 pub mod dupes;
 pub mod format;

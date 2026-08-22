@@ -56,6 +56,15 @@ impl Report {
     pub fn wasted(&self) -> u64 {
         self.groups.iter().map(|g| g.wasted()).sum()
     }
+
+    /// Record a group, unless collapsing shared storage has left it with
+    /// nothing to reclaim.
+    fn push(&mut self, ids: Vec<NodeId>, bytes_each: u64) {
+        if ids.len() < 2 {
+            return;
+        }
+        self.groups.push(Group { ids, bytes_each });
+    }
 }
 
 /// One candidate file: its node, where to read it, its size, and its mtime so
@@ -103,7 +112,7 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
         // so its fingerprint *is* its full hash: it is already verified.
         if bytes <= EDGE * 2 {
             report.bytes_read += bytes * group.len() as u64;
-            report.groups.push(Group { ids: newest_first(group), bytes_each: bytes });
+            report.push(newest_first(group), bytes);
             continue;
         }
         let cost = bytes.saturating_mul(group.len() as u64);
@@ -120,7 +129,7 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
         }
         for (_, same) in by_hash {
             if same.len() >= 2 {
-                report.groups.push(Group { ids: newest_first(same), bytes_each: bytes });
+                report.push(newest_first(same), bytes);
             }
         }
     }
@@ -130,9 +139,25 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
 }
 
 /// Newest first, so the copy the user is most likely still using is the one
-/// "keep one" keeps.
+/// "keep one" keeps — with copies that already share their storage collapsed
+/// down to one entry.
+///
+/// Two files that share their extents cost what one of them costs, so deleting
+/// either frees nothing. That is the same reason hard links are left out of the
+/// candidate set entirely, and it matters more here than it looks: on APFS
+/// `cp` clones, and so does the standard library's own file copy, so a great
+/// many byte-identical pairs on a Mac have never cost anything twice. Listing
+/// them as reclaimable would be inviting the user to delete a file for no gain.
+///
+/// A filesystem that will not report extents says nothing either way, and
+/// nothing is collapsed on the strength of not knowing.
 fn newest_first(mut group: Vec<Candidate>) -> Vec<NodeId> {
     group.sort_unstable_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
+    let mut seen = std::collections::HashSet::new();
+    group.retain(|c| match crate::clone::physical_start(&c.path) {
+        Some(start) => seen.insert(start),
+        None => true,
+    });
     group.into_iter().map(|c| c.id).collect()
 }
 

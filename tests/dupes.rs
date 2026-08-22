@@ -75,3 +75,34 @@ fn a_lone_file_of_its_size_is_never_read() {
     assert!(report.groups.is_empty());
     assert_eq!(report.bytes_read, 0, "sizes alone should have settled it");
 }
+
+/// Two files that already share their extents cost what one of them costs, so
+/// deleting either frees nothing. Listing them as reclaimable would be inviting
+/// the user to delete a file for no gain, which is the same reason hard links
+/// never reach the candidate set.
+#[test]
+fn copies_that_already_share_their_storage_are_not_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write(dir.path(), "a.bin", &body(7));
+    let b = write(dir.path(), "b.bin", &body(7));
+
+    // Prove the pair is reported before they share anything, or the assertion
+    // below would pass on a filesystem that simply found nothing.
+    let before = dupes::find(vec![candidate(&a, 1, 100), candidate(&b, 2, 200)]);
+    assert_eq!(before.groups.len(), 1, "the plain pair was not found in the first place");
+
+    match fad::clone::share(&a, &b, std::fs::metadata(&a).unwrap().len()) {
+        Ok(()) => {}
+        Err(fad::clone::Refusal::Unsupported) => {
+            eprintln!("skipped: this filesystem cannot share storage between files");
+            return;
+        }
+        Err(e) => panic!("clone failed: {e}"),
+    }
+
+    let after = dupes::find(vec![candidate(&a, 1, 100), candidate(&b, 2, 200)]);
+    assert!(
+        after.groups.is_empty(),
+        "a pair sharing one copy of its storage is still on offer to delete"
+    );
+}

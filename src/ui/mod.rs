@@ -101,6 +101,13 @@ fn draw_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             }
             if let Some(msg) = &app.status {
                 spans.push(Span::styled(msg.clone(), theme.emphasis));
+            } else if app.dupe_view {
+                // The one view with a second, better verb: the hint is the only
+                // place anyone will find it.
+                spans.push(Span::styled(
+                    "A delete all but the newest \u{b7} L share one copy instead, keeping every path \u{b7} d back",
+                    theme.dim,
+                ));
             } else {
                 spans.push(Span::styled(
                     "space stage \u{b7} x basket \u{b7} r reclaimable \u{b7} t tools \u{b7} / filter \u{b7} s sort \u{b7} ? help \u{b7} q quit",
@@ -133,6 +140,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("t", "tool storage: what Docker and friends hold that a walk cannot see"),
         ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),
         ("d", "duplicate view: files whose contents are byte-for-byte equal"),
+        ("L", "in the duplicate view: share one copy of the storage, keeping every path"),
         ("s", "cycle sort: size, count, modified, name"),
         ("S", "bring the next detail breakdown to the top, when they do not all fit"),
         ("o / e / y", "Finder / $EDITOR / copy path"),
