@@ -30,12 +30,30 @@ pub fn reveal(path: &Path) -> io::Result<&'static str> {
 /// Free bytes on the filesystem holding `path`, as the user sees them: blocks
 /// available to an unprivileged process, not the reserved total.
 pub fn free_space(path: &Path) -> Option<u64> {
+    volume(path).map(|v| v.free)
+}
+
+/// What the filesystem holding `path` has, and what is left of it.
+pub struct Volume {
+    /// Blocks available to an unprivileged process, not the reserved total:
+    /// this is the figure the user will see in their file manager.
+    pub free: u64,
+    pub total: u64,
+}
+
+/// A size tells you nothing without its denominator. 285G is most of a 512G
+/// disk and a quarter of a 2T one, and those are different afternoons.
+pub fn volume(path: &Path) -> Option<Volume> {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return None;
     }
-    (st.f_bavail as u64).checked_mul(st.f_frsize as u64)
+    let unit = st.f_frsize as u64;
+    Some(Volume {
+        free: (st.f_bavail as u64).checked_mul(unit)?,
+        total: (st.f_blocks as u64).checked_mul(unit)?,
+    })
 }
 
 /// Copy text to the system clipboard.

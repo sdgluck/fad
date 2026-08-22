@@ -491,3 +491,40 @@ fn the_empty_trash_screen_states_what_it_costs() {
     assert!(out.contains("cannot be undone"), "no warning that this is final:\n{out}");
     assert!(out.contains("left where it is"), "does not say other trash is spared:\n{out}");
 }
+
+/// A scan total on its own does not say whether it matters. The header has to
+/// carry the denominator the user is actually trying to move.
+#[test]
+fn the_header_says_what_is_left_on_the_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.poll_volume();
+
+    let out = render(&mut app, 140, 20);
+    println!("{out}");
+    assert!(out.contains("free of"), "no free-space figure in the header:\n{out}");
+    assert!(out.contains("dirs,"), "the entry count was dropped on a wide pane:\n{out}");
+
+    // Narrow enough that the two cannot both fit. The count is context; the
+    // free figure is the number the user is trying to move, so it is the one
+    // that stays.
+    let narrow = render(&mut app, 76, 20);
+    println!("{narrow}");
+    assert!(narrow.contains("free of"), "the free figure was dropped first:\n{narrow}");
+}
+
+/// With --cross-device the tree spans filesystems and one free-space figure
+/// cannot describe all of them. Say so rather than let it read as the total.
+#[test]
+fn a_cross_device_scan_says_the_free_figure_is_one_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.opts.cross_device = true;
+    app.poll_volume();
+
+    let out = render(&mut app, 100, 20);
+    println!("{out}");
+    assert!(out.contains("crosses filesystems"), "no caveat for a multi-volume scan:\n{out}");
+}

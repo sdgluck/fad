@@ -18,7 +18,7 @@ const EIGHTHS: [&str; 9] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉",
 const BAR_WIDTH: usize = 12;
 
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
-    let title = header(app);
+    let title = header(app, area.width.saturating_sub(2) as usize);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border)
@@ -57,28 +57,41 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     }
 }
 
-fn header(app: &App) -> Line<'static> {
+/// The one line that is always on screen, so what it drops when it runs out of
+/// room matters.
+///
+/// Everything after the path is built first and the path is given what is
+/// left, because the path is the part the user already knows — they typed it —
+/// and the sizes are the part they came for. A block title is truncated from
+/// the right, so laying it out the other way round loses the free-space figure
+/// first, which is exactly backwards.
+fn header(app: &App, width: usize) -> Line<'static> {
     let root = app.tree.node(app.tree.root());
-    let path = app.tree.root_path().display().to_string();
-    let mut spans = vec![
-        Span::from(" ").into(),
-        Span::from(path).bold(),
-        Span::from("  "),
-        Span::from(human(app.tree.size(app.tree.root(), app.apparent))).bold(),
-    ];
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::from("  "));
+    spans.push(Span::from(human(app.tree.size(app.tree.root(), app.apparent))).bold());
     if app.apparent {
         spans.push(Span::from(" apparent"));
     }
+    // The first thing to go when the pane is narrow: an entry count is context,
+    // and everything else on this line is the answer.
+    let counts = spans.len();
     if app.scanning() {
         spans.push(Span::from(format!(
-            "  scanning {} dirs, {} files ",
+            "  scanning {} dirs, {} files",
             root.dir_count, root.file_count
         )));
     } else {
         spans.push(Span::from(format!(
-            "  {} dirs, {} files ",
+            "  {} dirs, {} files",
             root.dir_count, root.file_count
         )));
+    }
+    // The denominator. A scan total on its own says how big something is; this
+    // is what says whether it matters, and it is the number the user is
+    // actually trying to move.
+    if let Some(v) = app.volume.as_ref() {
+        spans.push(Span::from(format!("  {} free of {} ", human(v.free), human(v.total))).bold());
     }
     if app.reclaim_view {
         spans.push(Span::from(" reclaimable ").bold().reversed());
@@ -115,7 +128,22 @@ fn header(app: &App) -> Line<'static> {
         spans.push(Span::from(format!(" {} ", app.age_filter.label())).bold().reversed());
         spans.push(Span::from(" "));
     }
-    Line::from(spans)
+
+    /// A path compressed below this is no longer a path, and a title that
+    /// overflows loses the free-space figure off the right-hand end — so when
+    /// it comes to it, the entry count goes instead.
+    const MIN_PATH: usize = 16;
+
+    let width_of =
+        |v: &[Span<'static>]| v.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    if width.saturating_sub(width_of(&spans) + 1) < MIN_PATH {
+        spans.remove(counts);
+    }
+
+    let path = app.tree.root_path().display().to_string();
+    let room = width.saturating_sub(width_of(&spans) + 1);
+    let head = vec![Span::from(" "), Span::from(super::compress(&path, room)).bold()];
+    Line::from([head, spans].concat())
 }
 
 fn empty_reason(app: &App) -> String {
@@ -286,6 +314,19 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
                 }
             }
         }
+    }
+
+    // With --cross-device the tree spans filesystems and the header's free
+    // figure is only the root volume's. One number over several disks is
+    // exactly the kind of total the rest of this tool refuses to print.
+    if app.spans_volumes() && app.volume.is_some() {
+        out.push(Line::from(Span::styled(
+            truncate_end(
+                " \u{25cc} this scan crosses filesystems \u{2014} the free figure is the root volume's alone",
+                width,
+            ),
+            theme.dim,
+        )));
     }
 
     let cloud = app

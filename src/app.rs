@@ -376,6 +376,13 @@ pub struct App {
     pub history: Vec<delete::Batch>,
     /// Index into `history`.
     pub history_cursor: usize,
+    /// What the volume under the scan root holds and what is left of it.
+    ///
+    /// Cached rather than asked for per frame: it is a syscall against a live
+    /// filesystem, the answer moves in whole gigabytes, and the header redraws
+    /// thirty times a second during a walk.
+    pub volume: Option<crate::platform::Volume>,
+    volume_at: Option<Instant>,
     /// What fad has trashed and not yet seen emptied. Trashing reclaims nothing
     /// until the trash goes out, and a headline that ignores that is a lie by
     /// omission.
@@ -533,6 +540,8 @@ impl App {
             basket_cursor: 0,
             history: Vec::new(),
             history_cursor: 0,
+            volume: None,
+            volume_at: None,
             trash_pending: delete::still_in_trash(),
             tree_list: ratatui::layout::Rect::ZERO,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
@@ -1618,6 +1627,32 @@ impl App {
         self.expanded.retain(|id| self.tree.node(*id).flags & flags::DELETED == 0);
         self.mark_dirty();
         true
+    }
+
+    /// Reread how much room is left on the volume. Returns true if the figure
+    /// moved, which during a scan it will not: nothing fad has done yet
+    /// changes it, and everything the user is about to do is measured against
+    /// it.
+    pub fn poll_volume(&mut self) -> bool {
+        const EVERY: Duration = Duration::from_secs(2);
+        if self.volume_at.is_some_and(|t| t.elapsed() < EVERY) {
+            return false;
+        }
+        self.volume_at = Some(Instant::now());
+        let fresh = crate::platform::volume(self.tree.root_path());
+        let changed = match (&self.volume, &fresh) {
+            (Some(a), Some(b)) => a.free != b.free || a.total != b.total,
+            (None, None) => false,
+            _ => true,
+        };
+        self.volume = fresh;
+        changed
+    }
+
+    /// True when the scan spans more than one filesystem, so the free-space
+    /// figure in the header describes only the volume the root is on.
+    pub fn spans_volumes(&self) -> bool {
+        self.opts.cross_device
     }
 
     /// Reread the journal. Called whenever a batch lands or is put back, which

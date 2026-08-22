@@ -11,7 +11,7 @@ items go to the system trash by default and can be restored with one keystroke.
 Runs on macOS and Linux.
 
 ```
-┌ /Users/you  285G  294014 dirs, 2411907 files ────────┬ selection ────────────────┐
+┌ /Users/you  285G  294014 dirs, 2411907 files  71G free of 1.0T ┬ selection ──────┐
 │ ▾ you                              285G ████████████ │ /Users/you/Library        │
 │   ▾ Library                        168G ████████████ │ 168G on disk              │
 │     ▸ Containers                    38G ██▊          │ 59% of scan               │
@@ -344,6 +344,21 @@ nothing at all when the biggest candidate happens to be 3G.
 first, then leaves the fresh walk behind as the new baseline, so it can be run
 on a timer. It answers "what did that install just add?", which no single scan
 can.
+
+## Free space
+
+The header carries what is left on the volume: `71G free of 1.0T`. A scan total
+on its own says how big something is, not whether it matters — 285G is most of a
+512G disk and a quarter of a 2T one, and those are different afternoons. It is
+also the number every decision in this tool is ultimately about, so it is on
+screen the whole time rather than only in the basket.
+
+When the pane is too narrow for all of it, the entry count goes and the free
+figure stays. A count is context; this is the answer.
+
+`--cross-device` makes the tree span filesystems, and one free-space figure
+cannot describe several disks. `fad` says so in a banner rather than let the
+header read as a total.
 
 ## Sizes
 

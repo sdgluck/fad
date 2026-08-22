@@ -72,6 +72,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
         app.poll_dupes();
         app.poll_tools();
         app.poll_tool_job();
+        app.poll_volume();
 
         let tick = if app.scanning() { SCAN_TICK } else { IDLE_TICK };
         if last_draw.elapsed() >= tick {
