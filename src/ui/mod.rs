@@ -5,6 +5,7 @@ mod basket;
 mod detail_pane;
 mod history;
 mod modal;
+mod omissions;
 mod search;
 mod theme;
 mod tree_pane;
@@ -61,6 +62,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Search => search::draw(f, app, &theme, area),
         Mode::Basket => basket::draw(f, app, &theme, area),
         Mode::History => history::draw(f, app, &theme, area),
+        Mode::Omissions => omissions::draw(f, app, &theme, area),
         Mode::Confirm => modal::draw_confirm(f, app, &theme, area),
         Mode::EmptyTrash => modal::draw_empty_trash(f, app, &theme, area),
         Mode::Deleting => modal::draw_progress(f, app, &theme, area),
@@ -148,6 +150,7 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         ("S", "bring the next detail breakdown to the top, when they do not all fit"),
         ("o / e / y", "Finder / $EDITOR / copy path"),
         ("i", "never rank this again \u{2014} adds it to your ignore list"),
+        ("!", "what is not in these numbers: skipped, unreadable, ignored"),
         ("R", "rescan the selected subtree"),
         ("click", "select \u{b7} on the arrow: open \u{b7} on the left edge: stage"),
         ("wheel", "move the selection"),

@@ -110,6 +110,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         Mode::Basket => basket_key(app, k),
         Mode::History => history_key(app, k),
+        Mode::Omissions => omissions_key(app, k),
         Mode::Confirm => confirm_key(app, k),
         Mode::EmptyTrash => empty_key(app, k),
         Mode::Deleting => deleting_key(app, k),
@@ -202,6 +203,36 @@ fn restore_selected(app: &mut App) {
         Ok(r) => undo_message(&r),
         Err(e) => e,
     });
+}
+
+/// What the scan did not count. Read-only: every line here is a thing to go and
+/// do something about outside fad, or a flag to rerun with, so the only action
+/// worth offering is taking the path away with you.
+fn omissions_key(app: &mut App, k: KeyEvent) {
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('!') => app.mode = Mode::Normal,
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.omission_cursor =
+                (app.omission_cursor + 1).min(app.omissions.len().saturating_sub(1))
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.omission_cursor = app.omission_cursor.saturating_sub(1)
+        }
+        KeyCode::Char('g') => app.omission_cursor = 0,
+        KeyCode::Char('G') => app.omission_cursor = app.omissions.len().saturating_sub(1),
+        KeyCode::Char('y') => {
+            let Some(path) = app.omission_at_cursor().map(|o| o.path.clone()) else { return };
+            match crate::platform::copy_to_clipboard(&path.to_string_lossy()) {
+                Ok(()) => app.status = Some("path copied".into()),
+                Err(_) => {
+                    app.status =
+                        Some(format!("no clipboard \u{2014} {}", crate::platform::clipboard_hint()))
+                }
+            }
+        }
+        _ => {}
+    }
+    app.mark_dirty();
 }
 
 fn basket_key(app: &mut App, k: KeyEvent) {
@@ -419,6 +450,11 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('e') => open_editor(app),
         KeyCode::Char('y') => copy_path(app),
         KeyCode::Char('i') => ignore_selected(app),
+        // The banners say how many; this says which, and what would fix each.
+        KeyCode::Char('!') => {
+            app.collect_omissions();
+            app.mode = Mode::Omissions;
+        }
         KeyCode::Char('R') => {
             // In the tools view there is no tree to rescan: R means ask the
             // tools again, which is the only thing here that goes stale.

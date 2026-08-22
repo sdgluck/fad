@@ -79,6 +79,7 @@ sign of movement reads as a hang.
 | `S` | bring the next detail breakdown to the top, when they do not all fit |
 | `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
 | `i` | never rank this again — adds it to your ignore list |
+| `!` | what is not in these numbers — skipped, unreadable, ignored |
 | `?` | help · `q` or `esc` quit |
 
 The mouse works too: click a row to select it, click its arrow to open or close
@@ -450,7 +451,33 @@ first of its paths.
   your terminal Full Disk Access usually fixes this.
 
 Anything skipped is reported in a banner, so an incomplete number is never shown
-as a complete one.
+as a complete one. A banner says how many, which is enough to know a total is
+short and not enough to do anything about it — `!` says which, path by path,
+with the flag or the permission that would fix each kind on its heading.
+
+```
+┌ what is not in these numbers ─────────────────────────────────────┐
+│ 12 entries were not counted — every total above them is short by  │
+│    whatever they hold                                             │
+│ 2 hidden by your ignore list · 41G — counted, just not shown      │
+│                                                                   │
+│ could not be read  not counted — grant your terminal Full Disk    │
+│   Library/Application Support/MobileSync                        — │
+│ cloud folders  not counted — rerun with --cloud                   │
+│   Library/Mobile Documents                                      — │
+│ on your ignore list  counted in every total above it, not shown   │
+│   VMs                                                         38G │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+The two halves are never added together. Something unreadable is missing from
+every total above it and makes the headline wrong; something ignored is in the
+headline and only missing from the view. A single figure spanning both would be
+true of neither.
+
+Nothing uncounted is given a size, because there isn't one to give: not knowing
+what an unread directory holds is the whole content of the row, and a `0` there
+would be the exact failure this screen exists to expose.
 
 ## Deleting
 

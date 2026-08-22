@@ -156,6 +156,61 @@ pub struct Breakdown {
     at: Instant,
 }
 
+/// Why an entry is not in the numbers, or not on screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// The directory could not be read. Its contents are missing from every
+    /// total above it.
+    Unreadable,
+    /// A cloud provider's folder, not descended into.
+    Cloud,
+    /// A mount point for another filesystem.
+    OtherVolume,
+    /// On the user's ignore list: hidden from the views, but counted.
+    Ignored,
+}
+
+impl Why {
+    pub fn heading(self) -> &'static str {
+        match self {
+            Why::Unreadable => "could not be read",
+            Why::Cloud => "cloud folders",
+            Why::OtherVolume => "other filesystems",
+            Why::Ignored => "on your ignore list",
+        }
+    }
+
+    /// What it costs, and what to do about it. The second half is the reason
+    /// this screen exists: a list of things fad did not do is only useful if
+    /// each line says how to make it do them.
+    pub fn note(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "macos")]
+            Why::Unreadable => "not counted \u{2014} grant your terminal Full Disk Access",
+            #[cfg(not(target_os = "macos"))]
+            Why::Unreadable => "not counted \u{2014} needs different permissions, or root",
+            Why::Cloud => "not counted \u{2014} rerun with --cloud",
+            Why::OtherVolume => "not counted \u{2014} rerun with --cross-device",
+            Why::Ignored => "counted in every total above it, just not shown",
+        }
+    }
+
+    /// Is what this is hiding missing from the totals?
+    pub fn uncounted(self) -> bool {
+        !matches!(self, Why::Ignored)
+    }
+}
+
+/// One thing the scan did not count, or did not show.
+pub struct Omission {
+    pub path: PathBuf,
+    pub why: Why,
+    /// What it holds, where that is known at all. It never is for anything
+    /// uncounted — that is what uncounted means — and inventing a figure for it
+    /// would be the exact failure this screen exists to expose.
+    pub bytes: Option<u64>,
+}
+
 /// One line of the staging basket.
 pub enum BasketRow {
     Group { cat: Option<Category>, count: usize, bytes: u64 },
@@ -255,6 +310,8 @@ pub enum Mode {
     EmptyTrash,
     /// A batch is being deleted, or has just finished.
     Deleting,
+    /// Everything the scan did not count, and what to do about each kind.
+    Omissions,
 }
 
 pub struct App {
@@ -382,6 +439,10 @@ pub struct App {
     pub mouse: bool,
     /// Index into `basket_rows`.
     pub basket_cursor: usize,
+    /// What the scan did not count, as of the last time it was asked for.
+    pub omissions: Vec<Omission>,
+    /// Index into `omissions`.
+    pub omission_cursor: usize,
     /// The undo journal, newest first, as of the last time it was opened.
     pub history: Vec<delete::Batch>,
     /// Index into `history`.
@@ -552,6 +613,8 @@ impl App {
             ignored: (0, 0),
             mouse: true,
             basket_cursor: 0,
+            omissions: Vec::new(),
+            omission_cursor: 0,
             history: Vec::new(),
             history_cursor: 0,
             volume: None,
@@ -1331,6 +1394,94 @@ impl App {
         // keystroke into a full-tree walk.
         let children = self.tree.node(id).children.clone();
         children.iter().any(|c| self.fuzzy_matches(*c))
+    }
+
+    /// Everything the scan did not count, and everything it counted but will
+    /// not show.
+    ///
+    /// The banners along the bottom of the tree say how many of each there are,
+    /// which is enough to know a total is short and not enough to do anything
+    /// about it. "Why is this smaller than the Finder says" was unanswerable
+    /// from inside the UI; this is the answer, path by path.
+    pub fn collect_omissions(&mut self) {
+        /// A cap, because a permissions problem can produce thousands of these
+        /// and a list that long is not a list.
+        const KEEP: usize = 500;
+
+        let mut out: Vec<Omission> = Vec::new();
+        for (id, reason) in &self.tree.skipped {
+            out.push(Omission {
+                path: self.tree.path(*id),
+                why: match reason {
+                    crate::scan::walk::Skip::CloudStorage => Why::Cloud,
+                    crate::scan::walk::Skip::OtherDevice => Why::OtherVolume,
+                },
+                bytes: None,
+            });
+        }
+        for id in 0..self.tree.len() as NodeId {
+            let n = self.tree.node(id);
+            if n.flags & (flags::UNREADABLE | flags::DELETED) != flags::UNREADABLE {
+                continue;
+            }
+            out.push(Omission { path: self.tree.path(id), why: Why::Unreadable, bytes: None });
+        }
+        // Only the topmost match of each ignored branch. An absolute path in
+        // the ignore list covers everything beneath it, and listing all of that
+        // would bury the four rules the user actually wrote.
+        if !self.ignore.is_empty() {
+            for id in 0..self.tree.len() as NodeId {
+                if self.tree.node(id).flags & flags::DELETED != 0 || !self.is_ignored(id) {
+                    continue;
+                }
+                if self.has_ignored_ancestor(id) {
+                    continue;
+                }
+                out.push(Omission {
+                    path: self.tree.path(id),
+                    why: Why::Ignored,
+                    bytes: Some(self.tree.size(id, self.apparent)),
+                });
+            }
+        }
+
+        // Grouped by reason, and within a reason the ones with a known size
+        // first and biggest: everything else has nothing to sort by.
+        out.sort_by(|a, b| {
+            (a.why as u8)
+                .cmp(&(b.why as u8))
+                .then_with(|| b.bytes.cmp(&a.bytes))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        out.truncate(KEEP);
+        self.omissions = out;
+        self.omission_cursor = 0;
+    }
+
+    fn has_ignored_ancestor(&self, id: NodeId) -> bool {
+        let mut cur = self.tree.node(id).parent;
+        while let Some(p) = cur {
+            if self.is_ignored(p) {
+                return true;
+            }
+            cur = self.tree.node(p).parent;
+        }
+        false
+    }
+
+    /// How many entries are missing from the totals, and how much is merely
+    /// hidden. Never one figure: one of them makes every size on screen wrong
+    /// and the other does not.
+    pub fn omission_summary(&self) -> (usize, usize, u64) {
+        let uncounted = self.omissions.iter().filter(|o| o.why.uncounted()).count();
+        let hidden = self.omissions.iter().filter(|o| !o.why.uncounted());
+        let bytes = hidden.clone().filter_map(|o| o.bytes).sum();
+        (uncounted, hidden.count(), bytes)
+    }
+
+    /// The path under the cursor on the omissions screen.
+    pub fn omission_at_cursor(&self) -> Option<&Omission> {
+        self.omissions.get(self.omission_cursor)
     }
 
     // --------------------------------------------------------------- search

@@ -547,3 +547,36 @@ fn the_find_overlay_shows_where_each_hit_is() {
     assert!(out.contains("dev/fad/target/debug/huge.rlib"), "no path for the hit:\n{out}");
     assert!(out.contains("go there"), "no footer:\n{out}");
 }
+
+/// The screen that answers "why is this smaller than the Finder says". Each
+/// heading has to carry the flag or the permission that would fix it, and the
+/// two kinds — missing from the totals, and merely hidden — must not blur.
+#[test]
+fn the_omissions_screen_says_what_would_fix_each_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let locked = dir.path().join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("x.bin"), vec![0u8; 4096]).unwrap();
+
+    // Root reads anything; there is no unreadable directory to render.
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("skipped: running as root, where no directory is unreadable");
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut app = app_for(dir.path());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    app.collect_omissions();
+    app.mode = fad::app::Mode::Omissions;
+
+    let out = render(&mut app, 100, 24);
+    println!("{out}");
+    assert!(out.contains("not in these numbers"), "no title:\n{out}");
+    assert!(out.contains("could not be read"), "no heading for the unreadable group:\n{out}");
+    assert!(out.contains("locked"), "the path is missing:\n{out}");
+    assert!(out.contains("is short by whatever it holds"), "does not say the totals are wrong:\n{out}");
+}
