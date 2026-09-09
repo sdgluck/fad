@@ -127,3 +127,137 @@ fn a_scan_that_left_nothing_out_reports_nothing() {
     assert!(app.omissions.is_empty());
     assert_eq!(app.omission_summary(), (0, 0, 0));
 }
+
+/// A name that is not valid UTF-8 — possible on Linux, rejected by APFS — is a
+/// name fad cannot carry. It holds names as text, so `Tree::path` would rebuild
+/// a path that reaches nothing, and a delete aimed at it would miss or, if two
+/// names flatten to the same text, hit the wrong entry. So the walk stops at
+/// one, the screen says so, and nothing can stage it.
+mod unnamed {
+    use super::*;
+    use fad::scan::meta::{Kind, Meta};
+    use fad::scan::walk::{Batch, Entry, ROOT_ID, Skip};
+    use fad::tree::{Tree, flags};
+
+    fn meta(kind: Kind, len: u64) -> Meta {
+        Meta { blocks: len, len, mtime: 0, dev: 1, ino: 7, nlink: 1, kind }
+    }
+
+    /// A tree of `root` holding one ordinary directory and one entry the walk
+    /// refused to name. Built by hand because the filesystem under this test
+    /// may not accept such a name at all.
+    fn tree_with_a_bad_name(root: &Path) -> Tree {
+        let mut tree = Tree::new(root.to_path_buf(), &meta(Kind::Dir, 0));
+        tree.apply(Batch {
+            parent: ROOT_ID,
+            entries: vec![
+                Entry {
+                    name: "readable".into(),
+                    meta: meta(Kind::Dir, 4096),
+                    descend: None,
+                    skip: None,
+                },
+                Entry {
+                    // What `from_utf8_lossy` leaves behind.
+                    name: "bad\u{fffd}name".into(),
+                    meta: meta(Kind::Dir, 8192),
+                    descend: None,
+                    skip: Some(Skip::UnrepresentableName),
+                },
+            ],
+            unreadable: None,
+        });
+        tree
+    }
+
+    fn app_with(tree: Tree, root: &Path) -> App {
+        let opts = ScanOpts::default();
+        let mut app = App::new(tree, Scan::start(root, opts.clone()).unwrap().1, opts);
+        app.mark_dirty();
+        app.rebuild_rows();
+        app
+    }
+
+    #[test]
+    fn it_is_flagged_and_never_descended_into() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = tree_with_a_bad_name(dir.path());
+
+        let bad = tree
+            .node(tree.root())
+            .children
+            .iter()
+            .copied()
+            .find(|c| tree.node(*c).flags & flags::UNNAMED != 0)
+            .expect("the entry was not flagged");
+        // Marked scanned so nothing goes looking for children it cannot reach.
+        assert!(tree.node(bad).flags & flags::SCANNED != 0);
+        assert_eq!(tree.skipped.len(), 1, "not recorded as something left out");
+    }
+
+    #[test]
+    fn it_is_reported_as_missing_from_the_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(tree_with_a_bad_name(dir.path()), dir.path());
+        app.collect_omissions();
+
+        let found: Vec<_> = app.omissions.iter().filter(|o| o.why == Why::Unnamed).collect();
+        assert_eq!(found.len(), 1, "the unnamed entry was not reported");
+        assert!(found[0].bytes.is_none(), "claimed to know what it holds");
+        assert!(Why::Unnamed.uncounted(), "must not read as merely hidden");
+
+        let (uncounted, hidden, _) = app.omission_summary();
+        assert_eq!((uncounted, hidden), (1, 0));
+    }
+
+    #[test]
+    fn it_cannot_reach_a_delete_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with(tree_with_a_bad_name(dir.path()), dir.path());
+        let bad = app
+            .tree
+            .node(app.tree.root())
+            .children
+            .iter()
+            .copied()
+            .find(|c| app.tree.node(*c).flags & flags::UNNAMED != 0)
+            .unwrap();
+
+        // Staged directly, as a stale batch carried across a rescan could be.
+        app.stage(bad);
+        assert_eq!(app.staged.len(), 1);
+
+        app.review_batch();
+        assert!(app.staged.is_empty(), "an unnameable entry reached the batch");
+        assert!(app.batch_items().is_empty());
+        assert_eq!(app.refused.len(), 1);
+        assert!(app.refused[0].1.contains("not valid text"), "{:?}", app.refused[0].1);
+    }
+
+    /// The real thing, where the filesystem allows it. APFS and HFS+ reject
+    /// these names outright, so this can only run on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_one_is_stopped_at_rather_than_walked_into() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        mk(dir.path(), "fine/a.bin", 4096);
+        let bad = dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir"));
+        std::fs::create_dir(&bad).unwrap();
+        std::fs::write(bad.join("inside.bin"), vec![0u8; 8192]).unwrap();
+
+        let mut app = app_for(dir.path());
+        app.collect_omissions();
+
+        let found: Vec<_> = app.omissions.iter().filter(|o| o.why == Why::Unnamed).collect();
+        assert_eq!(found.len(), 1, "a real unnameable directory was not reported");
+
+        // It was stopped at, not walked into and not reported as unreadable.
+        assert_eq!(app.tree.unreadable_count, 0, "reported as a permissions problem");
+        assert!(
+            app.omissions.iter().all(|o| o.why != Why::Unreadable),
+            "misreported as unreadable"
+        );
+    }
+}

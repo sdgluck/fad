@@ -52,6 +52,9 @@ pub mod flags {
     /// Deleted during this session. The arena entry stays so every other index
     /// remains valid; it is simply no longer anyone's child.
     pub const DELETED: Flags = 1 << 6;
+    /// The name is not valid UTF-8. Shown lossily, never descended into, and
+    /// never staged: the path fad would rebuild for it does not exist.
+    pub const UNNAMED: Flags = 1 << 7;
 }
 
 #[derive(Debug)]
@@ -252,6 +255,7 @@ impl Tree {
             match e.skip {
                 Some(Skip::OtherDevice) => f |= flags::OTHER_DEVICE | flags::SCANNED,
                 Some(Skip::CloudStorage) => f |= flags::CLOUD | flags::SCANNED,
+                Some(Skip::UnrepresentableName) => f |= flags::UNNAMED | flags::SCANNED,
                 None => {}
             }
             let bytes = e.meta.blocks;
@@ -590,12 +594,14 @@ fn skip_to_u8(s: Skip) -> u8 {
     match s {
         Skip::OtherDevice => 0,
         Skip::CloudStorage => 1,
+        Skip::UnrepresentableName => 2,
     }
 }
 
 fn skip_from_u8(v: u8) -> Skip {
     match v {
         1 => Skip::CloudStorage,
+        2 => Skip::UnrepresentableName,
         _ => Skip::OtherDevice,
     }
 }

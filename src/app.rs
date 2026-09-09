@@ -168,6 +168,8 @@ pub enum Why {
     OtherVolume,
     /// On the user's ignore list: hidden from the views, but counted.
     Ignored,
+    /// The name is not valid UTF-8, so there is no path fad could act on.
+    Unnamed,
 }
 
 impl Why {
@@ -176,6 +178,7 @@ impl Why {
             Why::Unreadable => "could not be read",
             Why::Cloud => "cloud folders",
             Why::OtherVolume => "other filesystems",
+            Why::Unnamed => "names that are not valid text",
             Why::Ignored => "on your ignore list",
         }
     }
@@ -191,6 +194,7 @@ impl Why {
             Why::Unreadable => "not counted \u{2014} needs different permissions, or root",
             Why::Cloud => "not counted \u{2014} rerun with --cloud",
             Why::OtherVolume => "not counted \u{2014} rerun with --cross-device",
+            Why::Unnamed => "not counted \u{2014} rename it, or clear it out from a shell",
             Why::Ignored => "counted in every total above it, just not shown",
         }
     }
@@ -1481,6 +1485,7 @@ impl App {
                 why: match reason {
                     crate::scan::walk::Skip::CloudStorage => Why::Cloud,
                     crate::scan::walk::Skip::OtherDevice => Why::OtherVolume,
+                    crate::scan::walk::Skip::UnrepresentableName => Why::Unnamed,
                 },
                 bytes: None,
             });
@@ -1989,6 +1994,14 @@ impl App {
             // added — or staged from a view the rule does not filter.
             if self.is_ignored(id) {
                 self.refused.push((id, "on your ignore list".into()));
+                continue;
+            }
+            // The name did not survive the trip through UTF-8, so `path` is a
+            // best-effort rendering rather than a real path: deleting by it
+            // would miss, or — with two names that flatten to the same text —
+            // hit the wrong entry. Refused rather than attempted.
+            if self.tree.node(id).flags & flags::UNNAMED != 0 {
+                self.refused.push((id, "its name is not valid text".into()));
                 continue;
             }
             match delete::guard(&path, &root) {

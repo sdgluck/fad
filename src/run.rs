@@ -657,6 +657,11 @@ fn expand(app: &mut App) {
         app.status = Some("cloud folder — rerun with --cloud to scan it".into());
         return;
     }
+    if n.flags & flags::UNNAMED != 0 {
+        app.status =
+            Some("its name is not valid text, so fad cannot open it — ! for the list".into());
+        return;
+    }
     if app.expanded.insert(id) {
         return;
     }
@@ -719,6 +724,12 @@ fn toggle_stage(app: &mut App) {
     let Some(id) = app.selected() else { return };
     if id == app.tree.root() {
         app.status = Some("the scan root cannot be deleted".into());
+        return;
+    }
+    // Said here rather than at the confirm screen, which is a long way from
+    // the keypress that would have staged it.
+    if app.tree.node(id).flags & flags::UNNAMED != 0 {
+        app.status = Some("its name is not valid text — fad cannot name it to delete it".into());
         return;
     }
     if !app.staged.remove(&id) {

@@ -38,6 +38,9 @@ pub enum Skip {
     OtherDevice,
     /// A cloud provider's folder. Enumerating it can block on the network.
     CloudStorage,
+    /// The name is not valid UTF-8, so fad cannot rebuild a path that reaches
+    /// it. See `dir::DirEntry::representable`.
+    UnrepresentableName,
 }
 
 #[derive(Debug)]
@@ -134,10 +137,15 @@ fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s Ctx, path: PathBuf, id: ScanI
     let mut subdirs = Vec::new();
 
     for item in read {
-        let dir::DirEntry { name, meta } = item;
+        let dir::DirEntry { name, representable, meta } = item;
         let mut skip = None;
         let mut descend = None;
-        if meta.is_dir() {
+        // Before anything else: every branch below joins this name onto a path,
+        // and one that does not round-trip would name a different file — or
+        // nothing at all.
+        if !representable {
+            skip = Some(Skip::UnrepresentableName);
+        } else if meta.is_dir() {
             if !ctx.opts.cross_device && meta.dev != ctx.root_dev {
                 skip = Some(Skip::OtherDevice);
             } else if !ctx.opts.cloud && cloud::is_cloud_root(&path.join(&*name)) {

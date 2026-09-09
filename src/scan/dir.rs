@@ -14,7 +14,21 @@ use std::path::Path;
 use super::meta::Meta;
 
 pub struct DirEntry {
+    /// The name as text. Lossy when `representable` is false, in which case it
+    /// is fit for display and for nothing else — see there.
     pub name: Box<str>,
+    /// The name survived the trip through UTF-8 unchanged, so `name` can be
+    /// joined back onto a path and still refer to this entry.
+    ///
+    /// Filenames are bytes on Unix, and on Linux they need not be UTF-8. fad
+    /// carries names as `str` — the tree, the fuzzy matcher, the snapshot and
+    /// every path it rebuilds — so a name that does not round-trip is a name it
+    /// cannot act on: `Tree::path` would produce a path that does not exist,
+    /// and a delete aimed at it would miss. Rather than find that out at the
+    /// point of deleting something, the walk stops at such an entry and the
+    /// omissions screen says so. macOS does not arise: APFS and HFS+ reject
+    /// these names at creation.
+    pub representable: bool,
     pub meta: Meta,
 }
 
@@ -64,8 +78,10 @@ pub fn read_dir_stat(path: &Path) -> io::Result<Vec<DirEntry>> {
             continue; // raced with a delete, or we cannot stat it; either way, skip
         }
 
+        let name = String::from_utf8_lossy(name_bytes);
         out.push(DirEntry {
-            name: String::from_utf8_lossy(name_bytes).into_owned().into_boxed_str(),
+            representable: name.as_bytes() == name_bytes,
+            name: name.into_owned().into_boxed_str(),
             meta: Meta::from_stat(&st),
         });
     }
