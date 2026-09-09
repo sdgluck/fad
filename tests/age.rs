@@ -120,3 +120,59 @@ fn sorting_by_modified_ranks_on_the_newest_write_below() {
         "sorted by the directory's own mtime rather than the newest write below it"
     );
 }
+
+/// The newest-write rollup is a maximum, and a maximum does not subtract, so
+/// removing a node cannot walk it back the way `roll_up` walks sizes back.
+/// Delete the one recent file in an archive and every directory above it went
+/// on claiming to have been written to yesterday — which the age filter then
+/// believed, and went on hiding a branch that had become exactly what it was
+/// looking for.
+#[test]
+fn deleting_the_newest_file_makes_its_ancestors_old_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_aged(&root.join("archive/deep/ancient"), 1024, 900);
+    write_aged(&root.join("archive/deep/fresh"), 1024, 1);
+
+    let mut tree = scanned(root);
+    let now = fad::app::now_secs();
+    let archive = find(&tree, "archive");
+    let deep = find(&tree, "archive/deep");
+
+    assert!(now - tree.node(archive).last_write() < 3 * DAY, "fixture is not fresh to begin with");
+
+    tree.remove(find(&tree, "archive/deep/fresh")).expect("remove returned nothing");
+
+    for (id, what) in [(deep, "the containing directory"), (archive, "its parent")] {
+        assert!(
+            now - tree.node(id).last_write() > 800 * DAY,
+            "{what} still reports the deleted file's write"
+        );
+    }
+}
+
+/// The same thing through the filter, which is where a user would meet it.
+#[test]
+fn the_age_filter_reveals_a_branch_once_its_fresh_file_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_aged(&root.join("active/old"), 1024, 900);
+    write_aged(&root.join("active/fresh"), 1024, 2);
+
+    let opts = ScanOpts::default();
+    let (mut tree, scan) = Scan::start(root, opts.clone()).unwrap();
+    scan.finish(&mut tree);
+    let mut app = App::new(tree, Scan::start(root, opts.clone()).unwrap().1, opts);
+    app.age_filter = AgeFilter::Y1;
+
+    let shown = |app: &mut App| {
+        app.mark_dirty();
+        app.rebuild_rows();
+        app.rows.iter().any(|r| app.tree.node(r.id).name.as_ref() == "active")
+    };
+
+    assert!(!shown(&mut app), "a branch with a fresh file was shown as untouched");
+    let fresh = app.tree.find_path(&app.tree.root_path().join("active/fresh")).unwrap();
+    app.tree.remove(fresh);
+    assert!(shown(&mut app), "the branch stayed hidden after its fresh file went");
+}

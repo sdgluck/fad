@@ -415,7 +415,39 @@ impl Tree {
         self.nodes[id as usize].flags |= flags::DELETED;
         self.nodes[parent as usize].children.retain(|c| *c != id);
         self.roll_up(parent, -(bytes as i64), -(len as i64), -(files as i64), -(dirs as i64));
+        // `roll_up` walks sizes back; the newest-write rollup cannot be walked
+        // back the same way, because a maximum does not subtract. Delete the one
+        // recent file in an archive and every directory above it would go on
+        // reporting itself as freshly written — wrong in the detail pane, in the
+        // modified sort, and in the age filter, which would keep hiding a branch
+        // that is now exactly what it claims to be looking for.
+        self.recompute_newest(parent);
         Some(bytes)
+    }
+
+    /// Rebuild `newest_file_mtime` from the children that are left, upwards.
+    ///
+    /// Stops at the first ancestor whose value does not move: it is a maximum
+    /// over the level below, so if this level did not change, nothing above it
+    /// can have.
+    fn recompute_newest(&mut self, from: NodeId) {
+        let mut cur = Some(from);
+        while let Some(id) = cur {
+            let newest = self.nodes[id as usize]
+                .children
+                .iter()
+                .map(|c| self.nodes[*c as usize].newest_file_mtime)
+                .max()
+                .unwrap_or(i64::MIN);
+            let n = &mut self.nodes[id as usize];
+            // A file's stamp is its own mtime, not a fold over children it
+            // does not have.
+            if n.flags & flags::IS_DIR == 0 || n.newest_file_mtime == newest {
+                return;
+            }
+            n.newest_file_mtime = newest;
+            cur = n.parent;
+        }
     }
 
     /// Order children by `sort`, in place. Called only for nodes that are
