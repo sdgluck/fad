@@ -12,7 +12,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use crate::app::{App, Heading, Mode};
+use crate::app::{App, Heading, Mode, View};
 use crate::delete::{self, Disposal};
 use crate::tree::flags;
 use crate::ui;
@@ -765,11 +765,10 @@ fn share_storage(app: &mut App) {
 }
 
 fn toggle_reclaim(app: &mut App) {
-    app.reclaim_view = !app.reclaim_view;
-    app.dupe_view = false;
-    app.cursor = 0;
-    app.offset = 0;
-    if app.reclaim_view && app.tree.reclaimable.is_empty() {
+    if !app.toggle_view(View::Reclaim) {
+        return;
+    }
+    if app.tree.reclaimable.is_empty() {
         app.status = Some(if app.scanning() {
             "nothing reclaimable found yet — still scanning".into()
         } else {
@@ -781,15 +780,9 @@ fn toggle_reclaim(app: &mut App) {
 /// The duplicate view. Hashing is only meaningful once the walk has finished,
 /// and only starts when the user asks for it.
 fn toggle_dupes(app: &mut App) {
-    app.dupe_view = !app.dupe_view;
-    app.cursor = 0;
-    app.offset = 0;
-    if !app.dupe_view {
+    if !app.toggle_view(View::Dupes) {
         return;
     }
-    // The reclaimable view is the other list-of-groups screen; showing both at
-    // once would mean two different things by the same heading.
-    app.reclaim_view = false;
     if app.dupes.is_some() || app.dupe_hunt_running() {
         return;
     }
@@ -803,16 +796,9 @@ fn toggle_dupes(app: &mut App) {
 
 /// The tools view. Nothing is asked of any daemon until this is pressed.
 fn toggle_tools(app: &mut App) {
-    app.tools_view = !app.tools_view;
-    app.cursor = 0;
-    app.offset = 0;
-    if !app.tools_view {
+    if !app.toggle_view(View::Tools) {
         return;
     }
-    // All three of these are lists of groups; showing two at once would mean
-    // two different things by the same heading.
-    app.reclaim_view = false;
-    app.dupe_view = false;
     if app.tools.is_some() || app.tool_probe_running() {
         return;
     }

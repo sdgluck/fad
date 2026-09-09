@@ -225,10 +225,13 @@ fn main() {
     let mut app = App::new(tree, scan, opts);
     app.apparent = args.apparent;
     app.mouse = !args.no_mouse;
-    app.reclaim_view = args.reclaim;
+    // One view or the other, never both: `rebuild_rows` would show the tools
+    // and leave the reclaimable view up invisibly underneath it.
     if args.tools {
-        app.tools_view = true;
+        app.show_view(Some(fad::app::View::Tools));
         app.start_tool_probe();
+    } else if args.reclaim {
+        app.show_view(Some(fad::app::View::Reclaim));
     }
     if !args.no_cache {
         app.load_snapshot_async();

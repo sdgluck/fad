@@ -292,6 +292,19 @@ impl Row {
     }
 }
 
+/// One of the three views that replace the tree with a list of groups.
+///
+/// They are mutually exclusive. Each is a list of headings rather than a tree,
+/// and two up at once would mean two different things by the same row — so the
+/// three flags behind them are only ever written together, through
+/// [`App::show_view`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Reclaim,
+    Dupes,
+    Tools,
+}
+
 #[derive(PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -1332,6 +1345,48 @@ impl App {
         self.reclaim_open.contains(&cat)
     }
 
+    // ----------------------------------------------------------------- views
+
+    /// Which group view is up, if any. The order matches `rebuild_rows`, which
+    /// is what decides the question if the flags ever disagree.
+    pub fn view(&self) -> Option<View> {
+        if self.tools_view {
+            Some(View::Tools)
+        } else if self.dupe_view {
+            Some(View::Dupes)
+        } else if self.reclaim_view {
+            Some(View::Reclaim)
+        } else {
+            None
+        }
+    }
+
+    /// Put one group view up, or none at all.
+    ///
+    /// The single writer of all three flags, because the exclusivity between
+    /// them used to be re-stated in each of the three key handlers and one of
+    /// them said it incompletely: `r` cleared the duplicate view and left the
+    /// tools view standing, so the reclaimable view was silently up underneath
+    /// it and appeared out of nowhere on a later `t`. `--reclaim --tools` could
+    /// set two the same way.
+    pub fn show_view(&mut self, view: Option<View>) {
+        self.reclaim_view = view == Some(View::Reclaim);
+        self.dupe_view = view == Some(View::Dupes);
+        self.tools_view = view == Some(View::Tools);
+        self.cursor = 0;
+        self.offset = 0;
+        self.mark_dirty();
+    }
+
+    /// Put `view` up, or take it down if it is already up. Returns whether it
+    /// is up afterwards, which is what decides whether the caller has any
+    /// opening work to do.
+    pub fn toggle_view(&mut self, view: View) -> bool {
+        let up = self.view() != Some(view);
+        self.show_view(up.then_some(view));
+        up
+    }
+
     fn push_row(&mut self, id: NodeId, depth: u16, sibling_max: u64) {
         self.rows.push(Row::node(id, depth, sibling_max));
         if !self.expanded.contains(&id) {
@@ -1583,9 +1638,7 @@ impl App {
         let (id, _) = *self.search_hits.get(self.search_cursor)?;
         // The group views are lists, not the tree, and the row this is looking
         // for does not exist in any of them.
-        self.reclaim_view = false;
-        self.dupe_view = false;
-        self.tools_view = false;
+        self.show_view(None);
 
         let mut cur = self.tree.node(id).parent;
         while let Some(p) = cur {

@@ -410,3 +410,53 @@ fn the_cursor_follows_its_row_across_a_re_probe() {
 
     assert_eq!(app.rows[app.cursor].header, want);
 }
+
+/// The three group views are lists of headings rather than the tree, so two up
+/// at once would mean two different things by the same row. `r` used to clear
+/// only the duplicate view, leaving the tools view standing with the
+/// reclaimable view up invisibly underneath it — which then appeared out of
+/// nowhere on the `t` that was meant to close something.
+#[test]
+fn only_one_group_view_is_ever_up() {
+    use fad::app::View;
+
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+    let mut app = app_for(dir.path());
+
+    let up = |app: &App| {
+        [
+            (View::Reclaim, app.reclaim_view),
+            (View::Dupes, app.dupe_view),
+            (View::Tools, app.tools_view),
+        ]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(v, _)| v)
+        .collect::<Vec<_>>()
+    };
+
+    assert_eq!(app.view(), None);
+    assert!(up(&app).is_empty());
+
+    // Every ordered pair, so no toggle can leave another view behind it.
+    for first in [View::Reclaim, View::Dupes, View::Tools] {
+        for second in [View::Reclaim, View::Dupes, View::Tools] {
+            app.show_view(None);
+            assert!(app.toggle_view(first));
+            assert_eq!(app.view(), Some(first));
+
+            let now_up = app.toggle_view(second);
+            if first == second {
+                assert!(!now_up, "{second:?} did not toggle off");
+                assert_eq!(app.view(), None);
+                assert!(up(&app).is_empty(), "{:?} left flags set", up(&app));
+            } else {
+                assert!(now_up);
+                assert_eq!(app.view(), Some(second));
+                assert_eq!(up(&app), vec![second], "{first:?} then {second:?}");
+            }
+        }
+    }
+}
