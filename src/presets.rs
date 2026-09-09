@@ -94,9 +94,34 @@ const ALWAYS: &[(&str, Category)] = &[
     ("thumbnails", Category::AppCache),
 ];
 
-/// File extensions that are always a disk image. `Docker.raw` on macOS,
-/// libvirt's `qcow2` on Linux, and the VirtualBox/VMware formats on both.
-const IMAGE_EXTS: &[&str] = &["raw", "qcow2", "vmdk", "vdi", "img", "sparsebundle", "vhd", "vhdx"];
+/// File extensions that are only ever a disk image: libvirt's `qcow2`, the
+/// VirtualBox and VMware formats, Apple's sparsebundle. Nothing else writes
+/// these, so the name alone is proof.
+const IMAGE_EXTS: &[&str] = &["qcow2", "vmdk", "vdi", "sparsebundle", "vhd", "vhdx"];
+
+/// Extensions that are usually a disk image and occasionally something
+/// irreplaceable. `.raw` is Docker's disk on macOS and also what Panasonic and
+/// Leica cameras write; `.img` is a VM disk and also installer media and
+/// forensic captures.
+///
+/// Every other rule in this module refuses to match on a name alone — a
+/// `target` needs a `Cargo.toml` beside it, because "name-only matching would
+/// eventually stage someone's photos". These two are precisely that hazard, and
+/// they reach `--reclaim --yes`, where nobody is watching.
+///
+/// Size is the corroboration available. A VM disk is provisioned in gigabytes;
+/// a camera raw is tens of megabytes. There is an order of magnitude of clear
+/// air between them, so the floor sits in the middle of it. Below the floor the
+/// entry is not offered at all, which for a file that small costs the user
+/// nothing worth having.
+///
+/// Measured against `st_size` rather than allocated blocks, because the
+/// question here is what the file *is*, not what it currently costs: a
+/// freshly-created `Docker.raw` is provisioned at 60G and sparse down to almost
+/// nothing, and it is a VM disk either way. What it costs is `--min-size`'s
+/// question, and it is asked separately.
+const AMBIGUOUS_IMAGE_EXTS: &[&str] = &["raw", "img"];
+const AMBIGUOUS_IMAGE_FLOOR: u64 = 1 << 30;
 
 /// The command that rebuilds this directory, for the entries we can name one
 /// for. Same sibling test as `classify`, so the answer is the tool that
@@ -108,21 +133,30 @@ pub fn rebuild_command(name: &str, siblings: &HashSet<&str>) -> Option<&'static 
         .map(|(_, _, cmd)| *cmd)
 }
 
-/// Classify one entry, given the names of everything beside it in the same
-/// directory. `parent_name` disambiguates the generic names: a `registry`
-/// directory only means Cargo's inside `.cargo`.
+/// Classify one entry, given its length and the names of everything beside it
+/// in the same directory. `parent_name` disambiguates the generic names: a
+/// `registry` directory only means Cargo's inside `.cargo`. `len` is `st_size`,
+/// and corroborates the two ambiguous image extensions; see
+/// [`AMBIGUOUS_IMAGE_EXTS`].
 pub fn classify(
     name: &str,
     is_dir: bool,
+    len: u64,
     parent_name: &str,
     siblings: &HashSet<&str>,
 ) -> Option<Category> {
     if !is_dir {
-        let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-        if let Some(ext) = ext {
-            if IMAGE_EXTS.contains(&ext.as_str()) {
-                return Some(Category::VmImage);
-            }
+        // A dotfile has no extension: `.img` is a name, not an img file.
+        let Some((stem, ext)) = name.rsplit_once('.') else { return None };
+        if stem.is_empty() {
+            return None;
+        }
+        let ext = ext.to_ascii_lowercase();
+        if IMAGE_EXTS.contains(&ext.as_str()) {
+            return Some(Category::VmImage);
+        }
+        if AMBIGUOUS_IMAGE_EXTS.contains(&ext.as_str()) && len >= AMBIGUOUS_IMAGE_FLOOR {
+            return Some(Category::VmImage);
         }
         return None;
     }

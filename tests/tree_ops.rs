@@ -164,3 +164,41 @@ fn presets_match_directly_under_the_scan_root() {
     assert_eq!(at_root.node(top).preset, expected, "the scan root did not vouch for its children");
     assert!(at_root.reclaimable.contains(&top), "missing from the reclaimable view");
 }
+
+/// Every other preset rule needs corroboration before it fires — a `target`
+/// wants a `Cargo.toml` beside it — because, as the module says, name-only
+/// matching would eventually stage someone's photos. `.raw` and `.img` were the
+/// exception: matched on the extension alone, into the category that
+/// `--reclaim --yes` deletes unattended, and `.raw` is what Panasonic and Leica
+/// cameras write.
+#[test]
+fn an_ambiguous_image_extension_needs_a_size_to_vouch_for_it() {
+    use fad::presets::Category;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // A camera raw and a disc image, at the sizes those things really are.
+    std::fs::write(root.join("P1000123.raw"), vec![0u8; 40 * 1024 * 1024]).unwrap();
+    std::fs::write(root.join("notes.img"), vec![0u8; 8 * 1024 * 1024]).unwrap();
+    // A VM disk, provisioned large and sparse — which is how they arrive.
+    std::fs::File::create(root.join("Docker.raw")).unwrap().set_len(60 << 30).unwrap();
+    // And one whose extension is proof on its own, at any size.
+    std::fs::write(root.join("box.qcow2"), vec![0u8; 1024]).unwrap();
+
+    let tree = scan(root);
+    let preset = |rel: &str| tree.node(find(&tree, rel)).preset;
+
+    assert_eq!(preset("P1000123.raw"), None, "a camera raw was staged as a VM image");
+    assert_eq!(preset("notes.img"), None, "a small .img was staged as a VM image");
+    assert_eq!(preset("Docker.raw"), Some(Category::VmImage), "a real VM disk was missed");
+    assert_eq!(preset("box.qcow2"), Some(Category::VmImage), "an unambiguous format was missed");
+
+    // And nothing that was not offered can reach the unattended path.
+    let ignore = fad::ignore::Rules::default();
+    let offered: Vec<String> = fad::reclaim::candidates(&tree, false, 0, &ignore)
+        .into_iter()
+        .map(|(id, _)| tree.node(id).name.to_string())
+        .collect();
+    assert!(!offered.iter().any(|n| n == "P1000123.raw"), "offered to --reclaim: {offered:?}");
+}

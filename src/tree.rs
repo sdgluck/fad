@@ -233,7 +233,9 @@ impl Tree {
         let presets: Vec<Option<Category>> = batch
             .entries
             .iter()
-            .map(|e| presets::classify(&e.name, e.meta.is_dir(), &parent_name, &siblings))
+            .map(|e| {
+                presets::classify(&e.name, e.meta.is_dir(), e.meta.len, &parent_name, &siblings)
+            })
             .collect();
 
         let mut children = Vec::with_capacity(batch.entries.len());
