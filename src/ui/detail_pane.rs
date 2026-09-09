@@ -16,7 +16,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // fixed nine rows, six of which were blank on the empty basket you are
     // looking at for most of a session — and every one of those rows is a row
     // the breakdowns above could have been using.
-    let staged = 2 + app.staged.len().clamp(1, 7) as u16;
+    let staged = 2 + (app.staged.len() + app.staged_tools.len()).clamp(1, 7) as u16;
     let split = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Length(staged)])
@@ -603,20 +603,33 @@ fn minibar(bytes: u64, max: u64) -> String {
     "\u{2588}".repeat(cells.min(W))
 }
 
+/// The box under the detail pane: what is in the batch, at a glance.
+///
+/// Both halves of it. A batch can be nothing but Docker images — they are
+/// staged from the same key, on the same screen — and a box that counted only
+/// the tree half sat there reading "staged" and "space stages the selection"
+/// with a permanent, unundoable batch waiting behind it. The two counts stay
+/// apart here for the same reason they do in the basket: they are different
+/// operations, and one number for both would be true of neither.
 fn draw_staged(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let title = if app.staged.is_empty() {
-        " staged ".to_string()
-    } else {
-        format!(" staged \u{b7} {} \u{b7} {} ", app.staged.len(), human(app.staged_bytes()))
+    let title = match (app.staged.len(), app.staged_tools.len()) {
+        (0, 0) => " staged ".to_string(),
+        (0, t) => format!(" staged \u{b7} {t} from tools \u{b7} {} ", app.staged_tool_freed().short()),
+        (n, 0) => format!(" staged \u{b7} {n} \u{b7} {} ", human(app.staged_bytes())),
+        (n, t) => format!(
+            " staged \u{b7} {n} \u{b7} {} + {t} from tools ",
+            human(app.staged_bytes())
+        ),
     };
+    let empty = app.nothing_staged();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(if app.staged.is_empty() { theme.border } else { theme.staged })
+        .border_style(if empty { theme.border } else { theme.staged })
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.staged.is_empty() {
+    if empty {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "space stages the selection",
@@ -631,20 +644,35 @@ fn draw_staged(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     items.sort_unstable_by_key(|id| std::cmp::Reverse(app.tree.size(*id, app.apparent)));
 
     let width = inner.width as usize;
-    let lines: Vec<Line> = items
+    let row = |name: &str, size: String, mark: &'static str, tint| {
+        let name_w = width.saturating_sub(size.chars().count() + 3);
+        Line::from(vec![
+            Span::styled(mark, tint),
+            Span::styled(format!("{:<name_w$}", shorten(name, name_w)), theme.normal),
+            Span::styled(size, theme.emphasis),
+        ])
+    };
+
+    let mut lines: Vec<Line> = items
         .iter()
-        .take(inner.height as usize)
         .map(|id| {
             let n = app.tree.node(*id);
-            let size = human(app.tree.size(*id, app.apparent));
-            let name_w = width.saturating_sub(size.len() + 3);
-            Line::from(vec![
-                Span::styled("\u{25cf} ", theme.staged),
-                Span::styled(format!("{:<name_w$}", shorten(&n.name, name_w)), theme.normal),
-                Span::styled(size, theme.emphasis),
-            ])
+            row(&n.name, human(app.tree.size(*id, app.apparent)), "\u{25cf} ", theme.staged)
         })
         .collect();
+    // Last and marked differently, because these do not go to the trash and
+    // `u` will not bring them back.
+    for key in &app.staged_tools {
+        let size = app
+            .tools
+            .as_ref()
+            .and_then(|r| r.get(key))
+            .filter(|r| r.sized())
+            .map(|r| human(r.bytes))
+            .unwrap_or_default();
+        lines.push(row(&app.tool_name(key), size, "\u{25c6} ", theme.warn));
+    }
+    lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
 }
 

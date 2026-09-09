@@ -460,3 +460,30 @@ fn only_one_group_view_is_ever_up() {
         }
     }
 }
+
+/// The staged box in the detail pane counted only the tree half. A batch of
+/// nothing but Docker images — staged with the same key, on the same screen —
+/// left it reading "staged" with the empty-basket prompt underneath, while a
+/// permanent, unundoable batch sat waiting behind it.
+#[test]
+fn the_staged_box_shows_a_batch_that_is_only_tools() {
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+    let mut app = app_for(dir.path());
+    app.install_tools_for_test(report(Backing::Host));
+
+    // Nothing staged at all: the prompt is right, and is the control.
+    let idle = render(&mut app, 100, 24);
+    assert!(idle.contains("space stages the selection"), "{idle}");
+
+    app.staged_tools.insert(key(app.tools.as_ref().unwrap(), "<dangling>"));
+    let out = render(&mut app, 100, 24);
+
+    assert!(
+        !out.contains("space stages the selection"),
+        "the staged box still says nothing is staged:\n{out}"
+    );
+    assert!(out.contains("1 from tools"), "the staged box does not count it:\n{out}");
+    assert!(out.contains("<dangling>"), "the staged box does not name it:\n{out}");
+}
