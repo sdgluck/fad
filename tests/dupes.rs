@@ -106,3 +106,27 @@ fn copies_that_already_share_their_storage_are_not_duplicates() {
         "a pair sharing one copy of its storage is still on offer to delete"
     );
 }
+
+/// The fingerprint pass covers the head and the tail, and `find` shortcuts the
+/// verifying read for anything no larger than both. The two have to agree about
+/// where that boundary is: a file between one edge and two used to be declared
+/// verified on the strength of its first 64K alone, so a pair differing only
+/// past that point was offered up as a duplicate.
+#[test]
+fn a_file_between_one_edge_and_two_is_still_read_to_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = 100 * 1024;
+    let mut one = vec![7u8; n];
+    let mut two = vec![7u8; n];
+    // Past the first 64K, and inside the last 64K.
+    one[n - 1] = 1;
+    two[n - 1] = 2;
+    let a = write(dir.path(), "a.bin", &one);
+    let b = write(dir.path(), "b.bin", &two);
+
+    let report = dupes::find(vec![candidate(&a, 1, 100), candidate(&b, 2, 200)]);
+    assert!(
+        report.groups.is_empty(),
+        "files differing past the first edge were called duplicates"
+    );
+}

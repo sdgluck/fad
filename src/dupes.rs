@@ -108,8 +108,10 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
     let mut report = Report { groups: Vec::new(), bytes_read: 0, unverified: 0 };
     for group in suspects {
         let bytes = group[0].bytes;
-        // A file no larger than both edges was read whole by the fingerprint,
-        // so its fingerprint *is* its full hash: it is already verified.
+        // A file no larger than both edges was read end to end by the
+        // fingerprint, so its fingerprint *is* its full hash: it is already
+        // verified. See `fingerprint`, which reads the tail from one edge up
+        // precisely so that this holds.
         if bytes <= EDGE * 2 {
             report.bytes_read += bytes * group.len() as u64;
             report.push(newest_first(group), bytes);
@@ -164,6 +166,13 @@ fn newest_first(mut group: Vec<Candidate>) -> Vec<NodeId> {
 /// The first and last 64K, plus the size. Cheap enough to run on every
 /// same-size file and selective enough that almost nothing reaches the full
 /// read.
+///
+/// The tail is read for anything past one edge, not past two, so that a file
+/// no larger than both edges is covered end to end — the head and the tail
+/// overlap in the middle of that range, and re-reading a few kilobytes is the
+/// price of `find` being able to treat such a fingerprint as a full hash. Past
+/// two edges the two reads are disjoint and the fingerprint is only ever a
+/// filter.
 fn fingerprint(c: &Candidate) -> Option<[u8; 32]> {
     let mut f = std::fs::File::open(&c.path).ok()?;
     let mut h = Sha256::default();
@@ -174,7 +183,7 @@ fn fingerprint(c: &Candidate) -> Option<[u8; 32]> {
     f.read_exact(&mut buf).ok()?;
     h.update(&buf);
 
-    if c.bytes > EDGE * 2 {
+    if c.bytes > EDGE {
         f.seek(SeekFrom::End(-(EDGE as i64))).ok()?;
         let mut tail = vec![0u8; EDGE as usize];
         f.read_exact(&mut tail).ok()?;
