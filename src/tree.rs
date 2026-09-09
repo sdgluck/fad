@@ -428,9 +428,15 @@ impl Tree {
                 let (ac, bc) = (a.file_count + a.dir_count, b.file_count + b.dir_count);
                 bc.cmp(&ac).then_with(|| a.name.cmp(&b.name))
             }),
+            // By `last_write`, for the reason the field exists: a directory's
+            // own mtime is when its listing last changed, not when anything in
+            // it was last written. Sorting on it would rank a reorganised
+            // archive above a project worked on this morning — and would
+            // disagree with both the detail pane and the age filter, which read
+            // through `last_write`.
             Sort::Modified => kids.sort_unstable_by(|a, b| {
                 let (a, b) = (&self.nodes[*a as usize], &self.nodes[*b as usize]);
-                b.mtime.cmp(&a.mtime).then_with(|| a.name.cmp(&b.name))
+                b.last_write().cmp(&a.last_write()).then_with(|| a.name.cmp(&b.name))
             }),
             Sort::Name => kids.sort_unstable_by(|a, b| {
                 self.nodes[*a as usize].name.cmp(&self.nodes[*b as usize].name)

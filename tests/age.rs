@@ -80,3 +80,43 @@ fn the_age_filter_hides_a_subtree_with_anything_recent_in_it() {
     assert!(names.iter().any(|n| n == "abandoned"), "untouched subtree was hidden: {names:?}");
     assert!(!names.iter().any(|n| n == "active"), "subtree with a fresh file shown: {names:?}");
 }
+
+/// Sorting by "modified" has to mean the same thing the age filter and the
+/// detail pane mean by it. A directory's own mtime moves when its listing
+/// changes — a file added, removed or renamed — so ranking on it puts a folder
+/// somebody tidied above a project worked on this morning, and disagrees with
+/// the filter sitting next to it on the same screen.
+#[test]
+fn sorting_by_modified_ranks_on_the_newest_write_below() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let now = fad::app::now_secs();
+
+    // Nothing written in it for years; the directory itself was touched just
+    // now, which is what reorganising one does.
+    write_aged(&root.join("reorganised/a"), 1024, 900);
+    // Written to yesterday, but the directory's own mtime is ancient.
+    write_aged(&root.join("worked_on/a"), 1024, 900);
+    write_aged(&root.join("worked_on/fresh"), 1024, 1);
+    set_mtime(&root.join("reorganised"), now);
+    set_mtime(&root.join("worked_on"), now - 900 * DAY);
+
+    let mut tree = scanned(root);
+    let r = tree.root();
+
+    // The trap the sort used to fall into is right here in the fixture.
+    assert!(
+        tree.node(find(&tree, "reorganised")).mtime
+            > tree.node(find(&tree, "worked_on")).mtime,
+        "fixture failed to make the tidied directory look fresher"
+    );
+
+    tree.sort_children(r, fad::tree::Sort::Modified, false);
+    let order: Vec<String> =
+        tree.node(r).children.iter().map(|c| tree.node(*c).name.to_string()).collect();
+    assert_eq!(
+        order,
+        vec!["worked_on".to_string(), "reorganised".to_string()],
+        "sorted by the directory's own mtime rather than the newest write below it"
+    );
+}

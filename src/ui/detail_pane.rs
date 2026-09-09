@@ -283,7 +283,13 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Span::styled(if app.apparent { " on disk" } else { " apparent size" }, theme.dim),
         ]));
     }
-    lines.push(Line::from(Span::styled(age(n.mtime), theme.dim)));
+    // `last_write`, not the entry's own mtime: a directory's mtime moves
+    // whenever anything is added, removed or renamed inside it, so a project
+    // nobody has opened in two years reads as freshly touched the moment it is
+    // reorganised. It is also what the age filter tests, and a pane that said
+    // "modified 2 hours ago" about something `a` had just hidden as untouched
+    // for two years was reporting one of the two wrong.
+    lines.push(Line::from(Span::styled(age(n.last_write()), theme.dim)));
 
     // Growth is more actionable than size. A cache that put on 12G this week is
     // a better target than a stable 20G one.
