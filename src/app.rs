@@ -495,8 +495,9 @@ impl App {
     }
 
     /// Take the snapshot if it beat the walk: complete-but-stale totals now
-    /// beat exact ones in twenty seconds. If the walk already finished, throw
-    /// it away — we have the truth.
+    /// beat exact ones in twenty seconds. If the walk already finished, keep it
+    /// as the previous scan instead — it is no use as a display, but it is the
+    /// only thing that can say what grew.
     fn poll_snapshot(&mut self) -> bool {
         let Some(rx) = self.snapshot_rx.as_ref() else { return false };
         let Ok(loaded) = rx.try_recv() else { return false };
@@ -507,22 +508,32 @@ impl App {
         // is the one thing a three-minute walk cannot produce on its own.
         self.expected_entries = Some(snapshot.len() as u64);
         self.previous_at = Some(saved_at);
-        if self.install_snapshot(snapshot) {
+        match self.install_snapshot(snapshot) {
             // It is on screen now, and `adopt` will move it into `previous`
             // when the fresh walk replaces it.
-            return true;
+            Ok(()) => true,
+            // The walk beat it, which on a small root or a warm cache is the
+            // common case rather than the odd one. Handed back rather than
+            // dropped, because `growth` has nothing else to measure against and
+            // the detail pane would otherwise never show a comparison at all.
+            Err(snapshot) => {
+                self.previous = Some(snapshot);
+                false
+            }
         }
-        // The walk beat it. It is no use as a display, but it is exactly what
-        // the growth comparison needs.
-        false
     }
 
     /// Put a loaded snapshot on screen and push the tree being filled behind
     /// it. Separate from `poll_snapshot` so the swap — the part with the sharp
     /// edges — can be exercised without racing a real walk.
-    pub fn install_snapshot(&mut self, snapshot: Tree) -> bool {
+    ///
+    /// Hands the snapshot back on refusal rather than consuming it: a tree that
+    /// is too late to display is still exactly what the growth comparison
+    /// wants, and taking it by value with nothing to return was how that got
+    /// thrown away.
+    pub fn install_snapshot(&mut self, snapshot: Tree) -> Result<(), Tree> {
         if self.scan.is_none() || self.pending.is_some() {
-            return false;
+            return Err(snapshot);
         }
         // Node ids are arena indices and mean nothing in the other tree, so
         // anything staged in the second before the snapshot landed has to be
@@ -542,7 +553,7 @@ impl App {
         self.cursor = 0;
         self.offset = 0;
         self.dirty = true;
-        true
+        Ok(())
     }
 
     /// Hand the app a previous scan directly. The real path runs through

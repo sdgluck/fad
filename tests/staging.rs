@@ -93,7 +93,7 @@ fn staging_survives_the_snapshot_swap_as_paths_not_ids() {
     let there = snapshot.find_path(&staged_path).expect("path missing from the snapshot");
     assert_ne!(there, movies, "fixture failed to shift the arena indices");
 
-    assert!(app.install_snapshot(snapshot), "snapshot was not installed");
+    assert!(app.install_snapshot(snapshot).is_ok(), "snapshot was not installed");
 
     let items = app.batch_items();
     assert_eq!(items.len(), 1);
@@ -154,7 +154,7 @@ fn rescanning_while_the_cached_tree_is_shown_starts_clean() {
     let mut app = App::new(tree, scan, opts);
 
     // A snapshot goes on screen, pushing the running walk into the background.
-    assert!(app.install_snapshot(shifted_snapshot(dir.path())));
+    assert!(app.install_snapshot(shifted_snapshot(dir.path())).is_ok());
     assert!(app.from_cache);
 
     // R throws all of that away. The new walk must feed the visible tree, not
@@ -239,4 +239,32 @@ fn the_basket_groups_the_batch_and_accounts_for_all_of_it() {
     assert_eq!(total, app.staged_bytes(), "group subtotals must account for the batch");
     let uncategorised = groups.iter().find(|(c, _, _)| c.is_none()).expect("uncategorised items need a home");
     assert_eq!(uncategorised.1, 2);
+}
+
+/// A snapshot that arrives after the walk has already finished is no use as a
+/// display — but it is the only record of the previous scan, and so the only
+/// thing the "what grew" comparison can measure against. `install_snapshot`
+/// therefore has to hand it back rather than swallow it: taking it by value
+/// with nothing to return was how it got dropped on the floor.
+#[test]
+fn a_snapshot_that_arrives_too_late_is_handed_back() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    // Let the live walk finish, which is the race the snapshot has just lost.
+    while app.scanning() {
+        app.poll_scan();
+    }
+
+    let snapshot = shifted_snapshot(dir.path());
+    let root = snapshot.root_path().to_path_buf();
+    let handed_back = app
+        .install_snapshot(snapshot)
+        .expect_err("a finished walk should refuse a snapshot for display");
+    assert_eq!(handed_back.root_path(), root, "the snapshot came back damaged");
+    assert!(
+        handed_back.find_path(&root.join("Movies")).is_some(),
+        "the snapshot came back unusable for a path comparison"
+    );
 }
