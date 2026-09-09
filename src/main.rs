@@ -192,6 +192,20 @@ fn main() {
         });
     }
 
+    // Ahead of --json, because --since has a JSON shape of its own: a list of
+    // changes, which is the whole question being asked. Below it, that shape
+    // was unreachable and `--since --json` quietly printed a plain tree dump.
+    if args.since {
+        scan.finish(&mut tree);
+        let code = print_since(&tree, &args);
+        // Leave this walk behind as the new baseline, or a script that runs
+        // --since on a timer would keep measuring against the same old scan.
+        if !args.no_cache {
+            let _ = fad::cache::save(&tree);
+        }
+        std::process::exit(code);
+    }
+
     if args.json {
         scan.finish(&mut tree);
         tree.sort_all_by_size(args.apparent);
@@ -206,17 +220,6 @@ fn main() {
     if args.reclaim && args.yes {
         scan.finish(&mut tree);
         std::process::exit(reclaim_now(&tree, &args));
-    }
-
-    if args.since {
-        scan.finish(&mut tree);
-        let code = print_since(&tree, &args);
-        // Leave this walk behind as the new baseline, or a script that runs
-        // --since on a timer would keep measuring against the same old scan.
-        if !args.no_cache {
-            let _ = fad::cache::save(&tree);
-        }
-        std::process::exit(code);
     }
 
     let mut app = App::new(tree, scan, opts);
