@@ -141,7 +141,12 @@ fn apparent_sizes_reach_the_ui_not_just_json() {
     let apparent = app.staged_bytes();
     assert_eq!(apparent, 64 * 1024 * 1024);
     assert!(apparent > on_disk, "sparse file reported the same size both ways");
-    assert_eq!(app.batch_items()[0].1, apparent, "the batch ignored --apparent");
+
+    // The batch is where the flag stops. Its bytes are not a size on screen —
+    // they become the undo journal, `Job::freed` and the "free after this
+    // batch" line, all of which are claims about the volume. See
+    // `apparent_sizes_never_reach_the_free_space_prediction`.
+    assert_eq!(app.batch_items()[0].1, on_disk, "the batch promised back a claimed size");
 }
 
 #[test]
@@ -267,4 +272,49 @@ fn a_snapshot_that_arrives_too_late_is_handed_back() {
         handed_back.find_path(&root.join("Movies")).is_some(),
         "the snapshot came back unusable for a path comparison"
     );
+}
+
+/// `--apparent` is a reporting lens: it changes what a size on screen means.
+/// It must not reach the free-space arithmetic. A sparse file's `st_size` is
+/// what it claims to be, not what the filesystem is holding for it, and a tool
+/// that promises back bytes nobody was using is wrong about the one number the
+/// user came for.
+#[test]
+fn apparent_sizes_never_reach_the_free_space_prediction() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+
+    // Sparse: 64M claimed, nothing allocated.
+    const CLAIMED: u64 = 64 * 1024 * 1024;
+    let sparse = dir.path().join("sparse.img");
+    std::fs::File::create(&sparse).unwrap().set_len(CLAIMED).unwrap();
+
+    let mut app = app_for(dir.path());
+    let id = find(&app.tree, "sparse.img");
+    let on_disk = app.tree.size(id, false);
+    assert!(
+        on_disk < CLAIMED / 2,
+        "the filesystem did not make this file sparse ({on_disk} allocated); test is moot"
+    );
+
+    app.apparent = true;
+    app.stage(id);
+
+    // The displayed total still follows the flag, as the rows beside it do.
+    assert_eq!(app.staged_bytes(), CLAIMED);
+
+    // What the volume would actually get back does not.
+    assert_eq!(app.staged_disk_bytes(), on_disk);
+    let (after, before) = app.after_commit().expect("no free-space figure");
+    assert_eq!(
+        after - before,
+        on_disk,
+        "promised back the apparent size of a sparse file"
+    );
+
+    // And the batch handed to the worker — whose bytes become the undo
+    // journal and the "reclaimed" figure — is on the same footing.
+    let items = app.batch_items();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].1, on_disk);
 }

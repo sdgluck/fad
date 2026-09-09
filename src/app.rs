@@ -1897,7 +1897,7 @@ impl App {
         // a VM image that does not shrink frees space inside that image and
         // nothing here, and putting it in this figure would make the one number
         // the user came for the one number that is wrong.
-        let gained = self.staged_bytes().saturating_add(self.staged_tool_host_bytes());
+        let gained = self.staged_disk_bytes().saturating_add(self.staged_tool_host_bytes());
         Some((free.saturating_add(gained), free))
     }
 
@@ -1922,8 +1922,22 @@ impl App {
         self.staged.is_empty() && self.staged_tools.is_empty()
     }
 
+    /// What the batch is, on the same metric as the rows it was staged from.
+    /// A total to show beside a list of sizes, not a claim about free space.
     pub fn staged_bytes(&self) -> u64 {
         self.staged.iter().map(|id| self.tree.size(*id, self.apparent)).sum()
+    }
+
+    /// What the batch will really give back to the volume.
+    ///
+    /// Allocated blocks, always, whatever `--apparent` says. `st_size` is what
+    /// a file claims to be; a sparse disk image claiming 60G can be costing
+    /// two, and the filesystem hands back what it was holding rather than what
+    /// was claimed. Everything that predicts or reports a change in free space
+    /// goes through here, so the one number the user came for cannot be the one
+    /// number that is wrong.
+    pub fn staged_disk_bytes(&self) -> u64 {
+        self.staged.iter().map(|id| self.tree.size(*id, false)).sum()
     }
 
     /// Stage `id`, dropping anything already staged inside it.
@@ -1991,8 +2005,13 @@ impl App {
     /// shows up as early as possible.
     pub fn batch_items(&self) -> Vec<(std::path::PathBuf, u64)> {
         let mut ids: Vec<NodeId> = self.staged.iter().copied().collect();
-        ids.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.size(*id, self.apparent)));
-        ids.iter().map(|id| (self.tree.path(*id), self.tree.size(*id, self.apparent))).collect()
+        // Allocated blocks on both counts, not `--apparent`. These bytes become
+        // the undo journal's record of the batch, `Job::freed`'s total and the
+        // confirm screen's "reclaimed" figure — every one of them a claim about
+        // the volume rather than a report of a size. Ordering follows for the
+        // same reason: biggest first means the most space back soonest.
+        ids.sort_unstable_by_key(|id| std::cmp::Reverse(self.tree.size(*id, false)));
+        ids.iter().map(|id| (self.tree.path(*id), self.tree.size(*id, false))).collect()
     }
 
     /// Start the batch.
