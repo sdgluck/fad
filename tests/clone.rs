@@ -50,6 +50,7 @@ fn a_clone_keeps_the_file_and_gives_the_space_back() {
     std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o640)).unwrap();
     let before = std::fs::metadata(&other).unwrap();
     let (mode, mtime) = (before.mode() & 0o7777, before.mtime());
+    let mtime_nsec = before.mtime_nsec();
 
     needs_clones!(clone::share(&keep, &other, 8 << 20)).expect("clone failed");
 
@@ -61,6 +62,9 @@ fn a_clone_keeps_the_file_and_gives_the_space_back() {
     let after = std::fs::metadata(&other).unwrap();
     assert_eq!(after.mode() & 0o7777, mode, "permissions changed");
     assert_eq!(after.mtime(), mtime, "modification time changed");
+    // To the nanosecond. Both APFS and ext4 keep them, and anything watching
+    // mtimes to decide what to rebuild reads them.
+    assert_eq!(after.mtime_nsec(), mtime_nsec, "modification time lost its sub-second part");
 
     // And they are now one copy of the bytes, not two.
     assert!(clone::already_shared(&keep, &other), "not sharing after the clone");

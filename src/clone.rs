@@ -259,12 +259,27 @@ fn carry_over(dm: &std::fs::Metadata, tmp: &Path) -> Result<(), Refusal> {
     // SAFETY: a NUL-terminated path, not retained.
     unsafe { libc::chown(c.as_ptr(), dm.uid(), dm.gid()) };
 
+    // `utimensat`, not `utimes`: the latter takes microseconds and both APFS and
+    // ext4 keep nanoseconds, so it would round the destination's timestamps on
+    // the way through. This is supposed to change where the bytes live and
+    // nothing else, and a build system watching mtimes is exactly the kind of
+    // thing that would notice.
     let times = [
-        libc::timeval { tv_sec: dm.atime() as libc::time_t, tv_usec: 0 },
-        libc::timeval { tv_sec: dm.mtime() as libc::time_t, tv_usec: 0 },
+        libc::timespec {
+            tv_sec: dm.atime() as libc::time_t,
+            tv_nsec: dm.atime_nsec() as libc::c_long,
+        },
+        libc::timespec {
+            tv_sec: dm.mtime() as libc::time_t,
+            tv_nsec: dm.mtime_nsec() as libc::c_long,
+        },
     ];
     // SAFETY: a NUL-terminated path and a two-element array of the expected type.
-    if unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) } != 0 {
+    // The temporary is a regular file we just created; NOFOLLOW says so.
+    let rc = unsafe {
+        libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW)
+    };
+    if rc != 0 {
         return Err(Refusal::Failed(io::Error::last_os_error()));
     }
     Ok(())
