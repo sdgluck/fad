@@ -685,15 +685,14 @@ fn shorten(s: &str, width: usize) -> String {
 }
 
 /// When the last scan was, phrased the way someone would say it out loud.
+///
+/// Through the same buckets as `age`, which is the point: the two sit two lines
+/// apart in this pane. This one used to open with "an hour ago" for anything
+/// under an hour, so a rescan thirty seconds old reported itself as an hour
+/// stale.
 fn since(at: std::time::SystemTime) -> String {
     let Ok(ago) = at.elapsed() else { return "the last scan".into() };
-    let secs = ago.as_secs();
-    match secs {
-        s if s < 3600 => "an hour ago".into(),
-        s if s < 36 * 3600 => format!("{} hours ago", s / 3600),
-        s if s < 60 * 86400 => format!("{} days ago", s / 86400),
-        s => format!("{} months ago", s / (30 * 86400)),
-    }
+    ago_in_words(ago.as_secs() as i64)
 }
 
 /// Rough, human relative time. Precision past "days" is not useful here.
@@ -702,7 +701,14 @@ fn age(mtime: i64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(mtime);
-    let secs = (now - mtime).max(0);
+    format!("modified {}", ago_in_words((now - mtime).max(0)))
+}
+
+/// A gap in seconds, in the largest unit that still says something: "3 days
+/// ago", "45 seconds ago". One implementation, because `age` and `since` are
+/// drawn two lines apart and reading the same interval two different ways is
+/// how one of them ends up wrong.
+fn ago_in_words(secs: i64) -> String {
     let (n, unit) = match secs {
         s if s < 90 => (s, "second"),
         s if s < 90 * 60 => (s / 60, "minute"),
@@ -711,5 +717,5 @@ fn age(mtime: i64) -> String {
         s if s < 2 * 365 * 86400 => (s / (30 * 86400), "month"),
         s => (s / (365 * 86400), "year"),
     };
-    format!("modified {n} {unit}{} ago", if n == 1 { "" } else { "s" })
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
