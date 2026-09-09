@@ -1213,9 +1213,14 @@ impl App {
                     freed += self.tree.self_size(*id, false);
                 }
                 // Nothing on this filesystem will work, so stop rather than
-                // fail the same way once per copy.
+                // fail the same way once per copy. Breaking rather than
+                // returning: a copy that did share before this has to be taken
+                // off the list and reported, and an early return dropped both
+                // — leaving the view offering a group whose storage was
+                // already collapsed.
                 Err(crate::clone::Refusal::Unsupported) => {
-                    return crate::clone::Refusal::Unsupported.to_string();
+                    refused = Some(crate::clone::Refusal::Unsupported.to_string());
+                    break;
                 }
                 Err(e) => refused = Some(e.to_string()),
             }
