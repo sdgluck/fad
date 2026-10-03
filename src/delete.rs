@@ -243,11 +243,17 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// A batch id nothing else will have: the clock to the nanosecond, mixed with
-/// the process id so two instances starting in the same tick still differ.
+/// A batch id nothing else will have: the clock, mixed with the process id so
+/// two instances starting in the same tick still differ, and a per-process
+/// counter so two batches in one process do too — macOS's clock only ticks in
+/// microseconds, and two batches can start inside one.
 fn new_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    ((nanos as u64) ^ (u64::from(std::process::id()) << 40)) | 1
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    ((nanos as u64) ^ (u64::from(std::process::id()) << 40) ^ seq.rotate_right(8)) | 1
 }
 
 /// An id for a batch written before batches had them, derived from what it
