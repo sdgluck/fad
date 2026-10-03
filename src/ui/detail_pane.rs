@@ -64,7 +64,7 @@ fn tool_heading_detail(
                 )));
                 if items.iter().any(|i| sr.items[*i].shared() > 0) {
                     lines.push(Line::from(Span::styled(
-                        "these share layers, so adding the rows up would count                          the shared ones more than once",
+                        "these share layers, so adding the rows up would count the shared ones more than once",
                         theme.dim,
                     )));
                 }
