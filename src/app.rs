@@ -472,6 +472,12 @@ pub struct App {
     pub breakdown: Option<Breakdown>,
     /// Which of the four breakdowns the detail pane leads with.
     pub panel: Panel,
+    /// The cursor is mid-burst — a held arrow key — so a new selection's
+    /// breakdown waits until it stops. The walk is the one expensive thing a
+    /// frame does, and paying for it on every row the cursor merely passes
+    /// through is what made holding `j` fall behind the key repeat. The event
+    /// loop sets and clears this; nothing else needs to.
+    pub settling: bool,
     /// Hide subtrees written to more recently than this.
     pub age_filter: AgeFilter,
     /// How many entries the last snapshot of this root held. The only honest
@@ -698,6 +704,7 @@ impl App {
             emptying: false,
             refused: Vec::new(),
             dirty: true,
+            settling: false,
             should_quit: false,
             ui: crate::ui::UiState::default(),
             cancelled: false,
@@ -1854,6 +1861,11 @@ impl App {
         // and otherwise only when the size has actually changed and enough time
         // has passed that we are not doing it on every frame of a live scan.
         const THROTTLE: Duration = Duration::from_millis(250);
+        // Mid-burst, a moved selection goes without until the cursor rests.
+        // The overview above the breakdowns is cheap and still follows it.
+        if self.settling && self.breakdown.as_ref().is_none_or(|c| c.id != id) {
+            return;
+        }
         let bytes = self.tree.size(id, self.apparent);
         if let Some(c) = self.breakdown.as_ref() {
             let fresh = c.id == id && (c.at_bytes == bytes || c.at.elapsed() < THROTTLE);

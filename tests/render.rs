@@ -295,6 +295,29 @@ fn the_detail_pane_says_where_the_size_is_concentrated() {
     assert!(rows[0].contains("44%"), "no share of the selection: {rows:?}\n{out}");
 }
 
+/// Holding an arrow key used to walk the subtree of every row the cursor passed
+/// through. Mid-burst the breakdown waits; once the cursor rests it arrives.
+#[test]
+fn a_moving_cursor_holds_the_breakdown_until_it_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.cursor = 0;
+    render(&mut app, 100, 30);
+    let root = app.breakdown.as_ref().map(|b| b.id);
+    assert!(root.is_some(), "a resting cursor gets its breakdown");
+
+    app.settling = true;
+    app.cursor = 1;
+    let out = render(&mut app, 100, 30);
+    assert_eq!(app.breakdown.as_ref().map(|b| b.id), root, "walked mid-burst");
+    assert!(!out.contains("where it goes"), "another row's breakdown shown:\n{out}");
+
+    app.settling = false;
+    render(&mut app, 100, 30);
+    assert_eq!(app.breakdown.as_ref().map(|b| b.id), app.selected(), "never caught up");
+}
+
 /// The root is the whole scan by definition, and it has no parent to be a share
 /// of. Both facts have to be said correctly rather than divided by zero.
 #[test]

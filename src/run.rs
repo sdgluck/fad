@@ -26,6 +26,12 @@ use crate::ui;
 const SCAN_TICK: Duration = Duration::from_millis(33);
 const IDLE_TICK: Duration = Duration::from_millis(250);
 
+/// How long the cursor has to rest before the detail pane's breakdown catches
+/// up with it. Longer than the default macOS key repeat (90ms), so a
+/// held key reads as one burst; short enough that letting go and seeing the
+/// numbers feel like the same moment.
+const SETTLE: Duration = Duration::from_millis(120);
+
 /// What the session left behind.
 pub struct Outcome {
     /// The tree, but only if it is worth persisting.
@@ -270,6 +276,7 @@ pub fn run(mut app: App, keep_stdout_clean: bool) -> io::Result<Outcome> {
 
 fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
     let mut last_draw = Instant::now() - SCAN_TICK;
+    let mut last_input = Instant::now() - SETTLE;
     loop {
         // Left set for `run` to find: the flag is all a handler could do, and
         // the restoring happens on the way out.
@@ -284,14 +291,24 @@ fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
         app.poll_tool_job();
         app.poll_volume();
 
+        // The burst is over: draw now, with the breakdown it was holding back,
+        // rather than leaving the pane short until the next tick.
+        let settled = app.settling && last_input.elapsed() >= SETTLE;
+        if settled {
+            app.settling = false;
+        }
+
         let tick = if app.scanning() { SCAN_TICK } else { IDLE_TICK };
-        if last_draw.elapsed() >= tick {
+        if settled || last_draw.elapsed() >= tick {
             app.rebuild_rows();
             session.terminal.draw(|f| ui::draw(f, app))?;
             last_draw = Instant::now();
         }
 
-        let ready = match event::poll(tick) {
+        // Wake for the end of a burst, not just the next tick: idle, the tick
+        // is a quarter of a second, and the breakdown would arrive that late.
+        let wait = if app.settling { SETTLE.saturating_sub(last_input.elapsed()) } else { tick };
+        let ready = match event::poll(wait) {
             Ok(ready) => ready,
             // A signal arriving mid-poll; the check at the top of the loop is
             // what deals with it.
@@ -299,25 +316,40 @@ fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
             Err(e) => return Err(e),
         };
         if ready {
-            let ev = match event::read() {
-                Ok(ev) => ev,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            };
-            let effect = match ev {
-                Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
-                Event::Mouse(m) => {
-                    on_mouse(app, m);
-                    None
+            // Everything already queued, then one frame. Held, a key repeats
+            // faster than a frame can be drawn on a big tree, and drawing after
+            // each one left the cursor running on after the key came up.
+            loop {
+                let ev = match event::read() {
+                    Ok(ev) => ev,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
+                    Err(e) => return Err(e),
+                };
+                let effect = match ev {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        // A key on the heels of the last one is a burst; one on
+                        // its own is answered in full, breakdown and all.
+                        app.settling = last_input.elapsed() < SETTLE;
+                        last_input = Instant::now();
+                        on_key(app, k)
+                    }
+                    Event::Mouse(m) => {
+                        on_mouse(app, m);
+                        None
+                    }
+                    Event::Resize(_, _) => {
+                        app.mark_dirty();
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(Effect::Edit(path)) = effect {
+                    edit(session, app, &path)?;
+                    break;
                 }
-                Event::Resize(_, _) => {
-                    app.mark_dirty();
-                    None
+                if app.should_quit || !matches!(event::poll(Duration::ZERO), Ok(true)) {
+                    break;
                 }
-                _ => None,
-            };
-            if let Some(Effect::Edit(path)) = effect {
-                edit(session, app, &path)?;
             }
             // Respond to input immediately rather than at the next tick.
             app.rebuild_rows();
