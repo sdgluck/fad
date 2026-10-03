@@ -199,6 +199,53 @@ fn tool_detail(app: &App, theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
+/// A reclaimable category or a duplicate group: what the group adds up to and
+/// what `A` would do with it.
+///
+/// A heading is not an item, so the pane no longer describes the first item
+/// under it as if that were the selection — and an empty pane on the row the
+/// cursor starts on would read as broken. This is the group's own summary.
+fn group_heading_detail(app: &App, theme: &Theme, heading: crate::app::Heading) -> Option<Vec<Line<'static>>> {
+    use crate::app::Heading;
+    let mut lines = Vec::new();
+    match heading {
+        Heading::Category(cat) => {
+            let items = app.reclaim_items(cat);
+            let total: u64 = items.iter().map(|id| app.tree.size(*id, app.apparent)).sum();
+            lines.push(Line::from(Span::styled(cat.label().to_string(), theme.emphasis)));
+            lines.push(Line::from(vec![
+                Span::styled(human(total), theme.emphasis),
+                Span::styled(format!(" in {} item(s)", items.len()), theme.dim),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(cat.note().to_string(), theme.dim)));
+            lines.push(Line::from(Span::styled("A stages the whole category", theme.dim)));
+        }
+        Heading::Dupes(group) => {
+            let items = app.dupe_items(group);
+            let each = app.dupes.as_ref().and_then(|r| r.groups.get(group)).map(|g| g.bytes_each)?;
+            let spare = each * items.len().saturating_sub(1) as u64;
+            lines.push(Line::from(Span::styled(
+                format!("{} identical copies", items.len()),
+                theme.emphasis,
+            )));
+            lines.push(Line::from(vec![
+                Span::styled(human(each), theme.emphasis),
+                Span::styled(" each", theme.dim),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(human(spare), theme.emphasis),
+                Span::styled(" of it is extra copies", theme.dim),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("A stages every copy but the newest", theme.dim)));
+            lines.push(Line::from(Span::styled("L shares one copy, keeping every path", theme.dim)));
+        }
+        Heading::Tool(..) | Heading::ToolStatus(_) => return None,
+    }
+    Some(lines)
+}
+
 fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -220,10 +267,11 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             return;
         }
         if let Some(h) = row.header {
-            if let Some(lines) = tool_heading_detail(app, theme, h) {
-                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
-                return;
-            }
+            let lines = tool_heading_detail(app, theme, h)
+                .or_else(|| group_heading_detail(app, theme, h))
+                .unwrap_or_default();
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+            return;
         }
     }
 

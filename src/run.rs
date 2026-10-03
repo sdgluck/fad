@@ -799,7 +799,7 @@ fn reveal(app: &mut App) {
         app.status = Some("this is not a file \u{2014} y copies the command that removes it".into());
         return;
     }
-    let Some(id) = app.selected() else { return };
+    let Some(id) = item_at_cursor(app) else { return };
     let path = app.tree.path(id);
     match crate::platform::reveal(&path) {
         Ok(msg) => app.status = Some(msg.into()),
@@ -809,8 +809,27 @@ fn reveal(app: &mut App) {
 
 /// The path `e` would open, if the cursor is on one.
 fn editor_target(app: &mut App) -> Option<PathBuf> {
-    let id = app.selected()?;
+    if app.tool_at_cursor().is_some() {
+        app.status = Some("this is not a file \u{2014} y copies the command that removes it".into());
+        return None;
+    }
+    let id = item_at_cursor(app)?;
     Some(app.tree.path(id))
+}
+
+/// The tree node under the cursor, for a key that acts on exactly one item.
+///
+/// A group heading carries the id of the first item under it — which may be in
+/// a closed group, or hidden by a filter — so acting on "the selection" there
+/// silently acted on something the user could not see. `i` would write it to
+/// the ignore file. Every such key comes through here instead, and on a
+/// heading it says why it did nothing.
+fn item_at_cursor(app: &mut App) -> Option<crate::tree::NodeId> {
+    if app.rows.get(app.cursor).is_some_and(|r| r.header.is_some()) {
+        app.status = Some("that is a group heading \u{2014} pick an item under it".into());
+        return None;
+    }
+    app.selected()
 }
 
 /// The editor the user asked for, the way every other terminal program picks
@@ -870,7 +889,11 @@ fn edit(session: &mut Session, app: &mut App, path: &std::path::Path) -> io::Res
 /// path rather than the name: ignoring `Caches` because of one of them would
 /// hide every other.
 fn ignore_selected(app: &mut App) {
-    let Some(id) = app.selected() else { return };
+    if app.tool_at_cursor().is_some() {
+        app.status = Some("the ignore list is for files and folders \u{2014} this lives inside a tool".into());
+        return;
+    }
+    let Some(id) = item_at_cursor(app) else { return };
     if id == app.tree.root() {
         app.status = Some("the scan root cannot be ignored".into());
         return;
@@ -902,7 +925,7 @@ fn copy_path(app: &mut App) {
             }
         };
     }
-    let Some(id) = app.selected() else { return };
+    let Some(id) = item_at_cursor(app) else { return };
     let path = app.tree.path(id);
     match crate::platform::copy_to_clipboard(&path.to_string_lossy()) {
         Ok(()) => app.status = Some("path copied".into()),

@@ -9,6 +9,8 @@ use fad::scan::Scan;
 use fad::scan::walk::ScanOpts;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+mod common;
+
 fn fixture(root: &Path) {
     let mk = |rel: &str, size: usize| {
         let p = root.join(rel);
@@ -220,6 +222,33 @@ fn the_wheel_scrolls_the_list_in_an_overlay() {
     assert_eq!(app.cursor, tree_cursor, "the wheel moved the tree under the basket");
     fad::run::on_mouse(&mut app, wheel(MouseEventKind::ScrollUp));
     assert_eq!(app.basket_cursor, 0);
+}
+
+/// A heading carries the id of the first item under it, which may be in a
+/// closed group the user cannot see. No single-item key may act on it — least
+/// of all `i`, which would write that hidden item to the ignore file.
+#[test]
+fn single_item_keys_refuse_a_group_heading() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let _env = common::env_lock();
+    common::isolate(dir.path());
+    let mut app = app_for(dir.path());
+
+    app.show_view(Some(View::Reclaim));
+    app.rebuild_rows();
+    assert!(app.rows.first().is_some_and(|r| r.header.is_some()), "no reclaimable heading to stand on");
+    app.cursor = 0;
+
+    for key in ['i', 'o', 'e', 'y'] {
+        let effect =
+            fad::run::on_key(&mut app, KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        assert_eq!(effect, None, "{key} acted on a heading");
+        let msg = app.status.clone().unwrap_or_default();
+        assert!(msg.contains("group heading"), "{key} said {msg:?}");
+    }
+    let ignore = fad::ignore::path().unwrap();
+    assert!(!ignore.exists(), "i wrote a hidden item to the ignore file");
 }
 
 #[test]
