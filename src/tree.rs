@@ -262,6 +262,9 @@ impl Tree {
                 Some(Skip::OtherDevice) => f |= flags::OTHER_DEVICE | flags::SCANNED,
                 Some(Skip::CloudStorage) => f |= flags::CLOUD | flags::SCANNED,
                 Some(Skip::UnrepresentableName) => f |= flags::UNNAMED | flags::SCANNED,
+                // Entered by another path already (see `Entry::descend`): there
+                // is no batch coming for it, so it must not read as pending.
+                None if e.meta.is_dir() && e.descend.is_none() => f |= flags::SCANNED,
                 None => {}
             }
             let bytes = e.meta.blocks;
