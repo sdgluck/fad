@@ -580,3 +580,19 @@ fn the_omissions_screen_says_what_would_fix_each_kind() {
     assert!(out.contains("locked"), "the path is missing:\n{out}");
     assert!(out.contains("is short by whatever it holds"), "does not say the totals are wrong:\n{out}");
 }
+
+/// A kept filter is as easy to forget as an age filter, and has to be as
+/// visible: rows missing with no reason on screen read as a bug.
+#[test]
+fn a_kept_filter_is_named_in_the_header() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.filter = "holiday".into();
+    app.mark_dirty();
+
+    let out = render(&mut app, 100, 20);
+    println!("{out}");
+    let header = out.lines().next().unwrap_or_default();
+    assert!(header.contains("/holiday"), "the header does not say the tree is filtered:\n{out}");
+}

@@ -128,6 +128,14 @@ fn header(app: &App, width: usize) -> Line<'static> {
         spans.push(Span::from(format!(" {} ", app.age_filter.label())).bold().reversed());
         spans.push(Span::from(" "));
     }
+    // Same reason, and a kept filter is easier still to forget: it was typed
+    // once, `enter` put the prompt away, and nothing else on screen says the
+    // tree is a subset. Capped, because the query is a reminder here and the
+    // free-space figure is the answer.
+    if !app.filter.is_empty() {
+        spans.push(Span::from(format!(" /{} ", truncate_end(&app.filter, 20))).bold().reversed());
+        spans.push(Span::from(" "));
+    }
 
     /// A path compressed below this is no longer a path, and a title that
     /// overflows loses the free-space figure off the right-hand end — so when

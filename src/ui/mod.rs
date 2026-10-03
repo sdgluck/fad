@@ -21,6 +21,18 @@ use crate::format::human;
 
 pub use theme::Theme;
 
+/// What the screen remembers from one key to the next that nothing outside
+/// the interface has any reason to read.
+#[derive(Default)]
+pub struct UiState {
+    /// First line of the help overlay on screen. Clamped by the draw, which is
+    /// the only place that knows how long the wrapped text came out.
+    pub help_scroll: usize,
+    /// A quit was asked for with a batch staged, and the next key decides:
+    /// `q` again goes, anything else stays.
+    pub quit_armed: bool,
+}
+
 /// Keep the start and the end of a path, drop the middle: both halves carry
 /// information, the middle rarely does.
 pub(crate) fn compress(s: &str, width: usize) -> String {
@@ -77,7 +89,7 @@ fn draw_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Span::raw(" "),
             Span::styled(app.filter.clone(), theme.emphasis),
             Span::styled("\u{2588}", theme.emphasis),
-            Span::styled("   enter accept \u{b7} esc clear", theme.dim),
+            Span::styled("   enter keep \u{b7} esc clear \u{b7} / again to refine", theme.dim),
         ]),
         _ => {
             let mut spans = vec![];

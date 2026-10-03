@@ -14,7 +14,7 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-use crate::app::{App, Heading, Mode, View};
+use crate::app::{AgeFilter, App, Heading, Mode, View};
 use crate::delete::{self, Disposal};
 use crate::tree::flags;
 use crate::ui;
@@ -292,7 +292,23 @@ fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
     }
 }
 
-fn on_key(app: &mut App, k: KeyEvent) {
+/// One key, in whatever mode the app is in. Public so the tests can drive the
+/// real key handling rather than a copy of it.
+pub fn on_key(app: &mut App, k: KeyEvent) {
+    // Ctrl-c means "stop what I am doing" in every mode. At the top level that
+    // is quitting; inside a prompt or an overlay it is backing out of it —
+    // never typing a `c` into the filter or the search.
+    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        match app.mode {
+            Mode::Normal => {}
+            Mode::Deleting => {
+                app.cancel_deleting();
+                app.mark_dirty();
+                return;
+            }
+            _ => return on_key(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        }
+    }
     match app.mode {
         Mode::Filter => filter_key(app, k),
         Mode::Search => search_key(app, k),
@@ -312,7 +328,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
 
 /// Clicks and the wheel. A modal owns the screen while it is up, so the mouse
 /// does nothing there rather than quietly moving a selection underneath it.
-fn on_mouse(app: &mut App, m: MouseEvent) {
+pub fn on_mouse(app: &mut App, m: MouseEvent) {
     if app.mode != Mode::Normal {
         return;
     }
@@ -516,9 +532,16 @@ fn empty_key(app: &mut App, k: KeyEvent) {
 
 fn deleting_key(app: &mut App, k: KeyEvent) {
     // Both halves, or the modal closes while a removal is still running.
-    if app.batch_finished() && matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-        app.finish_job();
+    if app.batch_finished() {
+        if matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+            app.finish_job();
+        }
+    } else if k.code == KeyCode::Esc {
+        // Stops after the item in hand rather than closing the modal: what has
+        // already gone is gone, and the screen that says so has to stay up.
+        app.cancel_deleting();
     }
+    app.mark_dirty();
 }
 
 fn filter_key(app: &mut App, k: KeyEvent) {
@@ -531,6 +554,8 @@ fn filter_key(app: &mut App, k: KeyEvent) {
         KeyCode::Backspace => {
             app.filter.pop();
         }
+        // Any other chord is a command the prompt does not have, not a letter.
+        KeyCode::Char(_) if k.modifiers.contains(KeyModifiers::CONTROL) => return,
         KeyCode::Char(c) => app.filter.push(c),
         _ => return,
     }
@@ -567,6 +592,7 @@ fn search_key(app: &mut App, k: KeyEvent) {
             app.search.pop();
             app.run_search();
         }
+        KeyCode::Char(_) if ctrl => return,
         KeyCode::Char(c) => {
             app.search.push(c);
             app.run_search();
@@ -579,9 +605,20 @@ fn search_key(app: &mut App, k: KeyEvent) {
 fn normal_key(app: &mut App, k: KeyEvent) {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     app.status = None;
+    // The key after "N staged items will be forgotten" answers that and does
+    // nothing else: a stray `space` meant as "no" should not also unstage
+    // something.
+    if std::mem::take(&mut app.ui.quit_armed) {
+        if k.code == KeyCode::Char('q') || (ctrl && k.code == KeyCode::Char('c')) {
+            app.should_quit = true;
+        }
+        app.mark_dirty();
+        return;
+    }
     match k.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        KeyCode::Char('q') => request_quit(app),
+        KeyCode::Char('c') if ctrl => request_quit(app),
+        KeyCode::Esc => back_out(app),
 
         KeyCode::Char('j') | KeyCode::Down => move_cursor(app, 1),
         KeyCode::Char('k') | KeyCode::Up => move_cursor(app, -1),
@@ -597,10 +634,10 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('A') => stage_children(app),
         KeyCode::Char('L') => share_storage(app),
 
-        KeyCode::Char('/') => {
-            app.mode = Mode::Filter;
-            app.filter.clear();
-        }
+        // A kept filter comes back into the prompt to be refined, not thrown
+        // away: the usual reason to press `/` again is that the first query
+        // was nearly right.
+        KeyCode::Char('/') => app.mode = Mode::Filter,
         // The other question: not "narrow what I am looking at" but "where in
         // all of this is the thing called that".
         KeyCode::Char('f') => {
@@ -662,6 +699,40 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         _ => {}
     }
     app.mark_dirty();
+}
+
+/// Quit, unless that would throw a batch away without a word. Staging can be
+/// ten minutes' work across three views, and `q` and `esc` are both one
+/// keystroke from it.
+fn request_quit(app: &mut App) {
+    let n = app.staged.len() + app.staged_tools.len();
+    if n == 0 {
+        app.should_quit = true;
+        return;
+    }
+    app.ui.quit_armed = true;
+    app.status = Some(format!(
+        "{n} staged item{} will be forgotten \u{2014} q again to quit",
+        if n == 1 { "" } else { "s" }
+    ));
+}
+
+/// Esc undoes one layer of what is narrowing the screen, innermost first, and
+/// only quits once there is nothing left to undo. It used to quit outright from
+/// anywhere, so the key everyone presses to back out of a filter or a view
+/// took the whole session with it.
+fn back_out(app: &mut App) {
+    if !app.filter.is_empty() {
+        app.filter.clear();
+        app.status = Some("filter cleared".into());
+    } else if app.view().is_some() {
+        app.show_view(None);
+    } else if app.age_filter != AgeFilter::All {
+        app.age_filter = AgeFilter::All;
+        app.status = Some(format!("showing {}", app.age_filter.label()));
+    } else {
+        request_quit(app);
+    }
 }
 
 fn reveal(app: &mut App) {
