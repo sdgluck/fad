@@ -101,6 +101,25 @@ impl Source {
         std::env::var(self.bin_var()).unwrap_or_else(|_| self.program().to_string())
     }
 
+    /// Is there a binary to run at all? A `PATH` lookup, which is the same
+    /// question `exec::run` answers with `NotInstalled` — asked up front so the
+    /// UI can say which tools it is waiting on rather than naming one it is
+    /// not asking.
+    pub fn installed(self) -> bool {
+        let bin = self.bin();
+        let bin = std::path::Path::new(&bin);
+        if bin.components().count() > 1 {
+            return bin.is_file();
+        }
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join(bin).is_file()))
+    }
+
+    /// The tools a probe would actually ask, in `all` order.
+    pub fn present() -> Vec<Source> {
+        Source::all().iter().copied().filter(|s| s.installed()).collect()
+    }
+
     pub fn all() -> &'static [Source] {
         #[cfg(target_os = "macos")]
         {
@@ -478,14 +497,20 @@ impl Report {
     /// Ask every tool. Sources are probed on their own threads: a wedged Docker
     /// should not hold a healthy Podman up for the full timeout.
     pub fn probe() -> Report {
-        let handles: Vec<_> = Source::all()
+        Report::probe_these(&Source::all().to_vec())
+    }
+
+    /// Ask only these tools. The UI passes `Source::present()`, so what it
+    /// says it is asking and what it asks are the same list.
+    pub fn probe_these(sources: &[Source]) -> Report {
+        let handles: Vec<_> = sources
             .iter()
             .copied()
             .map(|s| std::thread::spawn(move || probe_one(s)))
             .collect();
         let sources = handles
             .into_iter()
-            .zip(Source::all())
+            .zip(sources)
             .map(|(h, s)| {
                 h.join().unwrap_or_else(|_| {
                     SourceReport::empty(*s, Status::Failed("probe panicked".into()))

@@ -566,3 +566,42 @@ fn a_finished_scan_does_not_start_a_hunt_nobody_asked_for() {
     assert!(!app.dupe_hunt_running());
     assert!(app.dupes.is_none());
 }
+
+// ---------------------------------------------------- what t says it is doing
+
+#[test]
+fn the_probe_status_names_only_what_it_asks() {
+    use fad::app::probe_status;
+    use fad::tools::Source;
+    assert_eq!(probe_status(&[Source::Snapshots]), "asking time machine\u{2026}");
+    assert_eq!(
+        probe_status(&[Source::Docker, Source::Snapshots]),
+        "asking docker and time machine\u{2026}"
+    );
+    assert_eq!(
+        probe_status(&[Source::Docker, Source::Podman, Source::Snapshots]),
+        "asking docker, podman and time machine\u{2026}"
+    );
+    assert!(probe_status(&[]).starts_with("no docker"));
+}
+
+/// `t` on a machine with no Docker said "asking docker…" all the same.
+#[test]
+fn t_without_docker_does_not_claim_to_ask_docker() {
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = dir.path().join("not-installed");
+    unsafe {
+        std::env::set_var("FAD_DOCKER_BIN", &nowhere);
+        std::env::set_var("FAD_PODMAN_BIN", &nowhere);
+    }
+    assert!(!fad::tools::Source::Docker.installed());
+    let mut app = settled(dir.path());
+    app.start_tool_probe();
+    let status = app.status.clone().unwrap_or_default();
+    assert!(!status.contains("docker"), "{status}");
+    unsafe {
+        std::env::remove_var("FAD_DOCKER_BIN");
+        std::env::remove_var("FAD_PODMAN_BIN");
+    }
+}

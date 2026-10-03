@@ -810,8 +810,8 @@ fn toggle_tools(app: &mut App) {
     if app.tools.is_some() || app.tool_probe_running() {
         return;
     }
+    // Which tools it is asking is the probe's to say; it knows the list.
     app.start_tool_probe();
-    app.status = Some("asking docker\u{2026}".into());
 }
 
 fn stage_children(app: &mut App) {

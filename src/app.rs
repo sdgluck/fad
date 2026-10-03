@@ -120,6 +120,16 @@ impl Panel {
     }
 }
 
+/// What `t` is waiting on, from the tools actually being asked.
+pub fn probe_status(sources: &[crate::tools::Source]) -> String {
+    let names: Vec<&str> = sources.iter().map(|s| s.label()).collect();
+    match names.as_slice() {
+        [] => "no docker, podman or time machine here to ask".into(),
+        [one] => format!("asking {one}\u{2026}"),
+        [rest @ .., last] => format!("asking {} and {last}\u{2026}", rest.join(", ")),
+    }
+}
+
 /// A gap in seconds as someone would say it: "40 seconds ago", "3 days ago".
 /// The same buckets as the detail pane's `ago_in_words`, so a snapshot's age
 /// reads the same in the status line as it does beside the growth figure.
@@ -1006,13 +1016,19 @@ impl App {
     /// Fired on the first `t` and never at startup: opening a disk-usage tool
     /// is not consent to shell out to a container daemon, and the answer would
     /// be stale by the time anyone looked at it anyway.
+    ///
+    /// Says in the status line which tools it is asking. It used to be
+    /// "asking docker\u{2026}" whatever was installed, so a Mac with no Docker
+    /// at all spent the wait apparently talking to a program it does not have.
     pub fn start_tool_probe(&mut self) {
         if self.tools_rx.is_some() {
             return;
         }
+        let sources = crate::tools::Source::present();
+        self.status = Some(probe_status(&sources));
         let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send(crate::tools::Report::probe());
+            let _ = tx.send(crate::tools::Report::probe_these(&sources));
         });
         self.tools_rx = Some(rx);
         self.tools_started = Some(Instant::now());
