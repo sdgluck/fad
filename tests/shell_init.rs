@@ -241,3 +241,101 @@ fn the_man_page_covers_keys_files_and_environment() {
     assert!(text.contains("ctrl\\-c"), "the quit-without-choosing key is not documented");
     assert!(text.contains("undo.jsonl") && text.contains("ignore"), "files missing");
 }
+
+/// Run a script in a shell with a clean environment, returning (status, out, err).
+fn in_shell(shell: &str, flags: &[&str], script: &str, home: &std::path::Path) -> Option<(i32, String, String)> {
+    let out = Command::new(shell)
+        .args(flags)
+        .arg("-c")
+        .arg(script)
+        .env("HOME", home)
+        .env("ZDOTDIR", home)
+        .output()
+        .ok()?;
+    Some((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+/// Evaluated before `compinit`, the zsh script used to fail on every new shell
+/// with "command not found: compdef".
+#[test]
+fn zsh_init_before_compinit_is_quiet_and_after_it_completes_fad_cd() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("init.zsh");
+    std::fs::write(&script, init("zsh")).unwrap();
+    let src = script.display();
+
+    let Some((code, _, err)) = in_shell("zsh", &["-f"], &format!("source {src}"), dir.path()) else {
+        eprintln!("skipped: no zsh on this machine");
+        return;
+    };
+    assert_eq!(code, 0, "{err}");
+    assert!(!err.contains("compdef"), "{err}");
+
+    let dump = dir.path().join("zcompdump");
+    let after = format!(
+        "autoload -Uz compinit && compinit -u -d {}; source {src}; print -r -- \"${{_comps[fad-cd]}}\"",
+        dump.display()
+    );
+    let (code, out, err) = in_shell("zsh", &["-f"], &after, dir.path()).unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), "_fad", "fad-cd has no completions: {err}");
+}
+
+#[test]
+fn bash_completes_fad_cd_like_fad() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("init.bash");
+    std::fs::write(&script, init("bash")).unwrap();
+    let Some((code, out, err)) = in_shell(
+        "bash",
+        &["--norc", "--noprofile"],
+        &format!("source {}; complete -p fad-cd", script.display()),
+        dir.path(),
+    ) else {
+        eprintln!("skipped: no bash on this machine");
+        return;
+    };
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("-F _fad"), "{out}");
+}
+
+#[test]
+fn fish_wraps_fad_for_completions() {
+    assert!(init("fish").contains("function fad-cd --wraps fad"));
+}
+
+/// When fad prints nothing and fails — ctrl-c under `--print-path` — the
+/// wrapper must leave the shell where it was. Exercised against a stand-in
+/// `fad` on `PATH`, since the real one needs a terminal.
+#[test]
+fn the_wrapper_stays_put_when_nothing_was_chosen() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let stub = bin.join("fad");
+    std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = dir.path().join("init.bash");
+    std::fs::write(&script, init("bash")).unwrap();
+    let start = std::fs::canonicalize(dir.path()).unwrap();
+
+    let Some((_, out, err)) = in_shell(
+        "bash",
+        &["--norc", "--noprofile"],
+        &format!(
+            "source {}; cd {}; PATH={}:$PATH; fad-cd; pwd -P",
+            script.display(),
+            start.display(),
+            bin.display()
+        ),
+        dir.path(),
+    ) else {
+        return;
+    };
+    assert_eq!(out.trim(), start.display().to_string(), "moved: {err}");
+}

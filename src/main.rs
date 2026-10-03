@@ -428,8 +428,14 @@ fn main() {
             }
             // Last, and on stdout alone, so it is the only thing a shell
             // substitution picks up.
-            if let (true, Some(p)) = (args.print_path, outcome.selected) {
-                println!("{}", p.display());
+            // Nothing chosen — quit with ctrl-c, or on a row that is not a
+            // path — prints nothing and fails, so `fad-cd` stays put rather
+            // than taking you somewhere you backed out of.
+            if args.print_path {
+                match outcome.selected {
+                    Some(p) => println!("{}", p.display()),
+                    None => std::process::exit(1),
+                }
             }
         }
         Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
@@ -473,7 +479,29 @@ fn print_init(shell: Shell) {
         Shell::Zsh => clap_complete::Shell::Zsh,
         Shell::Fish => clap_complete::Shell::Fish,
     };
-    clap_complete::generate(target, &mut cmd, "fad", &mut std::io::stdout());
+    let mut buf = Vec::new();
+    clap_complete::generate(target, &mut cmd, "fad", &mut buf);
+    let mut completions = String::from_utf8_lossy(&buf).into_owned();
+
+    // `fad-cd` takes fad's arguments, so it gets fad's completions. And in zsh,
+    // registering them needs `compdef`, which exists only once `compinit` has
+    // run — a startup file that evals this first got "command not found:
+    // compdef" on every new shell. Guarded, it simply skips completions there;
+    // eval after `compinit` to have them.
+    match shell {
+        Shell::Zsh => {
+            completions = completions.replace(
+                "    compdef _fad fad\n",
+                "    if (( $+functions[compdef] )); then compdef _fad fad fad-cd; fi\n",
+            );
+        }
+        Shell::Bash => {
+            completions = completions
+                .replace("-o default fad\n", "-o default fad\n    complete -F _fad -o default fad-cd\n");
+        }
+        Shell::Fish => {}
+    }
+    print!("{completions}");
 
     // `fad` on its own cannot change your shell's directory — nothing can, from
     // a child process — so the one thing a shell function is needed for is the
@@ -489,7 +517,7 @@ fad-cd() {
 }
 "#;
     let fish = r#"
-function fad-cd --description 'run fad and cd to where you left the cursor'
+function fad-cd --wraps fad --description 'run fad and cd to where you left the cursor'
   set -l target (command fad --print-path $argv)
   or return
   test -n "$target"; or return

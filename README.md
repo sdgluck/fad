@@ -80,7 +80,7 @@ sign of movement reads as a hang.
 | `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
 | `i` | never rank this again — adds it to your ignore list |
 | `!` | what is not in these numbers — skipped, unreadable, ignored |
-| `?` | help · `q` or `esc` quit |
+| `?` | help · `q` or `esc` quit · `ctrl-c` quit without choosing (for `--print-path`) |
 
 The mouse works too: click a row to select it, click its arrow to open or close
 it, click the left edge to stage it, and use the wheel to move the selection.
@@ -433,10 +433,16 @@ fad --man > /usr/local/share/man/man1/fad.1  # and man fad works
 ```
 
 That gives you completions for every flag, and `fad-cd`: run `fad`, quit on a
-directory, and land in it. Nothing can change your shell's directory from a
-child process, so this is the one thing a shell function is needed for. Quitting
-on a file lands you in the directory holding it — `cd` into a 40G disk image is
-not what anyone meant.
+directory with `q`, and land in it. Nothing can change your shell's directory
+from a child process, so this is the one thing a shell function is needed for.
+Quitting on a file lands you in the directory holding it — `cd` into a 40G disk
+image is not what anyone meant. Quitting with `ctrl-c` instead chooses nothing:
+`--print-path` prints nothing and exits 1, and `fad-cd` leaves you where you
+were. `fad-cd` completes exactly as `fad` does.
+
+In zsh, put the `eval` after `compinit` (which frameworks such as oh-my-zsh run
+for you). Evaluated before it, the `fad-cd` function still works and the
+completions are skipped rather than failing with "command not found: compdef".
 
 Both are generated from the argument parser itself, so they describe the flags
 this binary has rather than a copy that drifts away from it.

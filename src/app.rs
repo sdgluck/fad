@@ -497,6 +497,9 @@ pub struct App {
     /// Rows are rebuilt on demand, not on every frame.
     dirty: bool,
     pub should_quit: bool,
+    /// Quit with ctrl-c rather than `q`: the session ends with nothing
+    /// chosen, so `--print-path` prints nothing.
+    pub cancelled: bool,
 }
 
 impl App {
@@ -657,6 +660,7 @@ impl App {
             refused: Vec::new(),
             dirty: true,
             should_quit: false,
+            cancelled: false,
         };
         app.rebuild_rows();
         app

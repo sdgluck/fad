@@ -85,7 +85,8 @@ pub fn run(mut app: App, keep_stdout_clean: bool) -> io::Result<Outcome> {
     // left staring at a broken shell.
     leave(&mut terminal, mouse)?;
     result?;
-    let selected = app.selected().map(|id| app.tree.path(id));
+    let selected =
+        if app.cancelled { None } else { app.selected().map(|id| app.tree.path(id)) };
     Ok(Outcome { tree: app.tree_is_complete().then_some(app.tree), selected })
 }
 
@@ -436,7 +437,10 @@ fn normal_key(app: &mut App, k: KeyEvent) {
     app.status = None;
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        KeyCode::Char('c') if ctrl => {
+            app.should_quit = true;
+            app.cancelled = true;
+        }
 
         KeyCode::Char('j') | KeyCode::Down => move_cursor(app, 1),
         KeyCode::Char('k') | KeyCode::Up => move_cursor(app, -1),
