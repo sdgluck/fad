@@ -592,8 +592,16 @@ banner, and refused for deletion.
 | scan snapshots | `~/Library/Caches/fad` | `$XDG_CACHE_HOME/fad` |
 | undo journal | `~/Library/Application Support/fad` | `$XDG_DATA_HOME/fad` |
 
-`FAD_CONFIG_DIR`, `FAD_CACHE_DIR` and `FAD_STATE_DIR` override these. Snapshots are only written
-for scans that ran to completion, and `--clear-cache` removes them all.
+`FAD_CONFIG_DIR`, `FAD_CACHE_DIR` and `FAD_STATE_DIR` override these, and name
+the directory itself — no `fad/` is appended. Snapshots are only written for
+scans that ran to completion, one per root and set of scan options.
+
+The snapshot cache looks after its own size. Each save drops snapshots that
+have not been saved or read in 60 days, then, if what is left is over 1 GiB,
+the least recently used until it fits; the one just written is always kept.
+`--clear-cache` removes every snapshot — only the `*.snap` files fad wrote,
+never anything else in the directory — and the directory too if that leaves
+it empty.
 
 ## Development
 

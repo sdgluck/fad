@@ -141,3 +141,39 @@ fn an_old_format_snapshot_is_treated_as_absent() {
     std::fs::write(&snap, &bytes[..bytes.len() / 2]).unwrap();
     assert!(fad::cache::load(&root, &Default::default()).is_none());
 }
+
+/// `FAD_CACHE_DIR` names the directory itself. Pointed at a shared one, as
+/// `FAD_CACHE_DIR=~/.cache` would be, `--clear-cache` used to delete all of it.
+#[test]
+fn clearing_the_cache_touches_only_what_fad_wrote() {
+    let cache = tempfile::tempdir().unwrap();
+    let shared = cache.path().join("shared");
+    std::fs::create_dir_all(shared.join("someone-else")).unwrap();
+    std::fs::write(shared.join("someone-else/data"), b"keep").unwrap();
+    std::fs::write(shared.join("notes.txt"), b"keep").unwrap();
+    std::fs::write(shared.join("home-0123.snap"), b"x").unwrap();
+    std::fs::write(shared.join("home-0123.snap.tmp"), b"x").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_fad"))
+        .arg("--clear-cache")
+        .env("FAD_CACHE_DIR", &shared)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(shared.join("someone-else/data").exists(), "deleted another program's cache");
+    assert!(shared.join("notes.txt").exists(), "deleted a file fad did not write");
+    assert!(!shared.join("home-0123.snap").exists());
+    assert!(!shared.join("home-0123.snap.tmp").exists());
+
+    // Its own directory, holding only snapshots, goes entirely.
+    let own = cache.path().join("own");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("a.snap"), b"x").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fad"))
+        .arg("--clear-cache")
+        .env("FAD_CACHE_DIR", &own)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!own.exists());
+}
