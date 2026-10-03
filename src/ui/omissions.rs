@@ -91,7 +91,18 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         if last != Some(o.why) {
             last = Some(o.why);
             let head = format!(" {} ", o.why.heading());
-            let note = format!(" {} ", o.why.note());
+            // The banner already picks its remedy from the errors the walk
+            // actually hit; this heading has to say the same thing, or a path
+            // too long to open gets told to go and grant a permission.
+            let note = match o.why {
+                Why::Unreadable => {
+                    let fix = app.tree.unreadable_fix();
+                    // Its other answer points here, which is no answer on this screen.
+                    let fix = if fix == crate::tree::PERMISSION_FIX { fix } else { "not a permissions problem" };
+                    format!(" not counted \u{2014} {fix} ")
+                }
+                why => format!(" {} ", why.note()),
+            };
             let rule = width.saturating_sub(super::cols(&head) + super::cols(&note) + 1);
             lines.push(Line::from(vec![
                 Span::styled(head, theme.emphasis),
