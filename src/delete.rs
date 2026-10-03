@@ -7,6 +7,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -90,14 +92,35 @@ pub struct Job {
     pub total: usize,
     pub done: Vec<Outcome>,
     finished: bool,
+    /// Set from the UI to stop the worker before its next item. Checked
+    /// between items, never during one: half a `remove_dir_all` is worse than
+    /// either the whole thing or none of it.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Job {
     pub fn start(items: Vec<(PathBuf, u64)>, disposal: Disposal) -> Job {
         let total = items.len();
         let (tx, rx) = crossbeam_channel::unbounded();
-        std::thread::spawn(move || run_batch(items, disposal, tx));
-        Job { rx, disposal, total, done: Vec::new(), finished: false }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        std::thread::spawn(move || run_batch(items, disposal, tx, &stop));
+        Job { rx, disposal, total, done: Vec::new(), finished: false, cancel }
+    }
+
+    /// Stop after the item in hand. What is done stays done and is reported;
+    /// the rest is never attempted.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Items the worker never reached because it was stopped.
+    pub fn not_attempted(&self) -> usize {
+        if self.finished { self.total - self.done.len() } else { 0 }
     }
 
     /// Take a set of already-trashed paths out of the trash for good.
@@ -111,15 +134,20 @@ impl Job {
     pub fn erase(items: Vec<(PathBuf, u64)>) -> Job {
         let total = items.len();
         let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
         std::thread::spawn(move || {
             for (path, bytes) in items {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 let result = trash::erase(&path).map(|_| None).map_err(|e| e.to_string());
                 if tx.send(Outcome { path, bytes, result }).is_err() {
                     break;
                 }
             }
         });
-        Job { rx, disposal: Disposal::Permanent, total, done: Vec::new(), finished: false }
+        Job { rx, disposal: Disposal::Permanent, total, done: Vec::new(), finished: false, cancel }
     }
 
     /// Collect finished items. Returns true if anything new arrived.
@@ -151,9 +179,14 @@ impl Job {
     }
 }
 
-fn run_batch(items: Vec<(PathBuf, u64)>, disposal: Disposal, tx: Sender<Outcome>) {
+fn run_batch(items: Vec<(PathBuf, u64)>, disposal: Disposal, tx: Sender<Outcome>, stop: &AtomicBool) {
     let mut journal = Vec::new();
     for (path, bytes) in items {
+        // Stopped: the journal below still records everything that did go, so
+        // `u` puts back exactly what was trashed.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let result = match disposal {
             Disposal::Trash => trash::trash(&path).map(Some).map_err(|e| e.to_string()),
             Disposal::Permanent => permanent(&path).map(|_| None).map_err(|e| e.to_string()),

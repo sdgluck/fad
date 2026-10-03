@@ -2358,6 +2358,38 @@ impl App {
             .any(|s| touched.contains(&s.source))
     }
 
+    /// Stop the running batch after the item in hand.
+    ///
+    /// The deleting modal used to ignore every key until both jobs were done,
+    /// and a tools batch can be minutes of `df` and thirty-second removals
+    /// against a daemon that is not answering. Whatever has already gone stays
+    /// gone and is reported; whatever has not been started never is, and the
+    /// modal counts it as cancelled. A no-op once the batch has finished.
+    pub fn cancel_deleting(&mut self) {
+        if self.mode != Mode::Deleting || self.batch_finished() {
+            return;
+        }
+        if let Some(job) = self.job.as_ref() {
+            job.cancel();
+        }
+        if let Some(job) = self.tool_job.as_ref() {
+            job.cancel();
+        }
+        self.mark_dirty();
+    }
+
+    /// The running batch has been asked to stop.
+    pub fn deleting_cancelled(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| j.cancelled())
+            || self.tool_job.as_ref().is_some_and(|j| j.cancelled())
+    }
+
+    /// Items a stopped batch never reached, across both halves.
+    pub fn deleting_not_attempted(&self) -> usize {
+        self.job.as_ref().map_or(0, |j| j.not_attempted())
+            + self.tool_job.as_ref().map_or(0, |j| j.not_attempted())
+    }
+
     /// Both jobs have finished, or there were none.
     pub fn batch_finished(&self) -> bool {
         self.job.as_ref().is_none_or(|j| j.is_finished())
@@ -2431,15 +2463,21 @@ impl App {
         self.emptying = false;
         self.disposal = Disposal::Trash;
         self.refused.clear();
-        if self.tool_job.take().is_some() {
+        if let Some(job) = self.tool_job.take() {
             // The report on screen described a store that has just changed
             // underneath it. Keeping it would show sizes for things that are
             // gone, so it is dropped and the next `t` asks again.
             self.tools = None;
             self.tools_at = None;
-            self.staged_tools.clear();
+            // Everything the job tried leaves the batch, whatever the daemon
+            // said. What a cancelled job never reached is still staged, as the
+            // files it never reached are, and needs a fresh report to be
+            // confirmed against — so that is asked for now, not on the next
+            // `t`, or the confirm step would find no report and drop it.
+            let tried: HashSet<&crate::tools::ToolKey> = job.done.iter().map(|o| &o.key).collect();
+            self.staged_tools.retain(|k| !tried.contains(k));
             self.tools_refused.clear();
-            if self.tools_view {
+            if self.tools_view || !self.staged_tools.is_empty() {
                 self.start_tool_probe();
             }
         }

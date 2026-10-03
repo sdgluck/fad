@@ -78,7 +78,7 @@ pub fn probe(source: Source) -> SourceReport {
 fn status_for(e: ExecErr) -> Status {
     match e {
         ExecErr::NotInstalled => Status::Missing,
-        ExecErr::TimedOut => Status::TimedOut,
+        ExecErr::TimedOut | ExecErr::Stopped => Status::TimedOut,
         ExecErr::Failed { stderr, .. } => {
             if looks_like_no_daemon(&stderr) {
                 Status::NotRunning(super::tail(&stderr))
@@ -442,10 +442,19 @@ fn nonempty(s: String) -> Option<String> {
 /// Ask the tool again and return its totals, for measuring what a batch
 /// actually freed rather than predicting it.
 pub fn measure(source: Source) -> Option<Vec<(Kind, u64, u64)>> {
-    let out = exec::run(
+    measure_until(source, &std::sync::atomic::AtomicBool::new(false))
+}
+
+/// [`measure`], abandoned as soon as `stop` is set.
+pub fn measure_until(
+    source: Source,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<Vec<(Kind, u64, u64)>> {
+    let out = exec::run_until(
         &source.bin(),
         &["system", "df", "--format", "{{json .}}"],
         super::MEASURE_TIMEOUT,
+        stop,
     )
     .ok()?;
     let t = parse_totals(&out);

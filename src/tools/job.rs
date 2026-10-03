@@ -15,6 +15,9 @@
 
 use crossbeam_channel::{Receiver, Sender};
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use std::collections::BTreeSet;
 
 use super::{Source, ToolKey, docker};
@@ -47,14 +50,39 @@ pub struct Job {
     pub measured: Option<u64>,
     /// True once the worker has hung up, whether or not it measured.
     finished: bool,
+    /// Set from the UI to stop before the next removal. See `Job::cancel`.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Job {
     pub fn start(items: Vec<(ToolKey, String, u64)>) -> Job {
         let total = items.len();
         let (tx, rx) = crossbeam_channel::unbounded();
-        std::thread::spawn(move || run_batch(items, tx));
-        Job { rx, total, done: Vec::new(), measured: None, finished: false }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        std::thread::spawn(move || run_batch(items, tx, &stop));
+        Job { rx, total, done: Vec::new(), measured: None, finished: false, cancel }
+    }
+
+    /// Stop after the removal in hand.
+    ///
+    /// A batch here is a `df` of up to a minute, then one removal after
+    /// another at up to thirty seconds each, then another `df`. Without this
+    /// the only way out of a wedged daemon was to kill the terminal. The
+    /// removal running now is left to finish — the daemon carries on with it
+    /// whatever the CLI does — and nothing after it starts. A measurement in
+    /// flight is abandoned outright, leaving the estimate.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Removals the worker never started because it was stopped.
+    pub fn not_attempted(&self) -> usize {
+        if self.finished { self.total - self.done.len() } else { 0 }
     }
 
     /// Collect what has finished. Returns true if anything new arrived.
@@ -94,13 +122,16 @@ impl Job {
     }
 }
 
-fn run_batch(items: Vec<(ToolKey, String, u64)>, tx: Sender<Msg>) {
+fn run_batch(items: Vec<(ToolKey, String, u64)>, tx: Sender<Msg>, stop: &AtomicBool) {
     // Which tools this batch touches, so only those get re-measured.
     let sources: BTreeSet<Source> = items.iter().map(|(k, _, _)| k.source).collect();
     let before: Vec<(Source, Option<u64>)> =
-        sources.iter().map(|s| (*s, store_bytes(*s))).collect();
+        sources.iter().map(|s| (*s, store_bytes(*s, stop))).collect();
 
     for (key, label, bytes) in items {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         let result = super::remove(&key);
         if tx.send(Msg::Done(Box::new(Outcome { key, label, bytes, result }))).is_err() {
             // The UI is gone. Stop rather than keep removing unobserved, the
@@ -115,7 +146,13 @@ fn run_batch(items: Vec<(ToolKey, String, u64)>, tx: Sender<Msg>) {
     // slow one after into the whole store "freed". Without both ends the job
     // sends nothing, and the estimate stands, labelled as one.
     let Some(was) = before.iter().map(|(_, b)| *b).sum::<Option<u64>>() else { return };
-    let Some(after) = before.iter().map(|(s, _)| store_bytes(*s)).sum::<Option<u64>>() else {
+    // Stopped: the user has stopped waiting, and the measurement is the one
+    // step that is pure waiting.
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(after) = before.iter().map(|(s, _)| store_bytes(*s, stop)).sum::<Option<u64>>()
+    else {
         return;
     };
     let _ = tx.send(Msg::Measured(was.saturating_sub(after)));
@@ -123,10 +160,10 @@ fn run_batch(items: Vec<(ToolKey, String, u64)>, tx: Sender<Msg>) {
 
 /// Everything a tool says its store costs right now, or `None` when it would
 /// not say.
-fn store_bytes(source: Source) -> Option<u64> {
+fn store_bytes(source: Source, stop: &AtomicBool) -> Option<u64> {
     match source {
         Source::Docker | Source::Podman => {
-            docker::measure(source).map(|t| t.iter().map(|(_, size, _)| *size).sum())
+            docker::measure_until(source, stop).map(|t| t.iter().map(|(_, size, _)| *size).sum())
         }
         // Snapshots have no size to measure; a batch of them reports what it
         // expected and says as much.

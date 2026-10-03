@@ -9,6 +9,7 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -19,6 +20,8 @@ pub enum ExecErr {
     /// Still running at the deadline, and killed. Usually means the daemon is
     /// not answering rather than that the work is slow.
     TimedOut,
+    /// Killed because the caller asked us to stop waiting. See [`run_until`].
+    Stopped,
     Failed { code: Option<i32>, stderr: String },
 }
 
@@ -34,6 +37,22 @@ const TICK: Duration = Duration::from_millis(10);
 /// a child blocked writing to a full pipe — and would look exactly like the
 /// daemon hang it is meant to detect.
 pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String, ExecErr> {
+    run_until(program, args, timeout, &AtomicBool::new(false))
+}
+
+/// [`run`], but also give up as soon as `stop` is set.
+///
+/// For the questions a user may stop waiting for: a `system df` after a
+/// cancelled batch can take most of a minute to answer, and "stop after the
+/// current item" should not mean "after a measurement nobody wants any more".
+/// Never used for a removal — killing the CLI mid-way does not stop the
+/// daemon, and would only lose the answer to whether it worked.
+pub fn run_until(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    stop: &AtomicBool,
+) -> Result<String, ExecErr> {
     let mut child = match Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -56,12 +75,13 @@ pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String, Ex
             Ok(None) => {}
             Err(e) => return Err(ExecErr::Failed { code: None, stderr: e.to_string() }),
         }
-        if Instant::now() >= deadline {
+        let stopped = stop.load(Ordering::Relaxed);
+        if stopped || Instant::now() >= deadline {
             let _ = child.kill();
             // Reap it, so a hung daemon does not leave a zombie behind every
             // time the view is opened.
             let _ = child.wait();
-            return Err(ExecErr::TimedOut);
+            return Err(if stopped { ExecErr::Stopped } else { ExecErr::TimedOut });
         }
         std::thread::sleep(TICK);
     };

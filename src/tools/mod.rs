@@ -376,6 +376,7 @@ pub fn remove(key: &ToolKey) -> Result<(), String> {
             Err(format!("{} is not installed", key.source.program()))
         }
         Err(exec::ExecErr::TimedOut) => Err(format!("{} did not answer", key.source.program())),
+        Err(exec::ExecErr::Stopped) => Err("stopped".into()),
         Err(exec::ExecErr::Failed { stderr, .. }) => Err(tail(&stderr)),
     }
 }

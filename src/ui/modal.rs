@@ -358,6 +358,16 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     lines.push(Line::from(""));
 
     let finished = app.batch_finished();
+    let skipped = app.deleting_not_attempted();
+    if finished && skipped > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{skipped} cancelled \u{2014} never started, {}",
+                if app.emptying { "still in the trash" } else { "still staged" }
+            ),
+            theme.warn,
+        )));
+    }
     if finished {
         let undoable = app
             .job
@@ -371,8 +381,18 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             },
             theme.dim,
         )));
+    } else if app.deleting_cancelled() {
+        lines.push(Line::from(Span::styled(
+            "stopping after the current item\u{2026}",
+            theme.warn,
+        )));
     } else {
-        lines.push(Line::from(Span::styled("working…", theme.dim)));
+        // Keys are only taken once the batch is done, so `u` is not offered
+        // until then: a hint for a key that does nothing reads as a hang.
+        lines.push(Line::from(Span::styled(
+            "working\u{2026} \u{b7} ctrl-c to stop after the current item",
+            theme.dim,
+        )));
     }
 
     let title = if app.emptying {

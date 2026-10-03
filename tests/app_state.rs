@@ -354,3 +354,177 @@ fn a_batch_staged_on_a_snapshot_waits_for_the_live_scan() {
     app.open_confirm();
     assert_eq!(app.mode, Mode::Confirm);
 }
+
+// ------------------------------------------------------- stopping a batch
+
+/// A `docker` that answers `df` with nothing and takes `removal` seconds over
+/// every removal. `FAD_DOCKER_BIN` must point at it for the whole test.
+fn slow_docker(dir: &Path, df: &str, removal: &str) -> std::path::PathBuf {
+    let bin = dir.join("docker");
+    let body = format!(
+        "#!/bin/sh\nif [ \"$1\" = system ]; then sleep {df}; exit 0; fi\nsleep {removal}\n"
+    );
+    std::fs::write(&bin, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn volumes(names: &[&str]) -> fad::tools::Report {
+    use fad::tools::{Backing, Kind, Measure, Report, Resource, Source, SourceReport, Status};
+    let mk = |id: &str| Resource {
+        source: Source::Docker,
+        kind: Kind::Volume,
+        id: id.into(),
+        name: id.into(),
+        bytes: 1000,
+        measure: Measure::Exact,
+        reported: String::new(),
+        idle: true,
+        blocked: None,
+        last_used: None,
+        restore: None,
+        path: None,
+        detail: Vec::new(),
+    };
+    Report {
+        sources: vec![SourceReport {
+            source: Source::Docker,
+            status: Status::Ok,
+            backing: Backing::Host,
+            items: names.iter().map(|n| mk(n)).collect(),
+            totals: Vec::new(),
+        }],
+    }
+}
+
+fn wait_for(mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(start.elapsed() < std::time::Duration::from_secs(20), "timed out waiting");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The deleting modal ignored every key while a tools batch ground through a
+/// minute of `df` and thirty seconds a removal. `cancel_deleting` stops it
+/// after the item in hand: what went is reported, the rest is counted as
+/// cancelled and stays staged, and `u` is only offered once keys work again.
+#[test]
+fn a_tools_batch_stops_after_the_current_item() {
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+    let bin = slow_docker(dir.path(), "0", "1");
+    unsafe { std::env::set_var("FAD_DOCKER_BIN", &bin) };
+
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut app = settled(&root);
+    let names = ["a", "b", "c", "d"];
+    app.install_tools_for_test(volumes(&names));
+    app.show_view(None);
+    app.staged_tools = app.tool_items(fad::tools::Source::Docker, fad::tools::Kind::Volume)
+        .into_iter()
+        .collect();
+    app.commit();
+    assert_eq!(app.mode, Mode::Deleting);
+
+    let out = render(&mut app, 100, 30);
+    assert!(out.contains("ctrl-c to stop"), "no way out advertised while running:\n{out}");
+    assert!(!out.contains("u puts"), "offered undo while keys are ignored:\n{out}");
+
+    // Let the first removal start, then stop.
+    wait_for(|| {
+        app.poll_tool_job();
+        !app.tool_job.as_ref().unwrap().done.is_empty()
+    });
+    app.cancel_deleting();
+    assert!(app.deleting_cancelled());
+    let out = render(&mut app, 100, 30);
+    assert!(out.contains("stopping after the current item"), "{out}");
+
+    wait_for(|| {
+        app.poll_tool_job();
+        app.batch_finished()
+    });
+    let job = app.tool_job.as_ref().unwrap();
+    let done = job.done.len();
+    assert!(done < names.len(), "the batch ran to the end regardless");
+    assert_eq!(app.deleting_not_attempted(), names.len() - done);
+    // A stopped batch does not sit through the second `df` either.
+    assert_eq!(job.measured, None);
+
+    let out = render(&mut app, 100, 30);
+    println!("{out}");
+    assert!(out.contains(&format!("{} cancelled", names.len() - done)), "{out}");
+    assert!(out.contains("enter to close"), "{out}");
+    assert!(out.contains("(estimated)"), "an unmeasured figure passed for a measurement:\n{out}");
+
+    // What was never started is still in the batch afterwards.
+    app.finish_job();
+    assert_eq!(app.staged_tools.len(), names.len() - done);
+
+    unsafe { std::env::remove_var("FAD_DOCKER_BIN") };
+}
+
+/// The measurement is the one step that is pure waiting, and the user who
+/// pressed ctrl-c has stopped waiting. A `df` in flight is killed, not sat out.
+#[test]
+fn stopping_abandons_a_measurement_in_flight() {
+    use fad::tools::{Job, Kind, Source, ToolKey};
+
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let bin = slow_docker(dir.path(), "30", "0");
+    unsafe { std::env::set_var("FAD_DOCKER_BIN", &bin) };
+
+    let key = |id: &str| ToolKey { source: Source::Docker, kind: Kind::Volume, id: id.into() };
+    let mut job = Job::start(vec![(key("a"), "a".into(), 1), (key("b"), "b".into(), 1)]);
+    let started = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    job.cancel();
+    wait_for(|| {
+        job.poll();
+        job.is_finished()
+    });
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "sat out a thirty-second df after being told to stop"
+    );
+    assert!(job.done.is_empty());
+    assert_eq!(job.not_attempted(), 2);
+
+    unsafe { std::env::remove_var("FAD_DOCKER_BIN") };
+}
+
+/// The file half stops between entries too, and reports the same way.
+#[test]
+fn a_file_batch_stops_between_entries() {
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+    let files = dir.path().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let items: Vec<_> = (0..500)
+        .map(|i| {
+            let p = files.join(format!("f{i}"));
+            std::fs::write(&p, b"x").unwrap();
+            (p, 1u64)
+        })
+        .collect();
+
+    let mut job = fad::delete::Job::start(items.clone(), Disposal::Permanent);
+    job.cancel();
+    wait_for(|| {
+        job.poll();
+        job.is_finished()
+    });
+    assert!(job.cancelled());
+    // However far it got, the account has to balance, and nothing it says it
+    // did not reach may be missing from disk.
+    assert_eq!(job.done.len() + job.not_attempted(), items.len());
+    for (p, _) in &items[job.done.len()..] {
+        assert!(p.exists(), "{} went although it was never attempted", p.display());
+    }
+}

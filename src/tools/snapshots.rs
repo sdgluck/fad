@@ -19,7 +19,9 @@ pub fn probe() -> SourceReport {
     let out = match exec::run(&bin, &["listlocalsnapshots", "/"], super::INFO_TIMEOUT) {
         Ok(s) => s,
         Err(ExecErr::NotInstalled) => return SourceReport::empty(Source::Snapshots, Status::Missing),
-        Err(ExecErr::TimedOut) => return SourceReport::empty(Source::Snapshots, Status::TimedOut),
+        Err(ExecErr::TimedOut | ExecErr::Stopped) => {
+            return SourceReport::empty(Source::Snapshots, Status::TimedOut);
+        }
         Err(ExecErr::Failed { stderr, .. }) => {
             return SourceReport::empty(Source::Snapshots, Status::Failed(super::tail(&stderr)));
         }
