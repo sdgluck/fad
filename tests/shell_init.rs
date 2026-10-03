@@ -142,3 +142,64 @@ fn without_a_terminal_the_ui_says_what_to_use_instead() {
     assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(err.contains("needs a terminal") && err.contains("--json"), "{err}");
 }
+
+/// fad with every directory it writes to, and every tool it asks, in scratch.
+fn scratch(dir: &std::path::Path) -> Command {
+    let mut c = fad();
+    c.env("FAD_CACHE_DIR", dir.join("cache"))
+        .env("FAD_STATE_DIR", dir.join("state"))
+        .env("FAD_CONFIG_DIR", dir.join("config"))
+        .env("FAD_PODMAN_BIN", dir.join("no-podman"))
+        .env("FAD_TMUTIL_BIN", dir.join("no-tmutil"))
+        .stdin(std::process::Stdio::null());
+    c
+}
+
+/// "Nothing reclaimable" was the answer both when there was nothing and when
+/// everything was bigger than `--max`; the second is a different problem.
+#[test]
+fn everything_over_the_cap_is_not_reported_as_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("scan");
+    std::fs::create_dir_all(root.join("proj/node_modules/x")).unwrap();
+    std::fs::write(root.join("proj/package.json"), b"{}").unwrap();
+    std::fs::write(root.join("proj/node_modules/x/big"), vec![0u8; 256 * 1024]).unwrap();
+
+    let out = scratch(dir.path())
+        .arg(&root)
+        .args(["--reclaim", "--yes", "--dry-run", "--max", "1K"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("1 item, larger than --max 1.0K"), "{text}");
+    assert!(root.join("proj/node_modules/x/big").exists());
+}
+
+/// The daemon being down is not "nothing to clean". A nightly script was
+/// told exactly that, with exit 0, every night the daemon was not up.
+#[test]
+fn tools_yes_with_the_daemon_down_says_so_and_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let docker = dir.path().join("docker");
+    std::fs::write(
+        &docker,
+        "#!/bin/sh\necho 'Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+         Is the docker daemon running?' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = scratch(dir.path())
+        .arg(dir.path())
+        .args(["--tools", "--yes", "--dry-run"])
+        .env("FAD_DOCKER_BIN", &docker)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout: {text} stderr: {err}");
+    assert!(err.contains("not running"), "{err}");
+    assert!(!text.contains("nothing the tools report as unused"), "{text}");
+}

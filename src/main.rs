@@ -489,16 +489,18 @@ fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
     let ignore = fad::ignore::Rules::load();
     let root = tree.root_path();
 
-    let chosen = fad::reclaim::under_cap(
-        fad::reclaim::candidates(tree, args.apparent, args.min_size, &ignore),
-        args.max,
-    );
+    let all = fad::reclaim::candidates(tree, args.apparent, args.min_size, &ignore);
+    let found = all.len();
+    let chosen = fad::reclaim::under_cap(all, args.max);
     let total: u64 = chosen.iter().map(|(_, b)| b).sum();
     let batch: Vec<(PathBuf, u64)> =
         chosen.iter().map(|(id, bytes)| (tree.path(*id), *bytes)).collect();
 
     if batch.is_empty() {
-        println!("fad: nothing reclaimable under {}", display_path(root));
+        match nothing_under_cap(found, args.max) {
+            Some(why) => println!("fad: {why}"),
+            None => println!("fad: nothing reclaimable under {}", display_path(root)),
+        }
         return 0;
     }
 
@@ -654,9 +656,32 @@ fn status_word(s: &fad::tools::Status) -> &'static str {
 /// every command before running it. It is also the one scripted path in fad
 /// that cannot be undone, so it says so before it starts.
 fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
+    // A source that is installed and could not be asked is a cleanup that did
+    // not happen, not a clean bill of health. Said up front, and in the exit
+    // status: a script that runs this nightly with the daemon down was being
+    // told "nothing the tools report as unused" and exit 0, every night.
+    let unreachable: Vec<String> = report
+        .sources
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status,
+                fad::tools::Status::NotRunning(_)
+                    | fad::tools::Status::Failed(_)
+                    | fad::tools::Status::TimedOut
+            )
+        })
+        .filter_map(|s| s.status.line(s.source))
+        .collect();
+    for line in &unreachable {
+        eprintln!("fad: {}", escape_controls(line));
+    }
+    let unreachable = i32::from(!unreachable.is_empty());
+
     let chosen = report.candidates(args.min_size);
     let items: Vec<&fad::tools::Resource> =
         chosen.iter().filter_map(|k| report.get(k)).collect();
+    let found = items.len();
 
     // Same rule as --reclaim --max: skip anything that would take the batch
     // over the cap rather than stopping at the first overshoot.
@@ -673,8 +698,14 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
         .collect();
 
     if items.is_empty() {
-        println!("fad: nothing the tools report as unused");
-        return 0;
+        match nothing_under_cap(found, args.max) {
+            Some(why) => println!("fad: {why}"),
+            None if unreachable != 0 => {
+                println!("fad: nothing to remove from the tools that answered")
+            }
+            None => println!("fad: nothing the tools report as unused"),
+        }
+        return unreachable;
     }
 
     for r in &items {
@@ -696,7 +727,7 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
         }
     }
     if args.dry_run {
-        return 0;
+        return unreachable;
     }
 
     let batch: Vec<_> = items.iter().map(|r| (r.key(), r.name.clone(), r.bytes)).collect();
@@ -711,12 +742,27 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
     for o in &failures {
         eprintln!("fad: {}: {}", escape_controls(&o.label), o.result.as_ref().err().cloned().unwrap_or_default());
     }
-    // Measured by asking the tools again, not by adding up what we hoped for.
+    // Measured by asking the tools again where they would answer; otherwise
+    // what the removed items were reported to hold, and labelled as such.
     match job.measured {
         Some(bytes) => println!("freed {} (measured)", human(bytes)),
-        None => println!("removed {} item(s)", job.done.len() - failures.len()),
+        None => println!("freed about {} (estimated)", human(job.expected())),
     }
-    i32::from(!failures.is_empty())
+    i32::from(!failures.is_empty()).max(unreachable)
+}
+
+/// Why a cleanup with candidates took none of them, when `--max` is the
+/// reason. "Nothing reclaimable" was printed both when there was nothing and
+/// when every candidate was bigger than the cap, which sends someone looking
+/// for a problem in the wrong place.
+fn nothing_under_cap(found: usize, max: Option<u64>) -> Option<String> {
+    let max = max.filter(|_| found > 0)?;
+    Some(format!(
+        "{found} item{}, {}larger than --max {}",
+        if found == 1 { "" } else { "s" },
+        if found == 1 { "" } else { "all " },
+        human(max)
+    ))
 }
 
 /// How a path moved between two scans.
