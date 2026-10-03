@@ -26,8 +26,8 @@ pub fn trash(path: &Path) -> io::Result<PathBuf> {
     let dir = trash_dir_for(path, meta.dev())?;
     let files = dir.join("files");
     let info = dir.join("info");
-    std::fs::create_dir_all(&files)?;
-    std::fs::create_dir_all(&info)?;
+    private_dirs().create(&files)?;
+    private_dirs().create(&info)?;
 
     let stem = name.to_string_lossy();
     for attempt in 0..1000 {
@@ -77,6 +77,15 @@ pub fn trash(path: &Path) -> io::Result<PathBuf> {
             Ok(()) => return Ok(target),
             Err(e) => {
                 let _ = std::fs::remove_file(&info_path);
+                // A bind mount shares its source's device number, so the
+                // device test that picked this trash directory cannot see it —
+                // the kernel refuses the rename across it all the same.
+                if e.raw_os_error() == Some(libc::EXDEV) {
+                    return Err(io::Error::other(format!(
+                        "{} is on a different mount; can't be trashed \u{2014} use permanent delete",
+                        path.display()
+                    )));
+                }
                 return Err(e);
             }
         }
@@ -115,18 +124,73 @@ fn trash_dir_for(path: &Path, dev: u64) -> io::Result<PathBuf> {
     }
 
     let top = top_dir(path, dev)?;
-    let uid = unsafe { libc::getuid() };
+    // SAFETY: a plain query.
+    trash_in_topdir(&top, unsafe { libc::getuid() })
+}
 
-    // Spec order: an admin-provided `$topdir/.Trash` that is sticky and not a
-    // symlink, otherwise our own `$topdir/.Trash-$uid`.
+/// Directories only their owner can enter: the spec's mode for every trash
+/// directory a user creates, since what is in it was deleted, not shared.
+fn private_dirs() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true).mode(0o700);
+    b
+}
+
+/// The trash directory to use on the filesystem whose top is `top`, creating
+/// it if needed.
+///
+/// Spec order: an admin-provided `$topdir/.Trash` — a real directory, not a
+/// symlink, with the sticky bit — holding a per-user `$uid`; otherwise, or when
+/// that per-user directory cannot be used, our own `$topdir/.Trash-$uid`.
+///
+/// The checks are the spec's and they are about other users. `$topdir` is
+/// usually writable by more people than us: anyone could have planted a
+/// `.Trash-1000` as a symlink into their own directory, or as a directory they
+/// own, and then read everything we trash. So the per-user directory must be a
+/// real directory, owned by us, and is created `0700`; one that fails any of
+/// that is refused, never adopted.
+pub fn trash_in_topdir(top: &Path, uid: u32) -> io::Result<PathBuf> {
+    const S_ISVTX: u32 = 0o1000;
+
     let shared = top.join(".Trash");
     if let Ok(m) = std::fs::symlink_metadata(&shared) {
-        const S_ISVTX: u32 = 0o1000;
-        if m.is_dir() && !m.file_type().is_symlink() && m.mode() & S_ISVTX != 0 {
-            return Ok(shared.join(uid.to_string()));
+        // `symlink_metadata`, so a symlink reports as one and not as a dir.
+        if m.file_type().is_dir() && m.mode() & S_ISVTX != 0 {
+            let mine = shared.join(uid.to_string());
+            if own_private_dir(&mine, uid).is_ok() {
+                return Ok(mine);
+            }
         }
     }
-    Ok(top.join(format!(".Trash-{uid}")))
+    let own = top.join(format!(".Trash-{uid}"));
+    own_private_dir(&own, uid)
+        .map_err(|why| io::Error::other(format!("cannot use {}: {why}", own.display())))?;
+    Ok(own)
+}
+
+/// Create `dir` `0700` if it is missing, then insist it is a real directory
+/// owned by `uid`.
+fn own_private_dir(dir: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let m = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    if m.file_type().is_symlink() {
+        return Err("it is a symlink".into());
+    }
+    if !m.is_dir() {
+        return Err("it is not a directory".into());
+    }
+    if m.uid() != uid {
+        return Err("it belongs to another user".into());
+    }
+    Ok(())
 }
 
 fn home_trash() -> Option<PathBuf> {

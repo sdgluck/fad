@@ -114,3 +114,76 @@ fn directories_go_to_the_trash_whole() {
     assert!(!tree.exists());
     assert!(landed.join("dep/nested/index.js").exists(), "subtree did not come along");
 }
+
+// ------------------------------------------------- per-filesystem trash dirs
+//
+// `$topdir` is usually writable by other users, so these are about what fad
+// will and will not adopt there. Driven through `trash_in_topdir` against a
+// scratch directory standing in for a mount's top.
+
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+fn uid() -> u32 {
+    // SAFETY: a plain query.
+    unsafe { libc::getuid() }
+}
+
+fn mode(p: &Path) -> u32 {
+    std::fs::symlink_metadata(p).unwrap().mode() & 0o7777
+}
+
+#[test]
+fn a_fresh_topdir_gets_a_private_trash_of_our_own() {
+    let top = tempfile::tempdir().unwrap();
+    let got = trash::trash_in_topdir(top.path(), uid()).unwrap();
+    assert_eq!(got, top.path().join(format!(".Trash-{}", uid())));
+    assert_eq!(mode(&got), 0o700, "anyone could read what was trashed");
+}
+
+#[test]
+fn a_planted_symlink_is_never_adopted() {
+    let top = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), top.path().join(format!(".Trash-{}", uid())))
+        .unwrap();
+    assert!(trash::trash_in_topdir(top.path(), uid()).is_err(), "followed a planted symlink");
+}
+
+#[test]
+fn a_sticky_shared_trash_is_used_with_a_private_subdirectory() {
+    let top = tempfile::tempdir().unwrap();
+    let shared = top.path().join(".Trash");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+    let got = trash::trash_in_topdir(top.path(), uid()).unwrap();
+    assert_eq!(got, shared.join(uid().to_string()));
+    assert_eq!(mode(&got), 0o700);
+}
+
+#[test]
+fn a_shared_trash_that_fails_the_spec_falls_back_to_our_own() {
+    let own = |top: &Path| top.join(format!(".Trash-{}", uid()));
+
+    // Not sticky.
+    let top = tempfile::tempdir().unwrap();
+    std::fs::create_dir(top.path().join(".Trash")).unwrap();
+    std::fs::set_permissions(top.path().join(".Trash"), std::fs::Permissions::from_mode(0o777))
+        .unwrap();
+    assert_eq!(trash::trash_in_topdir(top.path(), uid()).unwrap(), own(top.path()));
+
+    // A symlink to a sticky directory.
+    let top = tempfile::tempdir().unwrap();
+    let real = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(real.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+    std::os::unix::fs::symlink(real.path(), top.path().join(".Trash")).unwrap();
+    assert_eq!(trash::trash_in_topdir(top.path(), uid()).unwrap(), own(top.path()));
+
+    // Sticky, but our slot in it is a symlink someone planted.
+    let top = tempfile::tempdir().unwrap();
+    let shared = top.path().join(".Trash");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    std::os::unix::fs::symlink(real.path(), shared.join(uid().to_string())).unwrap();
+    assert_eq!(trash::trash_in_topdir(top.path(), uid()).unwrap(), own(top.path()));
+}

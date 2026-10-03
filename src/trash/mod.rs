@@ -14,7 +14,7 @@ pub use macos::trash;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod freedesktop;
 #[cfg(all(unix, not(target_os = "macos")))]
-pub use freedesktop::trash;
+pub use freedesktop::{trash, trash_in_topdir};
 
 #[cfg(not(unix))]
 pub fn trash(_path: &Path) -> io::Result<std::path::PathBuf> {
