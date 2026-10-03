@@ -497,7 +497,7 @@ impl Report {
     /// Ask every tool. Sources are probed on their own threads: a wedged Docker
     /// should not hold a healthy Podman up for the full timeout.
     pub fn probe() -> Report {
-        Report::probe_these(&Source::all().to_vec())
+        Report::probe_these(Source::all())
     }
 
     /// Ask only these tools. The UI passes `Source::present()`, so what it
