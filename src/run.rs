@@ -852,10 +852,7 @@ fn stage_children(app: &mut App) {
         if items.is_empty() {
             return;
         }
-        let all = items.iter().all(|id| app.staged.contains(id));
-        for id in items {
-            if all { app.staged.remove(&id); } else { app.stage(id); }
-        }
+        app.stage_all(items);
         return;
     }
     let Some(id) = app.selected() else { return };
@@ -864,12 +861,5 @@ fn stage_children(app: &mut App) {
         return;
     }
     // All-or-nothing, so a second press undoes the first.
-    let all_staged = kids.iter().all(|c| app.staged.contains(c));
-    for c in kids {
-        if all_staged {
-            app.staged.remove(&c);
-        } else {
-            app.stage(c);
-        }
-    }
+    app.stage_all(kids);
 }

@@ -121,3 +121,140 @@ fn the_confirm_screen_does_not_call_a_trashed_batch_reclaimed() {
     assert!(out.contains("reclaimed"), "{out}");
     assert!(out.contains("cannot be undone"), "{out}");
 }
+
+// ------------------------------------------- what the walk stopped at, staged
+
+/// A tree with one of everything whose size on screen is not what deleting it
+/// would remove: a volume mounted two levels down, a cloud folder, and a
+/// directory that could not be read — beside two ordinary entries.
+fn hazards(root: &Path) -> Tree {
+    use fad::scan::meta::{Kind, Meta};
+    use fad::scan::walk::{Batch, Entry, ROOT_ID, Skip};
+
+    let meta = |kind: Kind, blocks: u64| Meta {
+        blocks,
+        len: blocks,
+        mtime: 0,
+        dev: 1,
+        ino: 0,
+        nlink: 1,
+        kind,
+    };
+    let dir = |name: &str, descend: Option<u32>, skip: Option<Skip>| Entry {
+        name: name.into(),
+        meta: meta(Kind::Dir, 0),
+        descend,
+        skip,
+    };
+    let file = |name: &str| Entry {
+        name: name.into(),
+        meta: meta(Kind::File, 4096),
+        descend: None,
+        skip: None,
+    };
+
+    let mut tree = Tree::new(root.to_path_buf(), &meta(Kind::Dir, 0));
+    tree.apply(Batch {
+        parent: ROOT_ID,
+        entries: vec![
+            dir("mnt", Some(1), None),
+            dir("Dropbox", None, Some(Skip::CloudStorage)),
+            dir("locked", Some(2), None),
+            dir("plain", Some(3), None),
+            file("also.bin"),
+        ],
+        unreadable: None,
+    });
+    tree.apply(Batch { parent: 1, entries: vec![dir("deeper", Some(4), None)], unreadable: None });
+    tree.apply(Batch {
+        parent: 4,
+        entries: vec![dir("backup", None, Some(Skip::OtherDevice))],
+        unreadable: None,
+    });
+    tree.apply(Batch {
+        parent: 2,
+        entries: Vec::new(),
+        unreadable: Some(std::io::ErrorKind::PermissionDenied),
+    });
+    tree.apply(Batch { parent: 3, entries: vec![file("a.bin")], unreadable: None });
+    tree
+}
+
+fn hazard_app(root: &Path) -> App {
+    let opts = ScanOpts::default();
+    let tree = hazards(root);
+    App::new(tree, Scan::start(root, opts.clone()).unwrap().1, opts)
+}
+
+/// Each of these shows as next to nothing, and deleting it would take a whole
+/// volume, someone's synced folder, or contents nobody has seen. None of them
+/// may reach the batch, and the status line has to say why.
+#[test]
+fn staging_refuses_mounts_cloud_folders_and_unreadable_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = hazard_app(dir.path());
+
+    for (rel, said) in [
+        ("mnt/deeper/backup", "a mounted volume"),
+        ("Dropbox", "a cloud folder"),
+        ("locked", "could not read"),
+    ] {
+        let id = find(&app.tree, rel);
+        app.status = None;
+        assert!(!app.stage(id), "{rel} was staged");
+        assert!(!app.staged.contains(&id));
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains(said), "{rel}: {status}");
+    }
+
+    // An ordinary directory and file still stage.
+    assert!(app.stage(find(&app.tree, "plain")));
+    assert!(app.stage(find(&app.tree, "also.bin")));
+}
+
+/// Staging a directory stages everything under it, so a mount three levels
+/// down is as dangerous as the mount itself.
+#[test]
+fn staging_refuses_a_directory_with_a_mount_somewhere_beneath_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = hazard_app(dir.path());
+
+    for rel in ["mnt", "mnt/deeper"] {
+        let id = find(&app.tree, rel);
+        assert!(!app.stage(id), "{rel} was staged with a volume mounted under it");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("contains a mounted volume"), "{status}");
+        assert!(status.contains("won't delete across it"), "{status}");
+    }
+    assert!(app.staged.is_empty());
+
+    // And the confirm step checks again, for a batch that got there some other
+    // way — carried across a rescan by path, say.
+    let mnt = find(&app.tree, "mnt");
+    app.staged.insert(mnt);
+    app.review_batch();
+    assert!(app.staged.is_empty(), "the confirm step let a mount through");
+    assert_eq!(app.refused.len(), 1);
+}
+
+/// `A` stages what it can, skips the rest, and says how many it skipped. A
+/// second `A` still undoes the first even though some of the group never went
+/// in.
+#[test]
+fn stage_all_skips_the_hazards_and_counts_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = hazard_app(dir.path());
+    let group: Vec<_> =
+        ["mnt", "Dropbox", "plain", "also.bin"].iter().map(|r| find(&app.tree, r)).collect();
+
+    app.stage_all(group.clone());
+    let plain = find(&app.tree, "plain");
+    let also = find(&app.tree, "also.bin");
+    assert_eq!(app.staged.len(), 2);
+    assert!(app.staged.contains(&plain) && app.staged.contains(&also));
+    let status = app.status.clone().unwrap_or_default();
+    assert!(status.contains("skipped 2"), "{status}");
+
+    app.stage_all(group);
+    assert!(app.staged.is_empty(), "a second A did not undo the first");
+}

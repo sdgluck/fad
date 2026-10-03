@@ -1979,9 +1979,17 @@ impl App {
     /// total double-counts the child, and since the batch runs largest-first the
     /// child is deleted along with its parent and then reported as a failure for
     /// a path that is exactly as gone as the user asked for.
-    pub fn stage(&mut self, id: NodeId) {
+    ///
+    /// Refuses anything `stage_refusal` objects to, says why in the status line,
+    /// and returns false. True means `id` is in the batch afterwards, whether
+    /// on its own or under a staged ancestor.
+    pub fn stage(&mut self, id: NodeId) -> bool {
         if self.is_staged_under(id) {
-            return;
+            return true;
+        }
+        if let Some(why) = self.stage_refusal(id) {
+            self.status = Some(format!("{} \u{2014} {why}", self.tree.node(id).name));
+            return false;
         }
         let nested: Vec<NodeId> =
             self.staged.iter().copied().filter(|o| self.is_ancestor(id, *o)).collect();
@@ -1989,6 +1997,106 @@ impl App {
             self.staged.remove(&n);
         }
         self.staged.insert(id);
+        true
+    }
+
+    /// Why `id` must not go into a batch, if it must not.
+    ///
+    /// The three flags here all mark a node whose size on screen is not what
+    /// deleting it would remove. A mount point shows as a few bytes because the
+    /// walk stopped at it, and deleting it walks straight into the whole other
+    /// volume. A cloud folder is the same with someone's synced files, and a
+    /// directory fad could not read holds whatever it holds — nobody, fad
+    /// included, has seen it. Each looks like the cheapest thing on the screen
+    /// and is the most expensive thing to lose.
+    ///
+    /// The whole subtree is walked rather than the node alone, because staging
+    /// a directory stages everything under it, and a `~/mnt` with a volume
+    /// mounted three levels down is exactly as dangerous as the volume itself.
+    /// The tree is in memory and this runs once per keypress, so the walk is
+    /// cheap next to what it guards; the delete worker checks again at the
+    /// last moment.
+    pub fn stage_refusal(&self, id: NodeId) -> Option<String> {
+        let own = self.tree.node(id).flags;
+        if own & flags::UNNAMED != 0 {
+            return Some("its name is not valid text, so fad cannot name it to delete it".into());
+        }
+        if let Some(what) = Self::hazard(own) {
+            return Some(format!("{what} \u{2014} fad won't delete it"));
+        }
+        let mut stack = self.tree.node(id).children.clone();
+        while let Some(cur) = stack.pop() {
+            let n = self.tree.node(cur);
+            if n.flags & flags::DELETED != 0 {
+                continue;
+            }
+            if let Some(what) = Self::hazard(n.flags) {
+                return Some(format!("contains {what} \u{2014} fad won't delete across it"));
+            }
+            stack.extend_from_slice(&n.children);
+        }
+        None
+    }
+
+    /// What a node is, when it is something whose real size fad does not know.
+    fn hazard(f: flags::Flags) -> Option<&'static str> {
+        if f & flags::OTHER_DEVICE != 0 {
+            Some("a mounted volume")
+        } else if f & flags::CLOUD != 0 {
+            Some("a cloud folder")
+        } else if f & flags::UNREADABLE != 0 {
+            Some("a directory fad could not read")
+        } else {
+            None
+        }
+    }
+
+    /// Stage a group in one go — `A` on a category, a duplicate group, or a
+    /// directory's children — or unstage it if it is already all staged.
+    ///
+    /// Anything `stage_refusal` objects to is left out and counted, and the
+    /// all-or-nothing test only looks at what could be staged. Otherwise a
+    /// category with one mount point in it could never read as fully staged,
+    /// and the second `A` that should undo the first would stage it again.
+    pub fn stage_all(&mut self, items: Vec<NodeId>) {
+        let root = self.tree.root();
+        let mut refused: Vec<String> = Vec::new();
+        let mut ok: Vec<NodeId> = Vec::new();
+        for id in items {
+            if id == root {
+                continue;
+            }
+            match self.stage_refusal(id) {
+                Some(why) => refused.push(why),
+                None => ok.push(id),
+            }
+        }
+        if ok.is_empty() {
+            self.status = match refused.first() {
+                Some(why) if refused.len() == 1 => Some(format!("nothing staged \u{2014} {why}")),
+                Some(why) => Some(format!(
+                    "nothing staged \u{2014} all {} refused, e.g. {why}",
+                    refused.len()
+                )),
+                None => None,
+            };
+            return;
+        }
+        let all = ok.iter().all(|id| self.staged.contains(id));
+        for id in ok {
+            if all {
+                self.staged.remove(&id);
+            } else {
+                self.stage(id);
+            }
+        }
+        if let Some(why) = refused.first().filter(|_| !all) {
+            self.status = Some(format!(
+                "skipped {} \u{2014} {}",
+                refused.len(),
+                if refused.len() == 1 { why.clone() } else { format!("e.g. {why}") }
+            ));
+        }
     }
 
     /// True when `id` is already covered by a staged ancestor.
@@ -2030,6 +2138,13 @@ impl App {
             // hit the wrong entry. Refused rather than attempted.
             if self.tree.node(id).flags & flags::UNNAMED != 0 {
                 self.refused.push((id, "its name is not valid text".into()));
+                continue;
+            }
+            // Checked again rather than trusted from staging time: a batch can
+            // be carried across a rescan by path, and the fresh walk may have
+            // found a volume mounted somewhere under it since.
+            if let Some(why) = self.stage_refusal(id) {
+                self.refused.push((id, why));
                 continue;
             }
             match delete::guard(&path, &root) {
