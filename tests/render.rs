@@ -580,3 +580,252 @@ fn the_omissions_screen_says_what_would_fix_each_kind() {
     assert!(out.contains("locked"), "the path is missing:\n{out}");
     assert!(out.contains("is short by whatever it holds"), "does not say the totals are wrong:\n{out}");
 }
+
+/// The last column of each tree row's size, read straight from the buffer, for
+/// every row that has one. The size is right-aligned in front of a fixed-width
+/// bar, so on a row whose name was measured correctly it ends in the same
+/// column as on every other row; a name measured in chars rather than columns
+/// pushes it right, or off the pane altogether.
+fn size_column_holds_a_size(app: &mut App, w: u16, h: u16, wanted: &[&str]) {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    app.rebuild_rows();
+    terminal.draw(|f| fad::ui::draw(f, app)).unwrap();
+    let buf = terminal.backend().buffer();
+    // The tree pane is everything left of the 38-column detail pane; inside its
+    // border the size ends 15 columns from the right (one of slack, the bar,
+    // and the space in front of it).
+    let inner_w = (w - 38 - 2) as usize;
+    let x = 1 + (inner_w - 15) as u16;
+    // A wide character's second cell is filler; skip it so names read whole.
+    let text = |y: u16| {
+        let mut out = String::new();
+        let mut x = 0;
+        while x < w - 38 {
+            let s = buf[(x, y)].symbol();
+            out.push_str(s);
+            x += unicode_width::UnicodeWidthStr::width(s).max(1) as u16;
+        }
+        out
+    };
+
+    for name in wanted {
+        let y = (1..h - 1)
+            .find(|y| text(*y).contains(name))
+            .unwrap_or_else(|| panic!("no row for {name}:\n{}", (0..h).map(text).collect::<Vec<_>>().join("\n")));
+        let last = buf[(x, y)].symbol();
+        assert!(
+            matches!(last, "B" | "K" | "M" | "G"),
+            "the size on the row for {name} is not where the others are (found {last:?}):\n{}",
+            (0..h).map(text).collect::<Vec<_>>().join("\n")
+        );
+    }
+}
+
+/// Wide characters are two columns each. Counting them as one let a CJK name
+/// run twice the width it was given and push its size and bar off the pane.
+#[test]
+fn wide_names_keep_the_columns_lined_up() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let long = "写真".repeat(20);
+    std::fs::create_dir_all(dir.path().join(&long)).unwrap();
+    std::fs::write(dir.path().join(&long).join("a.bin"), vec![0u8; 5 * 1024 * 1024]).unwrap();
+    std::fs::write(dir.path().join("🎉🎉 party 🎉.txt"), vec![0u8; 4 * 1024 * 1024]).unwrap();
+    std::fs::write(dir.path().join("休暇.mov"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+    let mut app = app_for(dir.path());
+    app.mark_dirty();
+
+    // The long one is cut, so it is found by its tail.
+    for (w, h) in [(100, 24), (80, 24)] {
+        size_column_holds_a_size(&mut app, w, h, &["写真写真", "arty", "休暇.mov", "Movies"]);
+    }
+
+    let out = render(&mut app, 100, 24);
+    println!("{out}");
+    assert!(out.contains("\u{2026}真"), "the long name was not cut from the left:\n{out}");
+}
+
+/// A row nested deeper than the pane has room to indent stops indenting; it
+/// does not push its own size off the edge.
+#[test]
+fn a_deep_row_stays_inside_the_pane() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rel = std::path::PathBuf::new();
+    for i in 0..30 {
+        rel.push(format!("d{i}"));
+    }
+    std::fs::create_dir_all(dir.path().join(&rel)).unwrap();
+    std::fs::write(dir.path().join(&rel).join("deepest.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+    let mut app = app_for(dir.path());
+    let mut id = app.tree.root();
+    loop {
+        app.expanded.insert(id);
+        match app.tree.node(id).children.first() {
+            Some(c) => id = *c,
+            None => break,
+        }
+    }
+    app.mark_dirty();
+    app.rebuild_rows();
+    app.cursor = app.rows.len() - 1;
+
+    size_column_holds_a_size(&mut app, 80, 40, &["est.bin", "d29"]);
+}
+
+/// The root always shows, so a filter that matches nothing leaves one row, not
+/// none. That row on its own has to say why it is alone.
+#[test]
+fn a_filter_that_matches_nothing_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.filter = "zzqqxx".into();
+    app.mark_dirty();
+
+    let out = render(&mut app, 100, 20);
+    println!("{out}");
+    assert!(out.contains("nothing matches \"zzqqxx\""), "no explanation for the empty tree:\n{out}");
+}
+
+/// Asked for mid-scan, the duplicate hunt waits for the walk and then starts on
+/// its own. The empty view must not send the user off to press R for it.
+#[test]
+fn the_duplicate_view_mid_scan_says_it_will_start_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    assert!(app.scanning(), "fixture expected a live scan");
+    app.show_view(Some(fad::app::View::Dupes));
+
+    let out = render(&mut app, 100, 20);
+    println!("{out}");
+    assert!(out.contains("starts when the scan finishes"), "{out}");
+    assert!(!out.contains("R to rescan"), "{out}");
+}
+
+/// The footer is the only place an overlay says how to leave it, so it has to
+/// be on the overlay's last row however small the terminal and however long
+/// the list. Omissions used to forget its headings take rows too.
+#[test]
+fn overlay_footers_stay_pinned_on_small_terminals() {
+    use fad::app::{Mode, Omission, Why};
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    // Staging: every file and directory, so the basket outgrows the screen.
+    let root = app.tree.root();
+    for c in app.tree.node(root).children.clone() {
+        for g in app.tree.node(c).children.clone() {
+            app.staged.insert(g);
+        }
+    }
+    // Omissions of three kinds, cursor on the last, so the window must make
+    // room for headings it has scrolled past.
+    let kinds = [Why::Unreadable, Why::Cloud, Why::Ignored];
+    app.omissions = (0..30)
+        .map(|i| Omission {
+            path: dir.path().join(format!("o{i}")),
+            why: kinds[i / 10],
+            bytes: Some(1024),
+        })
+        .collect();
+    app.omission_cursor = 29;
+    app.search = "o".into();
+    app.run_search();
+    app.history = (0..30)
+        .map(|i| fad::delete::Batch { at: i, entries: Vec::new() })
+        .collect();
+    app.history_cursor = 29;
+
+    for (w, h) in [(40u16, 10u16), (80, 24)] {
+        for (mode, footer, chosen) in [
+            (Mode::Basket, "review and commit", None),
+            (Mode::Omissions, "copy the path", Some("o29")),
+            (Mode::Search, "go there", None),
+            (Mode::History, "put this batch back", None),
+        ] {
+            app.mode = mode;
+            let out = render(&mut app, w, h);
+            let lines: Vec<&str> = out.lines().collect();
+            // The footer's row, and directly under it the overlay's bottom
+            // border: nothing between them, and nothing cut off below.
+            let at = lines.iter().position(|l| l.contains(footer));
+            let pinned = at.is_some_and(|i| lines.get(i + 1).is_some_and(|l| l.contains('\u{2514}')));
+            assert!(pinned, "{w}x{h}: the footer is not on the last row:\n{out}");
+            if let Some(name) = chosen {
+                assert!(out.contains(name), "{w}x{h}: the cursor's row is off screen:\n{out}");
+            }
+        }
+    }
+}
+
+/// The help is longer than a short terminal: it has to scroll to its end, and
+/// a description that does not fit has to wrap rather than stop mid-word.
+#[test]
+fn the_help_scrolls_and_wraps() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.mode = fad::app::Mode::Help;
+
+    let top = render(&mut app, 80, 24);
+    println!("{top}");
+    assert!(top.contains("jump 10 lines"), "{top}");
+    assert!(top.contains("j k scroll"), "no sign that it scrolls:\n{top}");
+    assert!(!top.contains("wheel"), "fits without scrolling? the test needs a shorter screen:\n{top}");
+
+    app.ui.help_scroll = usize::MAX;
+    let end = render(&mut app, 80, 24);
+    println!("{end}");
+    assert!(end.contains("wheel"), "could not scroll to the last entry:\n{end}");
+    assert!(app.ui.help_scroll < 100, "the scroll was not clamped to the text");
+
+    // Narrow enough that the long esc line has to wrap: both halves are there
+    // and no word is broken across them.
+    app.ui.help_scroll = 0;
+    let mut found = false;
+    for _ in 0..40 {
+        let out = render(&mut app, 60, 40);
+        if out.contains("back out one level") {
+            assert!(out.contains("quits at the top"), "the wrapped half is missing:\n{out}");
+            found = true;
+            break;
+        }
+        app.ui.help_scroll += 5;
+    }
+    assert!(found, "never saw the esc entry");
+}
+
+/// At 80 columns with a batch staged the hints are cut short, and the two
+/// that must survive are how to get help and how to leave.
+#[test]
+fn the_status_bar_keeps_help_and_quit_when_it_is_narrow() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    let root = app.tree.root();
+    for c in app.tree.node(root).children.clone() {
+        app.staged.insert(c);
+    }
+    let out = render(&mut app, 80, 24);
+    let status = out.lines().last().unwrap_or_default();
+    assert!(status.contains("? help") && status.contains("q quit"), "{status}");
+}
+
+/// A kept filter is as easy to forget as an age filter, and has to be as
+/// visible: rows missing with no reason on screen read as a bug.
+#[test]
+fn a_kept_filter_is_named_in_the_header() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.filter = "holiday".into();
+    app.mark_dirty();
+
+    let out = render(&mut app, 100, 20);
+    println!("{out}");
+    let header = out.lines().next().unwrap_or_default();
+    assert!(header.contains("/holiday"), "the header does not say the tree is filtered:\n{out}");
+}

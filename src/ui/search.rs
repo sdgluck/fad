@@ -73,12 +73,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         let path = app.tree.path(*id);
         let shown = path.strip_prefix(app.tree.root_path()).unwrap_or(&path).display().to_string();
         let size = human(*bytes);
-        let room = width.saturating_sub(size.chars().count() + 4);
+        let room = width.saturating_sub(super::cols(&size) + 4);
         let style = if n.flags & flags::IS_DIR != 0 { theme.dir } else { theme.normal };
         let line = Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("{:<room$}", super::compress(&shown, room), room = room),
+                super::pad(&super::compress(&shown, room), room),
                 style,
             ),
             Span::raw(" "),
@@ -99,17 +99,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         )));
     }
 
-    while lines.len() + 1 < inner.height as usize {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(vec![
+    let footer = Line::from(vec![
         Span::styled(" enter ", theme.mode_badge),
         Span::styled(" go there   ", theme.dim),
         Span::styled(" \u{2191} \u{2193} ", theme.emphasis),
         Span::styled("choose   ", theme.dim),
         Span::styled(" esc ", theme.emphasis),
         Span::styled("back", theme.dim),
-    ]));
+    ]);
+    let lines = super::pin_footer(lines, footer, inner.height as usize);
 
     f.render_widget(Clear, rect);
     f.render_widget(

@@ -529,6 +529,8 @@ pub struct App {
     /// Rows are rebuilt on demand, not on every frame.
     dirty: bool,
     pub should_quit: bool,
+    /// What the screen remembers between keys and nothing else needs to know.
+    pub ui: crate::ui::UiState,
 }
 
 impl App {
@@ -693,6 +695,7 @@ impl App {
             refused: Vec::new(),
             dirty: true,
             should_quit: false,
+            ui: crate::ui::UiState::default(),
         };
         app.rebuild_rows();
         app

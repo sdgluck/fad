@@ -6,7 +6,7 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::Theme;
+use super::{Theme, cols, pad, truncate_end, truncate_start as truncate};
 use crate::app::{App, Heading};
 use crate::format::human;
 use crate::tree::flags;
@@ -16,6 +16,26 @@ use crate::tree::flags;
 const EIGHTHS: [&str; 9] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"];
 
 const BAR_WIDTH: usize = 12;
+
+/// Everything on a tree row but the indent and the name: the stage marker, the
+/// twisty and its space, a space, the size, a space, the bar, and one column
+/// of slack on the right.
+const ROW_FIXED: usize = 1 + 2 + 1 + 8 + 1 + BAR_WIDTH + 1;
+
+/// The narrowest a name is squeezed to before the indent gives way instead.
+const MIN_NAME: usize = 8;
+
+/// Columns of indent for a row at `depth` in a pane `width` wide.
+///
+/// Two a level, until the name would drop below `MIN_NAME`, and then no more:
+/// a deep row keeps its name readable and stays inside the pane, at the cost of
+/// lining up with its parent. Before, the name had a floor and the indent did
+/// not, so a deep enough row ran off the right edge and took its size and bar
+/// with it. Public because a click on the twisty is hit-tested against it.
+pub(crate) fn indent(depth: u16, width: usize) -> usize {
+    let room = width.saturating_sub(ROW_FIXED + MIN_NAME);
+    (2 * depth as usize).min(room / 2 * 2)
+}
 
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let title = header(app, area.width.saturating_sub(2) as usize);
@@ -40,6 +60,15 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     }
     for i in app.offset..(app.offset + height).min(app.rows.len()) {
         lines.push(row_line(app, theme, i, inner.width as usize));
+    }
+    // The tree always shows its root, so a filter that matches nothing leaves
+    // one row rather than none — and a lone root with no children under it
+    // read as an empty directory, never as "your filter hid everything".
+    if app.view().is_none()
+        && app.rows.len() == 1
+        && (!app.filter.is_empty() || app.age_filter != crate::app::AgeFilter::All)
+    {
+        lines.push(Line::from(Span::styled(empty_reason(app), theme.dim)));
     }
     let list = Rect { height: list_h, ..inner };
     // Remembered for hit-testing: a click is a terminal coordinate and means
@@ -128,6 +157,14 @@ fn header(app: &App, width: usize) -> Line<'static> {
         spans.push(Span::from(format!(" {} ", app.age_filter.label())).bold().reversed());
         spans.push(Span::from(" "));
     }
+    // Same reason, and a kept filter is easier still to forget: it was typed
+    // once, `enter` put the prompt away, and nothing else on screen says the
+    // tree is a subset. Capped, because the query is a reminder here and the
+    // free-space figure is the answer.
+    if !app.filter.is_empty() {
+        spans.push(Span::from(format!(" /{} ", truncate_end(&app.filter, 20))).bold().reversed());
+        spans.push(Span::from(" "));
+    }
 
     /// A path compressed below this is no longer a path, and a title that
     /// overflows loses the free-space figure off the right-hand end — so when
@@ -135,7 +172,7 @@ fn header(app: &App, width: usize) -> Line<'static> {
     const MIN_PATH: usize = 16;
 
     let width_of =
-        |v: &[Span<'static>]| v.iter().map(|s| s.content.chars().count()).sum::<usize>();
+        |v: &[Span<'static>]| v.iter().map(|s| cols(&s.content)).sum::<usize>();
     if width.saturating_sub(width_of(&spans) + 1) < MIN_PATH {
         spans.remove(counts);
     }
@@ -157,8 +194,12 @@ fn empty_reason(app: &App) -> String {
     } else if app.dupe_view {
         if app.dupe_hunt_running() {
             " hashing candidates\u{2026}".to_string()
+        } else if app.dupes.is_none() && app.scanning() {
+            // Asked for already: the hunt starts on its own once the walk is
+            // done, and telling the user to press anything would be wrong.
+            " finding duplicates starts when the scan finishes".to_string()
         } else if app.dupes.is_none() {
-            " duplicates need a finished scan \u{2014} R to rescan".to_string()
+            " no duplicate search has run \u{2014} d to leave, d again to start one".to_string()
         } else {
             " no duplicates over 1M \u{2014} d for the full tree".to_string()
         }
@@ -203,7 +244,7 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
 
         if let Some(f) = fraction {
             let left = remaining(&p, f);
-            let cells = width.saturating_sub(left.chars().count() + 4);
+            let cells = width.saturating_sub(cols(&left) + 4);
             let filled = (f * cells as f64) as usize;
             out.push(Line::from(vec![
                 Span::raw(" "),
@@ -284,34 +325,34 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     // The one thing a size in this view cannot say for itself: whether removing
     // it gives the user's disk anything back, and whether the tree has counted
     // it already.
-    if app.tools_view {
-        if let Some(report) = app.tools.as_ref() {
-            for sr in &report.sources {
-                for (i, note) in sr.backing.notes().iter().enumerate() {
-                    // The tool's name once, on the first line only; the rest
-                    // are continuations of the same warning.
-                    // A tight prefix on purpose: every character here is one
-                    // the warning itself does not get.
-                    let lead =
-                        if i == 0 { format!(" \u{26a0} {}: ", sr.source.label()) } else { "   ".into() };
-                    out.push(Line::from(Span::styled(
-                        truncate_end(&format!("{lead}{note}"), width),
-                        theme.warn,
-                    )));
-                }
-                if sr.backing.notes().is_empty() {
-                    continue;
-                }
-                if app.tool_in_tree(sr.backing.disk().map(|p| p.as_path())) {
-                    out.push(Line::from(Span::styled(
-                        truncate_end(
-                            " \u{26a0} that file is under the scan root, so the tree above \
-                              already counts it \u{2014} these are not two separate piles",
-                            width,
-                        ),
-                        theme.warn,
-                    )));
-                }
+    if app.tools_view
+        && let Some(report) = app.tools.as_ref()
+    {
+        for sr in &report.sources {
+            for (i, note) in sr.backing.notes().iter().enumerate() {
+                // The tool's name once, on the first line only; the rest
+                // are continuations of the same warning.
+                // A tight prefix on purpose: every character here is one
+                // the warning itself does not get.
+                let lead =
+                    if i == 0 { format!(" \u{26a0} {}: ", sr.source.label()) } else { "   ".into() };
+                out.push(Line::from(Span::styled(
+                    truncate_end(&format!("{lead}{note}"), width),
+                    theme.warn,
+                )));
+            }
+            if sr.backing.notes().is_empty() {
+                continue;
+            }
+            if app.tool_in_tree(sr.backing.disk().map(|p| p.as_path())) {
+                out.push(Line::from(Span::styled(
+                    truncate_end(
+                        " \u{26a0} that file is under the scan root, so the tree above \
+                          already counts it \u{2014} these are not two separate piles",
+                        width,
+                    ),
+                    theme.warn,
+                )));
             }
         }
     }
@@ -376,12 +417,6 @@ fn si(v: f64) -> String {
     }
 }
 
-fn truncate_end(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return s.to_string();
-    }
-    s.chars().take(width.saturating_sub(1)).collect::<String>() + "\u{2026}"
-}
 
 /// Keep the cursor on screen with a little breathing room above and below.
 fn scroll_into_view(app: &mut App, height: usize) {
@@ -449,14 +484,13 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
         &n.name
     };
 
-    let indent = "  ".repeat(row.depth as usize);
+    let indent = " ".repeat(indent(row.depth, width));
     let bytes = app.tree.size(row.id, app.apparent);
     let size = human(bytes);
     let bar = bar(bytes, row.sibling_max);
 
     // Name column gets whatever the fixed columns leave behind.
-    let fixed = 1 + 1 + indent.len() + 2 + 8 + 1 + BAR_WIDTH + 1;
-    let name_w = width.saturating_sub(fixed).max(6);
+    let name_w = width.saturating_sub(ROW_FIXED + indent.len());
     let name = truncate(label, name_w);
 
     let name_style = if staged {
@@ -473,7 +507,7 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
         Span::styled(marker.to_string(), theme.staged),
         Span::raw(indent),
         Span::styled(format!("{twisty} "), theme.dim),
-        Span::styled(format!("{name:<name_w$}"), name_style),
+        Span::styled(pad(&name, name_w), name_style),
         Span::raw(" "),
         Span::styled(format!("{size:>8}"), theme.emphasis),
         Span::raw(" "),
@@ -501,7 +535,7 @@ fn category_line(app: &App, theme: &Theme, cat: crate::presets::Category, select
     let head =
         format!(" {arrow} {} \u{b7} {} \u{b7} {} ", cat.label(), items.len(), human(total));
     let note = format!(" {} ", cat.note());
-    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let rule = width.saturating_sub(cols(&head) + cols(&note) + 1);
     let line = Line::from(vec![
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.dim),
@@ -546,7 +580,7 @@ fn tool_line(
         Some((_, recl)) if recl > 0 => format!(" {} reclaimable ", human(recl)),
         _ => format!(" {} ", kind.note()),
     };
-    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let rule = width.saturating_sub(cols(&head) + cols(&note) + 1);
     let line = Line::from(vec![
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.dim),
@@ -606,9 +640,11 @@ fn tool_row_line(
         String::new()
     };
 
-    let indent = "  ".repeat(row.depth as usize);
-    let fixed = 1 + indent.len() + 2 + 8 + 1 + BAR_WIDTH + 1 + suffix.chars().count();
-    let name_w = width.saturating_sub(fixed).max(6);
+    let indent = " ".repeat(indent(row.depth, width));
+    // The suffix gives way before the name does: which image this is matters
+    // more than the note about it.
+    let suffix = truncate_end(&suffix, width.saturating_sub(ROW_FIXED + indent.len() + MIN_NAME));
+    let name_w = width.saturating_sub(ROW_FIXED + indent.len() + cols(&suffix));
     let name = truncate(&r.name, name_w);
 
     let name_style = if staged {
@@ -623,7 +659,7 @@ fn tool_row_line(
         Span::styled(marker.to_string(), theme.staged),
         Span::raw(indent),
         Span::styled("  ".to_string(), theme.dim),
-        Span::styled(format!("{name:<name_w$}"), name_style),
+        Span::styled(pad(&name, name_w), name_style),
         Span::raw(" "),
         Span::styled(format!("{size:>8}"), theme.emphasis),
         Span::raw(" "),
@@ -656,7 +692,7 @@ fn dupe_line(app: &App, theme: &Theme, group: usize, selected: bool, width: usiz
         human(each)
     );
     let note = format!(" {} reclaimable ", human(wasted));
-    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let rule = width.saturating_sub(cols(&head) + cols(&note) + 1);
     let line = Line::from(vec![
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.bar_hot),
@@ -687,12 +723,3 @@ fn bar(bytes: u64, max: u64) -> String {
     s
 }
 
-/// Truncate from the left: the tail of a filename is what distinguishes it.
-fn truncate(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count <= width {
-        return s.to_string();
-    }
-    let skip = count - width + 1;
-    format!("…{}", s.chars().skip(skip).collect::<String>())
-}

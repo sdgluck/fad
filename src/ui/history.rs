@@ -31,7 +31,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         )));
     }
 
-    let body = (inner.height as usize).saturating_sub(2);
+    // Room for the empty-state line, if any, and the footer.
+    let body = (inner.height as usize).saturating_sub(lines.len() + 1);
     let offset = app
         .history_cursor
         .saturating_sub(body.saturating_sub(1))
@@ -57,14 +58,14 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         lines.push(if i == app.history_cursor { line.style(theme.selection) } else { line });
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    let footer = Line::from(vec![
         Span::styled(" enter ", theme.mode_badge),
         Span::styled(" put this batch back   ", theme.dim),
         Span::styled(" esc ", theme.emphasis),
         Span::styled("close", theme.dim),
-    ]));
+    ]);
 
+    let lines = super::pin_footer(lines, footer, inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
 }
 

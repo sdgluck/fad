@@ -64,24 +64,35 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
     lines.push(Line::from(""));
 
-    // Room for the summary above and the footer below.
-    let body = (inner.height as usize).saturating_sub(lines.len() + 2);
-    let offset = app
+    // Room for the summary above and the footer below. Headings take rows
+    // too, which this used to leave out: a list with three kinds in it ran
+    // three rows long and pushed the footer off the bottom.
+    let body = (inner.height as usize).saturating_sub(lines.len() + 1);
+    let mut offset = app
         .omission_cursor
         .saturating_sub(body.saturating_sub(1))
         .min(app.omissions.len().saturating_sub(body));
+    // Walk the window down until the cursor's row, and every heading drawn
+    // above it, fits.
+    while offset < app.omission_cursor && rows_to(app, offset, app.omission_cursor) > body {
+        offset += 1;
+    }
 
     // Starts unset, so the first visible row always carries its heading. When
     // scrolling has pushed the real one off the top that heading is redrawn,
     // and a row is never on screen without the reason it is there.
     let mut last: Option<Why> = None;
+    let used = lines.len();
 
-    for (i, o) in app.omissions.iter().enumerate().skip(offset).take(body) {
+    for (i, o) in app.omissions.iter().enumerate().skip(offset) {
+        if lines.len() >= used + body {
+            break;
+        }
         if last != Some(o.why) {
             last = Some(o.why);
             let head = format!(" {} ", o.why.heading());
             let note = format!(" {} ", o.why.note());
-            let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+            let rule = width.saturating_sub(super::cols(&head) + super::cols(&note) + 1);
             lines.push(Line::from(vec![
                 Span::styled(head, theme.emphasis),
                 Span::styled(note, if o.why.uncounted() { theme.warn } else { theme.dim }),
@@ -92,12 +103,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         // A size we do not have is left blank, never shown as zero. Not knowing
         // what an unread directory holds is the entire point of the row.
         let size = o.bytes.map(human).unwrap_or_else(|| "\u{2014}".into());
-        let room = width.saturating_sub(size.chars().count() + 4);
+        let room = width.saturating_sub(super::cols(&size) + 4);
         let path = o.path.strip_prefix(app.tree.root_path()).unwrap_or(&o.path);
         let line = Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("{:<room$}", super::compress(&path.display().to_string(), room), room = room),
+                super::pad(&super::compress(&path.display().to_string(), room), room),
                 theme.normal,
             ),
             Span::raw(" "),
@@ -106,17 +117,30 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         lines.push(if i == app.omission_cursor { line.style(theme.selection) } else { line });
     }
 
-    while lines.len() + 1 < inner.height as usize {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(vec![
+    let footer = Line::from(vec![
         Span::styled(" y ", theme.mode_badge),
         Span::styled(" copy the path   ", theme.dim),
         Span::styled(" j k ", theme.emphasis),
         Span::styled("move   ", theme.dim),
         Span::styled(" esc ", theme.emphasis),
         Span::styled("back", theme.dim),
-    ]));
+    ]);
+    let lines = super::pin_footer(lines, footer, inner.height as usize);
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Screen rows taken by entries `from..=to`, counting the heading drawn above
+/// the first of them and above every change of kind after it.
+fn rows_to(app: &App, from: usize, to: usize) -> usize {
+    let mut last = None;
+    let mut rows = 0;
+    for o in &app.omissions[from..=to.min(app.omissions.len().saturating_sub(1))] {
+        if last != Some(o.why) {
+            last = Some(o.why);
+            rows += 1;
+        }
+        rows += 1;
+    }
+    rows
 }

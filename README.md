@@ -31,7 +31,7 @@ Runs on macOS and Linux.
 │                                                      │ ── staged · 1 · 40G ──    │
 │ ⚠ 2 cloud folder(s) not counted — rerun with --cloud │ ● dev              40G    │
 └──────────────────────────────────────────────────────┴───────────────────────────┘
- 1 staged · 40G   space stage · x commit · r reclaimable · / filter · ? help
+ 1 staged · 40G  space stage · x basket · r reclaimable · t tools · / filter · ? help · q quit
 ```
 
 ## Install
@@ -73,24 +73,37 @@ sign of movement reads as a hang.
 | `d` | duplicate view — files whose contents are byte-for-byte equal |
 | `L` | in the duplicate view — make the copies share one copy of the storage |
 | `a` | age filter — cycle: any age → untouched 90 days → 1 year → 2 years |
-| `/` | fuzzy filter — narrow what is on screen (`enter` to keep it, `esc` to clear) |
+| `/` | fuzzy filter — narrow what is on screen (`enter` keeps it, `/` again refines it, `esc` clears it) |
 | `f` | find — every entry in the tree by name, biggest first, `enter` to go there |
-| `s` | cycle sort: size → count → modified → name · `R` rescan |
+| `s` | cycle sort: size → count → modified → name · `R` rescan everything |
 | `S` | bring the next detail breakdown to the top, when they do not all fit |
-| `o` `e` `y` | reveal in your file manager · open in `$EDITOR` · copy path |
+| `o` `e` `y` | reveal in Finder (your file manager on Linux) · open in `$EDITOR` · copy path |
 | `i` | never rank this again — adds it to your ignore list |
 | `!` | what is not in these numbers — skipped, unreadable, ignored |
-| `?` | help · `q` or `esc` quit |
+| `esc` | back out one level — the filter, then the view, then the age filter; quits at the top |
+| `?` | help — `j` `k` scroll it, any other key closes it · `q` quit |
 
 The mouse works too: click a row to select it, click its arrow to open or close
 it, click the left edge to stage it, and use the wheel to move the selection.
 Capturing the mouse takes over your terminal's own text selection, so
-`--no-mouse` turns it off.
+`--no-mouse` turns it off. Over the basket, the history, the find list or the
+help, the wheel scrolls the list instead.
+
+A kept filter is named in the tree's header next to the age filter, because rows
+missing for no visible reason read as a bug. `esc` takes the narrowing off one
+layer at a time and only quits once there is nothing left to take off; `q`,
+`esc` and `ctrl-c` all ask first when something is staged, since a batch can be
+ten minutes' work and is one keystroke from gone.
+
+`e` hands the terminal over rather than opening an editor on top of the UI: `fad`
+steps aside, runs `$EDITOR` (then `$VISUAL`, then `vi`) through `sh` so that
+`EDITOR="code -w"` works, and comes back with a full redraw when it exits.
 
 In the basket: `space` unstages the selected item, or the whole group when the
 cursor is on a heading; `C` clears the batch; `enter` goes on to the
-confirmation. It also reports how much free space you will have when the batch
-lands, which is the number you came for.
+confirmation — and only `enter`: `y` copies a path everywhere else and commits
+on the next screen, so it does nothing here. It also reports how much free space
+you will have when the batch lands, which is the number you came for.
 
 In the confirmation screen: `D` toggles between trash and permanent delete,
 `enter` or `y` commits, `esc` or `q` goes back to the basket.
@@ -507,8 +520,9 @@ would be the exact failure this screen exists to expose.
 ## Deleting
 
 `space` stages an item; the staged batch and its total are shown in the right
-pane and the status bar. `x` opens a confirmation showing the item count, the
-total to be reclaimed, the largest items by name, and anything the guard
+pane and the status bar. `x` opens the basket, where the whole batch can be read
+and corrected, and `enter` there opens a confirmation showing the item count,
+the total to be reclaimed, the largest items by name, and anything the guard
 refused.
 
 Deletion goes to the system trash by default, and `u` restores the whole batch

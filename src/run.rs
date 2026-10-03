@@ -1,18 +1,22 @@
 //! Terminal setup, the event loop, and what each key does.
 
 use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 
-use crate::app::{App, Heading, Mode, View};
+use crate::app::{AgeFilter, App, Heading, Mode, View};
 use crate::delete::{self, Disposal};
 use crate::tree::flags;
 use crate::ui;
@@ -77,43 +81,201 @@ impl Screen {
 
 type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<Screen>>;
 
+/// Whether the terminal is currently ours: raw mode on, alternate screen up.
+/// Whoever swaps it back to false does the restoring, so the guard, the panic
+/// hook and the signal path can all race for it and the escape codes still go
+/// out exactly once — and a panic before startup or after a clean exit writes
+/// nothing to a terminal that is already fine.
+static TAKEN: AtomicBool = AtomicBool::new(false);
+static MOUSE: AtomicBool = AtomicBool::new(false);
+static KEEP_STDOUT_CLEAN: AtomicBool = AtomicBool::new(false);
+
+/// The last terminating signal to arrive, or zero. A handler may do almost
+/// nothing safely — no allocation, no locks, no writing escape codes through a
+/// buffered terminal — so it records the number and the event loop, which
+/// wakes at least four times a second, does the restoring on its way out.
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_signal(sig: libc::c_int) {
+    SIGNAL.store(sig, Ordering::SeqCst);
+}
+
+/// SIGTERM from `kill`, SIGHUP from a closed terminal window, SIGINT from
+/// anything that is not the keyboard (raw mode turns ctrl-c into a key). The
+/// default action for each kills the process with the terminal still raw and on
+/// the alternate screen, which leaves the shell unusable until the user types
+/// `reset` blind.
+///
+/// A caught signal goes back to its default disposition across `exec`, so an
+/// editor started from here still gets ctrl-c the normal way.
+fn install_signal_handlers() {
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        // SAFETY: a zeroed `sigaction` is a valid empty one, and the handler
+        // only stores to an atomic, which is async-signal-safe.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            // Restarted, so a signal landing mid-`read` does not surface as an
+            // error that ends the session before the loop has seen the flag.
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// A terminating signal that has arrived since the last call, if any.
+fn take_signal() -> Option<i32> {
+    match SIGNAL.swap(0, Ordering::SeqCst) {
+        0 => None,
+        s => Some(s),
+    }
+}
+
+/// The release profile aborts on panic, so no destructor runs and the guard
+/// below never gets its chance: the terminal would be left raw, reporting mouse
+/// movements as garbage, with the panic message drawn onto the alternate screen
+/// and then thrown away with it. The hook puts the terminal back first and only
+/// then lets the default hook print, so the message lands in the scrollback
+/// where it can be read and reported.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_now();
+            previous(info);
+        }));
+    });
+}
+
+/// Put the terminal back from wherever we are. Opens its own handle rather than
+/// borrowing the session's, which a panicking thread may have been halfway
+/// through writing to.
+fn restore_now() {
+    if !TAKEN.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut out = Screen::open(KEEP_STDOUT_CLEAN.load(Ordering::SeqCst));
+    restore(&mut out, MOUSE.load(Ordering::SeqCst));
+}
+
+/// Every step, each attempted whatever the one before it did, and every error
+/// ignored: this runs on the way out of a panic or a signal, where there is
+/// nobody left to report a failure to, and a terminal with raw mode off but the
+/// alternate screen still up is barely better than one with neither undone.
+fn restore(out: &mut impl io::Write, mouse: bool) {
+    let _ = disable_raw_mode();
+    if mouse {
+        let _ = execute!(out, DisableMouseCapture);
+    }
+    let _ = execute!(out, LeaveAlternateScreen, Show);
+}
+
+/// The terminal, taken over, and given back on every way out.
+///
+/// Dropping it is the normal path — an error return, an early `?`, the end of
+/// the session. The panic hook covers a panic, which under `panic = "abort"`
+/// never unwinds as far as a destructor, and the signal flag covers being
+/// killed. All three go through `restore`, and `TAKEN` stops two of them both
+/// doing it.
+struct Session {
+    terminal: Term,
+    mouse: bool,
+}
+
+impl Session {
+    fn enter(mouse: bool, keep_stdout_clean: bool) -> io::Result<Session> {
+        install_panic_hook();
+        install_signal_handlers();
+        MOUSE.store(mouse, Ordering::SeqCst);
+        KEEP_STDOUT_CLEAN.store(keep_stdout_clean, Ordering::SeqCst);
+
+        enable_raw_mode()?;
+        // From here on a failure has something to undo. Marked before the
+        // alternate screen goes up, so a terminal that refuses it is still
+        // taken out of raw mode: raw and nothing else is still a broken shell.
+        TAKEN.store(true, Ordering::SeqCst);
+        let mut out = Screen::open(keep_stdout_clean);
+        let entered = execute!(out, EnterAlternateScreen).and_then(|()| {
+            if mouse { execute!(out, EnableMouseCapture) } else { Ok(()) }
+        });
+        if let Err(e) = entered {
+            restore_now();
+            return Err(e);
+        }
+        match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out)) {
+            Ok(terminal) => Ok(Session { terminal, mouse }),
+            Err(e) => {
+                restore_now();
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Session {
+    /// Hand the terminal to another full-screen program, and take it back.
+    ///
+    /// Leaves the alternate screen rather than drawing over it, so the child
+    /// starts on the user's own screen and whatever it leaves there is not
+    /// mixed into ours. `TAKEN` is down for the duration: a panic while the
+    /// child runs must not try to restore a terminal that is the child's.
+    fn suspend<T>(&mut self, f: impl FnOnce() -> T) -> io::Result<T> {
+        TAKEN.store(false, Ordering::SeqCst);
+        restore(self.terminal.backend_mut(), self.mouse);
+        let out = f();
+        enable_raw_mode()?;
+        TAKEN.store(true, Ordering::SeqCst);
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen, Clear(ClearType::All))?;
+        if self.mouse {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)?;
+        }
+        // Ratatui only ever sends what changed since its last frame, and its
+        // last frame is no longer what is on the screen: without this the next
+        // draw paints a few changed cells onto a blank page. An empty frame
+        // makes its idea of the screen blank too, so the next one is drawn in
+        // full. Not `Terminal::clear`, which asks the terminal where its cursor
+        // is and ends the session if the answer is slow to come back.
+        self.terminal.draw(|_| {})?;
+        Ok(out)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if TAKEN.swap(false, Ordering::SeqCst) {
+            restore(self.terminal.backend_mut(), self.mouse);
+        }
+    }
+}
+
 pub fn run(mut app: App, keep_stdout_clean: bool) -> io::Result<Outcome> {
-    let mouse = app.mouse;
-    let mut terminal = enter(mouse, keep_stdout_clean)?;
-    let result = event_loop(&mut terminal, &mut app);
+    let mut session = Session::enter(app.mouse, keep_stdout_clean)?;
+    let result = event_loop(&mut session, &mut app);
     // Restore the terminal first: whatever went wrong, the user should not be
     // left staring at a broken shell.
-    leave(&mut terminal, mouse)?;
+    drop(session);
+    if let Some(sig) = take_signal() {
+        // The conventional status for "killed by this signal", which is what a
+        // shell or a supervisor checks for. Nothing is saved and nothing is
+        // printed: a session that was told to stop has no answer to give.
+        std::process::exit(128 + sig);
+    }
     result?;
     let selected = app.selected().map(|id| app.tree.path(id));
     Ok(Outcome { tree: app.tree_is_complete().then_some(app.tree), selected })
 }
 
-fn enter(mouse: bool, keep_stdout_clean: bool) -> io::Result<Term> {
-    enable_raw_mode()?;
-    let mut out = Screen::open(keep_stdout_clean);
-    execute!(out, EnterAlternateScreen)?;
-    if mouse {
-        execute!(out, EnableMouseCapture)?;
-    }
-    let backend = ratatui::backend::CrosstermBackend::new(out);
-    let terminal = ratatui::Terminal::new(backend)?;
-    Ok(terminal)
-}
-
-fn leave(terminal: &mut Term, mouse: bool) -> io::Result<()> {
-    disable_raw_mode()?;
-    if mouse {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
-}
-
-fn event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
+fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
     let mut last_draw = Instant::now() - SCAN_TICK;
     loop {
+        // Left set for `run` to find: the flag is all a handler could do, and
+        // the restoring happens on the way out.
+        if SIGNAL.load(Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
+
         app.poll_scan();
         app.poll_job();
         app.poll_dupes();
@@ -124,20 +286,41 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
         let tick = if app.scanning() { SCAN_TICK } else { IDLE_TICK };
         if last_draw.elapsed() >= tick {
             app.rebuild_rows();
-            terminal.draw(|f| ui::draw(f, app))?;
+            session.terminal.draw(|f| ui::draw(f, app))?;
             last_draw = Instant::now();
         }
 
-        if event::poll(tick)? {
-            match event::read()? {
+        let ready = match event::poll(tick) {
+            Ok(ready) => ready,
+            // A signal arriving mid-poll; the check at the top of the loop is
+            // what deals with it.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if ready {
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let effect = match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
-                Event::Mouse(m) => on_mouse(app, m),
-                Event::Resize(_, _) => app.mark_dirty(),
-                _ => {}
+                Event::Mouse(m) => {
+                    on_mouse(app, m);
+                    None
+                }
+                Event::Resize(_, _) => {
+                    app.mark_dirty();
+                    None
+                }
+                _ => None,
+            };
+            if let Some(Effect::Edit(path)) = effect {
+                edit(session, app, &path)?;
             }
             // Respond to input immediately rather than at the next tick.
             app.rebuild_rows();
-            terminal.draw(|f| ui::draw(f, app))?;
+            session.terminal.draw(|f| ui::draw(f, app))?;
             last_draw = Instant::now();
         }
 
@@ -147,28 +330,60 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
     }
 }
 
-fn on_key(app: &mut App, k: KeyEvent) {
+/// What a key asks of the terminal itself, which the key handler cannot do: it
+/// sees the app and nothing else, and that is what keeps it testable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// Hand the terminal to the user's editor on this path, and take it back.
+    Edit(PathBuf),
+}
+
+/// One key, in whatever mode the app is in. Public so the tests can drive the
+/// real key handling rather than a copy of it.
+pub fn on_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
+    // Ctrl-c means "stop what I am doing" in every mode. At the top level that
+    // is quitting; inside a prompt or an overlay it is backing out of it —
+    // never typing a `c` into the filter or the search — and while a batch is
+    // going it is the same as esc there: stop after this item.
+    if k.code == KeyCode::Char('c')
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && app.mode != Mode::Normal
+    {
+        return on_key(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    }
     match app.mode {
         Mode::Filter => filter_key(app, k),
         Mode::Search => search_key(app, k),
-        Mode::Help => {
-            app.mode = Mode::Normal;
-            app.mark_dirty();
-        }
+        Mode::Help => help_key(app, k),
         Mode::Basket => basket_key(app, k),
         Mode::History => history_key(app, k),
         Mode::Omissions => omissions_key(app, k),
         Mode::Confirm => confirm_key(app, k),
         Mode::EmptyTrash => empty_key(app, k),
         Mode::Deleting => deleting_key(app, k),
-        Mode::Normal => normal_key(app, k),
+        Mode::Normal => return normal_key(app, k),
     }
+    None
 }
 
 /// Clicks and the wheel. A modal owns the screen while it is up, so the mouse
-/// does nothing there rather than quietly moving a selection underneath it.
-fn on_mouse(app: &mut App, m: MouseEvent) {
+/// never moves a selection underneath it — but the wheel does scroll a list
+/// inside it, which is what anyone turning it over a list expects.
+pub fn on_mouse(app: &mut App, m: MouseEvent) {
     if app.mode != Mode::Normal {
+        let code = match m.kind {
+            MouseEventKind::ScrollDown => KeyCode::Down,
+            MouseEventKind::ScrollUp => KeyCode::Up,
+            _ => return,
+        };
+        if matches!(
+            app.mode,
+            Mode::Basket | Mode::History | Mode::Omissions | Mode::Search | Mode::Help
+        ) {
+            for _ in 0..3 {
+                on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+            }
+        }
         return;
     }
     match m.kind {
@@ -205,7 +420,7 @@ fn click(app: &mut App, column: u16, row: u16) {
     let x = column - list.x;
     if x == 0 {
         toggle_stage(app);
-    } else if x == 1 + 2 * r.depth {
+    } else if x as usize == 1 + ui::row_indent(r.depth, list.width as usize) {
         // Clicking the arrow toggles, rather than stepping in the way `l` does
         // on an already-open row: a second click in the same place undoing the
         // first is the only behaviour a pointer can have.
@@ -218,6 +433,26 @@ fn click(app: &mut App, column: u16, row: u16) {
         };
         if open { collapse(app) } else { expand(app) }
     }
+}
+
+/// The help overlay scrolls — it is longer than a short terminal — and any key
+/// that is not scrolling closes it, as it always did. The draw clamps the
+/// offset, since only it knows how many lines the text wrapped to.
+fn help_key(app: &mut App, k: KeyEvent) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let scroll = &mut app.ui.help_scroll;
+    match k.code {
+        KeyCode::Char('j') | KeyCode::Down => *scroll += 1,
+        KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+        KeyCode::PageDown => *scroll += 10,
+        KeyCode::Char('d') if ctrl => *scroll += 10,
+        KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+        KeyCode::Char('u') if ctrl => *scroll = scroll.saturating_sub(10),
+        KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => *scroll = usize::MAX,
+        _ => app.mode = Mode::Normal,
+    }
+    app.mark_dirty();
 }
 
 /// The journal. `u` reaches the top of the stack; this reaches the rest of it.
@@ -247,7 +482,7 @@ fn restore_selected(app: &mut App) {
     app.refresh_history();
     app.mode = Mode::Normal;
     app.status = Some(match outcome {
-        Ok(r) => undo_message(&r),
+        Ok(r) => undo_message(app, &r),
         Err(e) => e,
     });
 }
@@ -324,7 +559,10 @@ fn basket_key(app: &mut App, k: KeyEvent) {
             app.mode = Mode::Normal;
             app.status = Some("batch cleared".into());
         }
-        KeyCode::Enter | KeyCode::Char('y') => app.open_confirm(),
+        // Enter only. `y` copies a path everywhere else, and it is also what
+        // commits on the next screen — so with it here, `y y` from the basket
+        // deleted the batch with no screen read in between.
+        KeyCode::Enter => app.open_confirm(),
         _ => {}
     }
     app.mark_dirty();
@@ -368,9 +606,16 @@ fn empty_key(app: &mut App, k: KeyEvent) {
 
 fn deleting_key(app: &mut App, k: KeyEvent) {
     // Both halves, or the modal closes while a removal is still running.
-    if app.batch_finished() && matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
-        app.finish_job();
+    if app.batch_finished() {
+        if matches!(k.code, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
+            app.finish_job();
+        }
+    } else if k.code == KeyCode::Esc {
+        // Stops after the item in hand rather than closing the modal: what has
+        // already gone is gone, and the screen that says so has to stay up.
+        app.cancel_deleting();
     }
+    app.mark_dirty();
 }
 
 fn filter_key(app: &mut App, k: KeyEvent) {
@@ -383,6 +628,8 @@ fn filter_key(app: &mut App, k: KeyEvent) {
         KeyCode::Backspace => {
             app.filter.pop();
         }
+        // Any other chord is a command the prompt does not have, not a letter.
+        KeyCode::Char(_) if k.modifiers.contains(KeyModifiers::CONTROL) => return,
         KeyCode::Char(c) => app.filter.push(c),
         _ => return,
     }
@@ -419,6 +666,7 @@ fn search_key(app: &mut App, k: KeyEvent) {
             app.search.pop();
             app.run_search();
         }
+        KeyCode::Char(_) if ctrl => return,
         KeyCode::Char(c) => {
             app.search.push(c);
             app.run_search();
@@ -428,12 +676,24 @@ fn search_key(app: &mut App, k: KeyEvent) {
     app.mark_dirty();
 }
 
-fn normal_key(app: &mut App, k: KeyEvent) {
+fn normal_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
+    let mut effect = None;
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     app.status = None;
+    // The key after "N staged items will be forgotten" answers that and does
+    // nothing else: a stray `space` meant as "no" should not also unstage
+    // something.
+    if std::mem::take(&mut app.ui.quit_armed) {
+        if k.code == KeyCode::Char('q') || (ctrl && k.code == KeyCode::Char('c')) {
+            app.should_quit = true;
+        }
+        app.mark_dirty();
+        return None;
+    }
     match k.code {
-        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('c') if ctrl => app.should_quit = true,
+        KeyCode::Char('q') => request_quit(app),
+        KeyCode::Char('c') if ctrl => request_quit(app),
+        KeyCode::Esc => back_out(app),
 
         KeyCode::Char('j') | KeyCode::Down => move_cursor(app, 1),
         KeyCode::Char('k') | KeyCode::Up => move_cursor(app, -1),
@@ -449,10 +709,10 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('A') => stage_children(app),
         KeyCode::Char('L') => share_storage(app),
 
-        KeyCode::Char('/') => {
-            app.mode = Mode::Filter;
-            app.filter.clear();
-        }
+        // A kept filter comes back into the prompt to be refined, not thrown
+        // away: the usual reason to press `/` again is that the first query
+        // was nearly right.
+        KeyCode::Char('/') => app.mode = Mode::Filter,
         // The other question: not "narrow what I am looking at" but "where in
         // all of this is the thing called that".
         KeyCode::Char('f') => {
@@ -491,7 +751,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             app.status = Some(format!("showing {}", app.age_filter.label()));
         }
         KeyCode::Char('o') => reveal(app),
-        KeyCode::Char('e') => open_editor(app),
+        KeyCode::Char('e') => effect = editor_target(app).map(Effect::Edit),
         KeyCode::Char('y') => copy_path(app),
         KeyCode::Char('i') => ignore_selected(app),
         // The banners say how many; this says which, and what would fix each.
@@ -510,10 +770,48 @@ fn normal_key(app: &mut App, k: KeyEvent) {
                 rescan(app)
             }
         }
-        KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('?') => {
+            app.ui.help_scroll = 0;
+            app.mode = Mode::Help;
+        }
         _ => {}
     }
     app.mark_dirty();
+    effect
+}
+
+/// Quit, unless that would throw a batch away without a word. Staging can be
+/// ten minutes' work across three views, and `q` and `esc` are both one
+/// keystroke from it.
+fn request_quit(app: &mut App) {
+    let n = app.staged.len() + app.staged_tools.len();
+    if n == 0 {
+        app.should_quit = true;
+        return;
+    }
+    app.ui.quit_armed = true;
+    app.status = Some(format!(
+        "{n} staged item{} will be forgotten \u{2014} q again to quit",
+        if n == 1 { "" } else { "s" }
+    ));
+}
+
+/// Esc undoes one layer of what is narrowing the screen, innermost first, and
+/// only quits once there is nothing left to undo. It used to quit outright from
+/// anywhere, so the key everyone presses to back out of a filter or a view
+/// took the whole session with it.
+fn back_out(app: &mut App) {
+    if !app.filter.is_empty() {
+        app.filter.clear();
+        app.status = Some("filter cleared".into());
+    } else if app.view().is_some() {
+        app.show_view(None);
+    } else if app.age_filter != AgeFilter::All {
+        app.age_filter = AgeFilter::All;
+        app.status = Some(format!("showing {}", app.age_filter.label()));
+    } else {
+        request_quit(app);
+    }
 }
 
 fn reveal(app: &mut App) {
@@ -521,7 +819,7 @@ fn reveal(app: &mut App) {
         app.status = Some("this is not a file \u{2014} y copies the command that removes it".into());
         return;
     }
-    let Some(id) = app.selected() else { return };
+    let Some(id) = item_at_cursor(app) else { return };
     let path = app.tree.path(id);
     match crate::platform::reveal(&path) {
         Ok(msg) => app.status = Some(msg.into()),
@@ -529,26 +827,93 @@ fn reveal(app: &mut App) {
     }
 }
 
-fn open_editor(app: &mut App) {
-    let Some(id) = app.selected() else { return };
-    let path = app.tree.path(id);
-    let Some(editor) = std::env::var_os("EDITOR") else {
-        app.status = Some("$EDITOR is not set".into());
-        return;
-    };
-    // The TUI owns the terminal; handing it to a full-screen editor and taking
-    // it back cleanly is a bigger job than it looks, so open detached instead.
-    match std::process::Command::new(&editor).arg(&path).spawn() {
-        Ok(_) => app.status = Some(format!("opened in {}", editor.to_string_lossy())),
-        Err(e) => app.status = Some(format!("could not run $EDITOR: {e}")),
+/// The path `e` would open, if the cursor is on one.
+fn editor_target(app: &mut App) -> Option<PathBuf> {
+    if app.tool_at_cursor().is_some() {
+        app.status = Some("this is not a file \u{2014} y copies the command that removes it".into());
+        return None;
     }
+    let id = item_at_cursor(app)?;
+    Some(app.tree.path(id))
+}
+
+/// The tree node under the cursor, for a key that acts on exactly one item.
+///
+/// A group heading carries the id of the first item under it — which may be in
+/// a closed group, or hidden by a filter — so acting on "the selection" there
+/// silently acted on something the user could not see. `i` would write it to
+/// the ignore file. Every such key comes through here instead, and on a
+/// heading it says why it did nothing.
+fn item_at_cursor(app: &mut App) -> Option<crate::tree::NodeId> {
+    if app.rows.get(app.cursor).is_some_and(|r| r.header.is_some()) {
+        app.status = Some("that is a group heading \u{2014} pick an item under it".into());
+        return None;
+    }
+    app.selected()
+}
+
+/// The editor the user asked for, the way every other terminal program picks
+/// one: `$EDITOR`, then `$VISUAL`, then `vi`, which POSIX promises is there.
+fn editor() -> String {
+    ["EDITOR", "VISUAL"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find(|e| !e.trim().is_empty())
+        .unwrap_or_else(|| "vi".into())
+}
+
+/// Run the editor in the foreground, with the terminal handed over to it.
+///
+/// It used to be spawned detached on top of the running interface, which a
+/// terminal editor cannot survive — two programs drawing on one screen and both
+/// reading the keyboard. Now the session steps aside for the length of the
+/// edit, and comes back with a full redraw.
+///
+/// Through `sh` rather than exec'd directly, because `$EDITOR` is a command
+/// line and not a program name: `code -w` and `emacsclient -t` are both normal
+/// values, and only word splitting turns them into something runnable. The path
+/// goes in as `$1`, never spliced into the script, so nothing in a filename is
+/// ever read as shell.
+fn edit(session: &mut Session, app: &mut App, path: &std::path::Path) -> io::Result<()> {
+    let editor = editor();
+    let ran = session.suspend(|| {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("$EDITOR \"$1\"").arg("sh").arg(path).env("EDITOR", &editor);
+        // Under `--print-path` our stdout is a pipe into the shell's command
+        // substitution. The editor gets the terminal instead, or its screen
+        // would end up in the path the shell is about to `cd` to.
+        if KEEP_STDOUT_CLEAN.load(Ordering::SeqCst) {
+            let tty = || std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+            if let (Ok(i), Ok(o)) = (tty(), tty()) {
+                cmd.stdin(i).stdout(o);
+            }
+        }
+        cmd.status()
+    })?;
+    // A ctrl-c typed at an editor that leaves the terminal cooked reaches the
+    // whole foreground group, us included. It was the editor's, not ours.
+    let _ = SIGNAL.compare_exchange(libc::SIGINT, 0, Ordering::SeqCst, Ordering::SeqCst);
+    app.status = Some(match ran {
+        Ok(s) if s.success() => format!("back from {editor}"),
+        Ok(s) => match s.code() {
+            Some(code) => format!("{editor} exited with status {code}"),
+            None => format!("{editor} was killed by a signal"),
+        },
+        Err(e) => format!("could not run {editor}: {e}"),
+    });
+    app.mark_dirty();
+    Ok(())
 }
 
 /// Add the selection to the persistent ignore list. Deliberately the whole
 /// path rather than the name: ignoring `Caches` because of one of them would
 /// hide every other.
 fn ignore_selected(app: &mut App) {
-    let Some(id) = app.selected() else { return };
+    if app.tool_at_cursor().is_some() {
+        app.status = Some("the ignore list is for files and folders \u{2014} this lives inside a tool".into());
+        return;
+    }
+    let Some(id) = item_at_cursor(app) else { return };
     if id == app.tree.root() {
         app.status = Some("the scan root cannot be ignored".into());
         return;
@@ -580,7 +945,7 @@ fn copy_path(app: &mut App) {
             }
         };
     }
-    let Some(id) = app.selected() else { return };
+    let Some(id) = item_at_cursor(app) else { return };
     let path = app.tree.path(id);
     match crate::platform::copy_to_clipboard(&path.to_string_lossy()) {
         Ok(()) => app.status = Some("path copied".into()),
@@ -601,12 +966,12 @@ fn undo(app: &mut App) {
     let outcome = delete::undo_last();
     app.refresh_history();
     app.status = Some(match outcome {
-        Ok(r) => undo_message(&r),
+        Ok(r) => undo_message(app, &r),
         Err(e) => e,
     });
 }
 
-fn undo_message(r: &delete::UndoReport) -> String {
+fn undo_message(app: &App, r: &delete::UndoReport) -> String {
     if r.restored == 0 && r.skipped.is_empty() {
         return "nothing to undo".into();
     }
@@ -614,7 +979,13 @@ fn undo_message(r: &delete::UndoReport) -> String {
     if !r.skipped.is_empty() {
         msg.push_str(&format!(", {} could not be put back", r.skipped.len()));
     }
-    msg.push_str(" \u{2014} press R to rescan");
+    // In the tools view R asks Docker again and leaves the tree alone, which
+    // is exactly the wrong thing after putting files back.
+    msg.push_str(if app.tools_view {
+        " \u{2014} esc, then R to rescan"
+    } else {
+        " \u{2014} press R to rescan"
+    });
     msg
 }
 
@@ -706,17 +1077,17 @@ fn toggle_stage(app: &mut App) {
     }
     // A tool row is not a tree node, and the daemon's own answer decides
     // whether it can go at all.
-    if let Some(row) = app.rows.get(app.cursor).copied() {
-        if row.tool.is_some() {
-            let Some(r) = app.tool_of(&row) else { return };
-            if let Some(why) = r.blocked.clone() {
-                app.status = Some(format!("{} \u{2014} {why}", r.name));
-                return;
-            }
-            let key = r.key();
-            app.toggle_tool_stage(key);
+    if let Some(row) = app.rows.get(app.cursor).copied()
+        && row.tool.is_some()
+    {
+        let Some(r) = app.tool_of(&row) else { return };
+        if let Some(why) = r.blocked.clone() {
+            app.status = Some(format!("{} \u{2014} {why}", r.name));
             return;
         }
+        let key = r.key();
+        app.toggle_tool_stage(key);
+        return;
     }
     let Some(id) = app.selected() else { return };
     if id == app.tree.root() {
