@@ -338,7 +338,7 @@ fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
     let root = tree.root_path();
 
     let chosen = fad::reclaim::under_cap(
-        fad::reclaim::candidates(tree, args.apparent, args.min_size, &ignore),
+        fad::reclaim::auto_candidates(tree, args.apparent, args.min_size, &ignore),
         args.max,
     );
     let total: u64 = chosen.iter().map(|(_, b)| b).sum();

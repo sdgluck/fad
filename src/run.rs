@@ -476,9 +476,10 @@ fn restore_selected(app: &mut App) {
     if app.history.is_empty() {
         return;
     }
-    // `history` is newest first; the journal is oldest first.
-    let index = app.history.len() - 1 - app.history_cursor;
-    let outcome = delete::undo_batch(index);
+    // By id, not position: the list on screen can be stale by the time the key
+    // lands, and an index into it would name a different batch.
+    let Some(id) = app.history.get(app.history_cursor).map(|b| b.id) else { return };
+    let outcome = delete::undo_batch(id);
     app.refresh_history();
     app.mode = Mode::Normal;
     app.status = Some(match outcome {

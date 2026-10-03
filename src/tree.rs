@@ -233,11 +233,19 @@ impl Tree {
         let siblings: std::collections::HashSet<&str> =
             batch.entries.iter().map(|e| e.name.as_ref()).collect();
         let parent_name = self.nodes[parent as usize].name.clone();
+        let parent_path = self.path(parent);
         let presets: Vec<Option<Category>> = batch
             .entries
             .iter()
             .map(|e| {
-                presets::classify(&e.name, e.meta.is_dir(), e.meta.len, &parent_name, &siblings)
+                presets::classify(
+                    &e.name,
+                    e.meta.is_dir(),
+                    e.meta.len,
+                    &parent_name,
+                    &parent_path,
+                    &siblings,
+                )
             })
             .collect();
 
@@ -507,7 +515,7 @@ impl Tree {
             .iter()
             .map(|c| self.node(*c).name.as_ref())
             .collect();
-        presets::rebuild_command(&self.node(id).name, &siblings)
+        presets::rebuild_command(&self.node(id).name, &self.path(parent), &siblings)
     }
 
     /// The subtree size to report: allocated blocks, or `st_size` under

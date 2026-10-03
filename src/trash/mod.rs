@@ -14,7 +14,7 @@ pub use macos::trash;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod freedesktop;
 #[cfg(all(unix, not(target_os = "macos")))]
-pub use freedesktop::trash;
+pub use freedesktop::{trash, trash_in_topdir};
 
 #[cfg(not(unix))]
 pub fn trash(_path: &Path) -> io::Result<std::path::PathBuf> {
@@ -24,16 +24,95 @@ pub fn trash(_path: &Path) -> io::Result<std::path::PathBuf> {
 /// Undo the move. On platforms that leave metadata beside the trashed file,
 /// this cleans that up too, so the item does not linger as a phantom entry in
 /// the desktop's trash UI.
+///
+/// Never over the top of something: a plain `rename` replaces whatever is at
+/// `to`, and checking first leaves a gap for something to arrive in. The
+/// check and the move are one step here.
 pub fn restore(from_trash: &Path, to: &Path) -> io::Result<()> {
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::rename(from_trash, to)?;
+    rename_no_replace(from_trash, to)?;
 
     #[cfg(all(unix, not(target_os = "macos")))]
     freedesktop::forget(from_trash);
 
     Ok(())
+}
+
+/// `rename`, failing with `AlreadyExists` instead of replacing anything —
+/// including a dangling symlink, which `Path::exists` calls absent.
+///
+/// `renamex_np(RENAME_EXCL)` on macOS and `renameat2(RENAME_NOREPLACE)` on
+/// Linux do this atomically. Filesystems that do not support the flag (FAT,
+/// some network mounts, kernels before 3.15) say so with `EINVAL`, `ENOSYS` or
+/// `ENOTSUP`, and only then is it a check followed by a rename — the best that
+/// can be done there, and no worse than before.
+pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match rename_excl(from, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => Err(occupied()),
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP)
+            ) =>
+        {
+            if to.symlink_metadata().is_ok() {
+                return Err(occupied());
+            }
+            std::fs::rename(from, to)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn occupied() -> io::Error {
+    io::Error::new(io::ErrorKind::AlreadyExists, "something is there now")
+}
+
+#[cfg(unix)]
+fn cpath(p: &Path) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(p.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::other("path contains a NUL byte"))
+}
+
+#[cfg(target_os = "macos")]
+fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
+    let (f, t) = (cpath(from)?, cpath(to)?);
+    // SAFETY: two NUL-terminated paths, neither retained.
+    if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn rename_excl(from: &Path, to: &Path) -> io::Result<()> {
+    // Through `syscall` rather than glibc's wrapper, which only arrived in
+    // 2.28 and would otherwise be a link failure on older systems.
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let (f, t) = (cpath(from)?, cpath(to)?);
+    // SAFETY: two NUL-terminated paths, neither retained.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_excl(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOSYS))
 }
 
 /// Is this somewhere a trashed item could legitimately be sitting?

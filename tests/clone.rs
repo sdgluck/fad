@@ -8,6 +8,14 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use fad::clone::{self, Refusal};
+use fad::dupes::Identity;
+
+/// Share `other`'s storage with `keep`, as the duplicate view would straight
+/// after hashing: with both files' identities taken now.
+fn share_now(keep: &std::path::Path, other: &std::path::Path) -> Result<u64, Refusal> {
+    let (k, o) = (Identity::of(keep).unwrap(), Identity::of(other).unwrap());
+    clone::share(keep, &k, other, &o)
+}
 
 /// Skip the body when the filesystem underneath the temporary directory has no
 /// clone operation — ext4, HFS+, a container's overlayfs. There is nothing to
@@ -52,7 +60,7 @@ fn a_clone_keeps_the_file_and_gives_the_space_back() {
     let (mode, mtime) = (before.mode() & 0o7777, before.mtime());
     let mtime_nsec = before.mtime_nsec();
 
-    needs_clones!(clone::share(&keep, &other, 8 << 20)).expect("clone failed");
+    needs_clones!(share_now(&keep, &other)).expect("clone failed");
 
     // The whole point: the path still works and holds what it held.
     let content = std::fs::read(&other).unwrap();
@@ -84,24 +92,84 @@ fn a_plain_copy_is_not_reported_as_shared() {
     assert!(!clone::already_shared(&a, &b), "two separate copies reported as shared");
 }
 
-/// The evidence that the contents are identical was gathered some time ago. If
-/// either file has moved on since, the clone must not happen: it would replace
-/// one file's contents with another's.
+/// Two files of different sizes cannot be the same bytes, whatever the caller
+/// thinks it proved.
 #[test]
-fn a_file_that_changed_since_it_was_hashed_is_refused() {
+fn a_mismatched_pair_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let keep = dir.path().join("keep.bin");
     let other = dir.path().join("other.bin");
     write(&keep, 0x22, 1 << 20);
     write(&other, 0x33, 2 << 20);
 
-    let err = clone::share(&keep, &other, 1 << 20).expect_err("cloned a mismatched pair");
+    let err = share_now(&keep, &other).expect_err("cloned a mismatched pair");
+    assert!(matches!(err, Refusal::Refused(_)), "wrong refusal: {err}");
+    // And it left the destination exactly as it found it.
+    assert_eq!(std::fs::metadata(&other).unwrap().len(), 2 << 20);
+}
+
+/// Overwrite `path` in place with `byte`, keeping its length — the commonest
+/// edit there is, and the one a length check cannot see.
+fn edit_in_place(path: &std::path::Path, byte: u8) {
+    use std::io::Write;
+    let len = std::fs::metadata(path).unwrap().len() as usize;
+    let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.write_all(&vec![byte; len]).unwrap();
+    f.sync_all().unwrap();
+}
+
+/// The evidence that the contents are identical was gathered some time ago. A
+/// same-size edit since then used to pass the only check there was — the
+/// length — and the rename then replaced the edited file with a clone of the
+/// other one: the edit gone, silently, with "freed" printed over it.
+#[test]
+fn a_same_size_edit_since_hashing_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x22, 1 << 20);
+    let (k, o) = (Identity::of(&keep).unwrap(), Identity::of(&other).unwrap());
+
+    edit_in_place(&other, 0x99);
+
+    let err = clone::share(&keep, &k, &other, &o).expect_err("cloned over an edited file");
     assert!(
         matches!(err, Refusal::Refused(ref why) if why.contains("changed")),
         "wrong refusal: {err}"
     );
-    // And it left the destination exactly as it found it.
-    assert_eq!(std::fs::metadata(&other).unwrap().len(), 2 << 20);
+    let content = std::fs::read(&other).unwrap();
+    assert!(content.iter().all(|b| *b == 0x99), "the edit was lost");
+
+    // The kept side counts too: cloning from a source that moved on would put
+    // its new contents under the other name.
+    let (keep2, other2) = (dir.path().join("k2.bin"), dir.path().join("o2.bin"));
+    write(&keep2, 0x10, 1 << 20);
+    write(&other2, 0x10, 1 << 20);
+    let (k, o) = (Identity::of(&keep2).unwrap(), Identity::of(&other2).unwrap());
+    edit_in_place(&keep2, 0x11);
+    assert!(clone::share(&keep2, &k, &other2, &o).is_err(), "cloned from an edited source");
+    assert!(std::fs::read(&other2).unwrap().iter().all(|b| *b == 0x10));
+}
+
+/// A write that puts the old modification time back afterwards — `touch -r`,
+/// `rsync -t`, an editor preserving timestamps — leaves `mtime` and the length
+/// exactly as they were. `ctime` is the one thing it cannot put back.
+#[test]
+fn an_edit_that_restored_its_mtime_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x22, 1 << 20);
+    let (k, o) = (Identity::of(&keep).unwrap(), Identity::of(&other).unwrap());
+
+    edit_in_place(&other, 0x77);
+    let was = libc::timespec { tv_sec: o.mtime as libc::time_t, tv_nsec: o.mtime_nsec as libc::c_long };
+    let times = [was, was];
+    let c = std::ffi::CString::new(other.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path and a two-element array, neither retained.
+    assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) }, 0);
+    let now = std::fs::metadata(&other).unwrap();
+    assert_eq!((now.mtime(), now.mtime_nsec(), now.len()), (o.mtime, o.mtime_nsec, o.len));
+
+    let err = clone::share(&keep, &k, &other, &o).expect_err("cloned over a disguised edit");
+    assert!(matches!(err, Refusal::Refused(_)), "wrong refusal: {err}");
+    assert!(std::fs::read(&other).unwrap().iter().all(|b| *b == 0x77), "the edit was lost");
 }
 
 /// Cloning something onto itself would be a long way to delete a file.
@@ -111,7 +179,7 @@ fn a_file_is_not_cloned_onto_itself() {
     let only = dir.path().join("only.bin");
     write(&only, 0x44, 1 << 20);
 
-    let err = clone::share(&only, &only, 1 << 20).expect_err("cloned a file onto itself");
+    let err = share_now(&only, &only).expect_err("cloned a file onto itself");
     assert!(matches!(err, Refusal::Refused(_)), "wrong refusal: {err}");
     assert_eq!(std::fs::metadata(&only).unwrap().len(), 1 << 20);
 }
@@ -123,8 +191,8 @@ fn an_already_shared_pair_is_refused_rather_than_redone() {
     let dir = tempfile::tempdir().unwrap();
     let (keep, other) = two_copies(dir.path(), 0x55, 2 << 20);
 
-    needs_clones!(clone::share(&keep, &other, 2 << 20)).expect("clone failed");
-    let err = clone::share(&keep, &other, 2 << 20).expect_err("cloned an already shared pair");
+    needs_clones!(share_now(&keep, &other)).expect("clone failed");
+    let err = share_now(&keep, &other).expect_err("cloned an already shared pair");
     assert!(
         matches!(err, Refusal::Refused(ref why) if why.contains("sharing")),
         "wrong refusal: {err}"
@@ -138,7 +206,7 @@ fn nothing_is_left_behind() {
     let dir = tempfile::tempdir().unwrap();
     let (keep, other) = two_copies(dir.path(), 0x66, 1 << 20);
 
-    needs_clones!(clone::share(&keep, &other, 1 << 20)).expect("clone failed");
+    needs_clones!(share_now(&keep, &other)).expect("clone failed");
 
     let leftovers: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -147,4 +215,89 @@ fn nothing_is_left_behind() {
         .filter(|n| n.starts_with(".fad-clone-"))
         .collect();
     assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+}
+
+/// Set an extended attribute, or `false` where the filesystem has none.
+fn set_xattr(path: &std::path::Path, name: &str, value: &[u8]) -> bool {
+    let p = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let n = std::ffi::CString::new(name).unwrap();
+    // SAFETY: NUL-terminated strings and a buffer of the length passed.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) };
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+    rc == 0
+}
+
+fn get_xattr(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    let p = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let n = std::ffi::CString::new(name).unwrap();
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: NUL-terminated strings and a buffer of the length passed.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    (rc >= 0).then(|| {
+        buf.truncate(rc as usize);
+        buf
+    })
+}
+
+/// `clonefile` copies the source's extended attributes along with its data.
+/// Renamed over the destination, that swapped the destination's Finder tags,
+/// resource fork or `user.*` notes for the other copy's. The destination has
+/// to come out of it with its own.
+#[test]
+fn the_destination_keeps_its_own_extended_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x5A, 1 << 20);
+    if !set_xattr(&keep, "user.fad.keep", b"from the kept copy")
+        || !set_xattr(&other, "user.fad.other", b"the destination's own")
+    {
+        eprintln!("skipped: this filesystem has no extended attributes");
+        return;
+    }
+
+    needs_clones!(share_now(&keep, &other)).expect("clone failed");
+
+    assert_eq!(
+        get_xattr(&other, "user.fad.other").as_deref(),
+        Some(&b"the destination's own"[..]),
+        "the destination lost its own attribute"
+    );
+    assert_eq!(get_xattr(&other, "user.fad.keep"), None, "the source's attribute came across");
+    // And the kept file is untouched.
+    assert!(get_xattr(&keep, "user.fad.keep").is_some());
+}
+
+/// Replacing one name of a hard-linked file frees nothing — the other name
+/// keeps the blocks — and it splits the link, so writes through the other
+/// name stop showing up under this one.
+#[test]
+fn a_hard_linked_destination_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x3C, 1 << 20);
+    let twin = dir.path().join("twin.bin");
+    std::fs::hard_link(&other, &twin).unwrap();
+
+    let err = share_now(&keep, &other).expect_err("split a hard link");
+    assert!(
+        matches!(err, Refusal::Refused(ref why) if why.contains("hard link")),
+        "wrong refusal: {err}"
+    );
+    assert_eq!(std::fs::metadata(&other).unwrap().ino(), std::fs::metadata(&twin).unwrap().ino());
+}
+
+/// The "freed" figure is what the replaced inode had allocated when it went,
+/// not a size from the scan.
+#[test]
+fn a_share_reports_what_it_actually_freed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x7E, 4 << 20);
+    let allocated = std::fs::metadata(&other).unwrap().blocks() * 512;
+    assert!(allocated > 0);
+
+    let freed = needs_clones!(share_now(&keep, &other)).expect("clone failed");
+    assert_eq!(freed, allocated);
 }

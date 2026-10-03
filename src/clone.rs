@@ -24,6 +24,15 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::dupes::Identity;
+
+/// Up to this size, the two files are compared byte for byte once more before
+/// one replaces the other. The identity check already says neither has been
+/// touched; this is the belt to its braces, on a filesystem that does not keep
+/// `ctime` honestly (a FUSE mount, an SMB share) and for the price of a read
+/// that is quick at this size. Larger pairs rely on the identity alone.
+const RECHECK_LIMIT: u64 = 32 << 20;
+
 /// Why a clone did not happen.
 #[derive(Debug)]
 pub enum Refusal {
@@ -137,11 +146,25 @@ pub fn already_shared(a: &Path, b: &Path) -> bool {
 /// Replace `dst` with a copy-on-write clone of `src`, freeing what `dst`'s own
 /// bytes were costing.
 ///
-/// The caller has to have proved the two files hold identical contents. This
-/// checks everything else: that they are both plain files on the same
-/// filesystem, that neither has changed size since it was hashed, that they are
-/// not the same file, and that they are not already sharing.
-pub fn share(src: &Path, dst: &Path, expect_bytes: u64) -> Result<(), Refusal> {
+/// The caller has to have proved the two files hold identical contents, and
+/// hands over what each file was at the moment it was read (`dupes::Group`
+/// keeps these). This checks everything else: that both are still exactly
+/// those files — same inode, same length, same `mtime` and `ctime` to the
+/// nanosecond — that they are plain files on the same filesystem, that they
+/// are not the same file, and that they are not already sharing.
+///
+/// The identity is checked twice: before anything is built, and again after
+/// the clone exists and just before it is renamed into place. A write to the
+/// source while `clonefile` runs would otherwise be captured into the clone,
+/// and a write to the destination would be thrown away by the rename.
+///
+/// Returns the bytes given back to the volume: what the destination's own
+/// inode had allocated at the moment it was replaced. That is the figure the
+/// rename releases, not the scan's figure from however long ago — and it is
+/// still an upper bound, because a destination that was itself already a
+/// clone of some third file shared those blocks with it, and the filesystem
+/// will not say so.
+pub fn share(src: &Path, src_was: &Identity, dst: &Path, dst_was: &Identity) -> Result<u64, Refusal> {
     use std::os::unix::fs::MetadataExt;
 
     let sm = std::fs::symlink_metadata(src).map_err(Refusal::Failed)?;
@@ -149,33 +172,103 @@ pub fn share(src: &Path, dst: &Path, expect_bytes: u64) -> Result<(), Refusal> {
     if !sm.is_file() || !dm.is_file() {
         return Err(Refusal::Refused("not both plain files".into()));
     }
-    // The contents were proved equal at some point in the past, and this is the
-    // cheapest evidence available that neither has moved on since.
-    if sm.len() != expect_bytes || dm.len() != expect_bytes {
-        return Err(Refusal::Refused("one of them changed since it was hashed".into()));
+    if sm.dev() == dm.dev() && sm.ino() == dm.ino() {
+        return Err(Refusal::Refused("already the same file".into()));
+    }
+    // The contents were proved equal at some point in the past. Length alone
+    // is no evidence that neither has moved on since — an edit in place that
+    // keeps the size is the commonest edit there is, and the rename below
+    // would destroy it without a trace.
+    unchanged(&sm, src_was, &dm, dst_was)?;
+    if src_was.len != dst_was.len {
+        return Err(Refusal::Refused("they are not the same size".into()));
     }
     if sm.dev() != dm.dev() {
         return Err(Refusal::Refused("they are on different filesystems".into()));
     }
-    if sm.ino() == dm.ino() {
-        return Err(Refusal::Refused("already the same file".into()));
+    // Replacing one name of a multiply-linked file frees nothing — the other
+    // names keep the inode and its blocks alive — and it quietly splits the
+    // link, so writes through the other names stop showing up here.
+    if dm.nlink() > 1 {
+        return Err(Refusal::Refused(
+            "it has other hard links, so replacing it would free nothing".into(),
+        ));
     }
     if already_shared(src, dst) {
         return Err(Refusal::Refused("already sharing their storage".into()));
     }
+    if dm.len() <= RECHECK_LIMIT && !same_contents(src, dst).map_err(Refusal::Failed)? {
+        return Err(Refusal::Refused("their contents no longer match".into()));
+    }
 
+    let freed = dm.blocks() * 512;
     let tmp = temp_beside(dst)?;
     let result = build_clone(src, &tmp).and_then(|()| {
-        // The destination keeps its own permissions and its own modification
-        // time. Only where the bytes live is different, and nothing that looks
-        // at the file has any business noticing.
+        // The destination keeps its own extended attributes — Finder tags,
+        // a resource fork, quarantine, `user.*` — not the source's, which
+        // `clonefile` copies across with the data.
+        carry_xattrs(dst, &tmp)?;
+        // And its own permissions and its own modification time. Only where
+        // the bytes live is different, and nothing that looks at the file has
+        // any business noticing.
         carry_over(&dm, &tmp)?;
+        // The last look before the point of no return. Anything that wrote to
+        // either file while the clone was being built shows up here as a moved
+        // `ctime`.
+        let sm = std::fs::symlink_metadata(src).map_err(Refusal::Failed)?;
+        let dm = std::fs::symlink_metadata(dst).map_err(Refusal::Failed)?;
+        unchanged(&sm, src_was, &dm, dst_was)?;
         std::fs::rename(&tmp, dst).map_err(Refusal::Failed)
     });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result
+    result.map(|()| freed)
+}
+
+/// Both files still exactly what they were when they were hashed.
+fn unchanged(
+    sm: &std::fs::Metadata,
+    src_was: &Identity,
+    dm: &std::fs::Metadata,
+    dst_was: &Identity,
+) -> Result<(), Refusal> {
+    if Identity::from_meta(sm) != *src_was || Identity::from_meta(dm) != *dst_was {
+        return Err(Refusal::Refused("one of them changed since it was hashed".into()));
+    }
+    Ok(())
+}
+
+/// Byte-for-byte equality, read in step so a mismatch near the start costs
+/// almost nothing.
+fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = read_full(&mut fa, &mut ba)?;
+        let m = read_full(&mut fb, &mut bb)?;
+        if n != m || ba[..n] != bb[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// `read` until the buffer is full or the file ends, so the two sides of
+/// `same_contents` are always compared in equal-sized pieces.
+fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read;
+
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 /// A name beside the destination, so the clone lands on the right filesystem
@@ -283,6 +376,200 @@ fn carry_over(dm: &std::fs::Metadata, tmp: &Path) -> Result<(), Refusal> {
         return Err(Refusal::Failed(io::Error::last_os_error()));
     }
     Ok(())
+}
+
+/// Make the clone's extended attributes exactly the destination's own.
+///
+/// `clonefile` copies the *source's* attributes across with its data, and
+/// `FICLONE` copies none at all; either way the rename would have swapped the
+/// destination's Finder tags, resource fork, quarantine flag or `user.*` notes
+/// for someone else's, or for nothing. The attributes are what a file *is* to
+/// the user as much as its bytes are, and "only where the bytes live changes"
+/// is the promise this module makes.
+///
+/// Strip what the clone brought that the destination does not have, write
+/// what the destination has that the clone lacks, then read the result back.
+/// If it still does not match — a `security.*` label the user may not set, an
+/// attribute the filesystem refuses — the share is refused rather than done
+/// with the wrong metadata.
+fn carry_xattrs(dst: &Path, tmp: &Path) -> Result<(), Refusal> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let want = xattr::list(dst).map_err(Refusal::Failed)?;
+    let have = xattr::list(tmp).map_err(Refusal::Failed)?;
+    if xattr::same(&want, &have) {
+        return Ok(());
+    }
+    // The clone carries the source's mode, which may be read-only, and writing
+    // an attribute needs write access. `carry_over` sets the real mode after.
+    std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600))
+        .map_err(Refusal::Failed)?;
+    for (name, _) in &have {
+        if !want.iter().any(|(n, _)| n == name) {
+            let _ = xattr::remove(tmp, name);
+        }
+    }
+    for (name, value) in &want {
+        if !have.iter().any(|(n, v)| n == name && v == value) {
+            let _ = xattr::set(tmp, name, value);
+        }
+    }
+    if !xattr::same(&want, &xattr::list(tmp).map_err(Refusal::Failed)?) {
+        return Err(Refusal::Refused(
+            "its extended attributes could not be carried over to the clone".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Extended attributes by path, never following a symlink.
+mod xattr {
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::path::Path;
+
+    /// Every attribute and its value, sorted by name.
+    pub type Attrs = Vec<(CString, Vec<u8>)>;
+
+    /// Attributes the system manages on its own and will not let a user
+    /// process remove or set. A mismatch in one of these says where a file
+    /// came from, not what it holds, and refusing over it would refuse almost
+    /// every pair of downloaded files on a modern Mac.
+    const SYSTEM_MANAGED: &[&[u8]] = &[b"com.apple.provenance"];
+
+    pub fn same(a: &Attrs, b: &Attrs) -> bool {
+        let user = |x: &Attrs| -> Attrs {
+            x.iter().filter(|(n, _)| !SYSTEM_MANAGED.contains(&n.as_bytes())).cloned().collect()
+        };
+        user(a) == user(b)
+    }
+
+    fn c(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::other("path contains a NUL byte"))
+    }
+
+    pub fn list(path: &Path) -> io::Result<Attrs> {
+        let p = c(path)?;
+        let names = fill(|buf, len| sys::list(&p, buf, len))?;
+        let mut out = Vec::new();
+        for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+            // Split on NUL, so there is none left inside.
+            let name = CString::new(name).expect("attribute name split on NUL");
+            match fill(|buf, len| sys::get(&p, &name, buf, len)) {
+                Ok(value) => out.push((name, value)),
+                // Removed between the listing and the read: not there.
+                Err(e) if e.raw_os_error() == Some(sys::ENOATTR) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    pub fn set(path: &Path, name: &CStr, value: &[u8]) -> io::Result<()> {
+        if sys::set(&c(path)?, name, value) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn remove(path: &Path, name: &CStr) -> io::Result<()> {
+        if sys::remove(&c(path)?, name) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Ask for the size, then read; again if it grew in between.
+    fn fill(mut call: impl FnMut(*mut u8, usize) -> isize) -> io::Result<Vec<u8>> {
+        loop {
+            let n = call(std::ptr::null_mut(), 0);
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut buf = vec![0u8; n as usize];
+            if n == 0 {
+                return Ok(buf);
+            }
+            let m = call(buf.as_mut_ptr(), buf.len());
+            if m < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::ERANGE) {
+                    continue;
+                }
+                return Err(e);
+            }
+            buf.truncate(m as usize);
+            return Ok(buf);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod sys {
+        use std::ffi::CStr;
+
+        pub const ENOATTR: i32 = libc::ENOATTR;
+        const NOFOLLOW: libc::c_int = 0x0001;
+
+        // SAFETY (all four): NUL-terminated strings and a buffer of the length
+        // passed, none retained past the call.
+        pub fn list(p: &CStr, buf: *mut u8, len: usize) -> isize {
+            unsafe { libc::listxattr(p.as_ptr(), buf.cast(), len, NOFOLLOW) }
+        }
+        pub fn get(p: &CStr, name: &CStr, buf: *mut u8, len: usize) -> isize {
+            unsafe { libc::getxattr(p.as_ptr(), name.as_ptr(), buf.cast(), len, 0, NOFOLLOW) }
+        }
+        pub fn set(p: &CStr, name: &CStr, v: &[u8]) -> libc::c_int {
+            unsafe { libc::setxattr(p.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0, NOFOLLOW) }
+        }
+        pub fn remove(p: &CStr, name: &CStr) -> libc::c_int {
+            unsafe { libc::removexattr(p.as_ptr(), name.as_ptr(), NOFOLLOW) }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod sys {
+        use std::ffi::CStr;
+
+        pub const ENOATTR: i32 = libc::ENODATA;
+
+        // SAFETY (all four): NUL-terminated strings and a buffer of the length
+        // passed, none retained past the call.
+        pub fn list(p: &CStr, buf: *mut u8, len: usize) -> isize {
+            unsafe { libc::llistxattr(p.as_ptr(), buf.cast(), len) }
+        }
+        pub fn get(p: &CStr, name: &CStr, buf: *mut u8, len: usize) -> isize {
+            unsafe { libc::lgetxattr(p.as_ptr(), name.as_ptr(), buf.cast(), len) }
+        }
+        pub fn set(p: &CStr, name: &CStr, v: &[u8]) -> libc::c_int {
+            unsafe { libc::lsetxattr(p.as_ptr(), name.as_ptr(), v.as_ptr().cast(), v.len(), 0) }
+        }
+        pub fn remove(p: &CStr, name: &CStr) -> libc::c_int {
+            unsafe { libc::lremovexattr(p.as_ptr(), name.as_ptr()) }
+        }
+    }
+
+    /// No attributes to speak of, and no clone operation either: `share` is
+    /// refused as unsupported before this is ever reached.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    mod sys {
+        use std::ffi::CStr;
+
+        pub const ENOATTR: i32 = 0;
+        pub fn list(_: &CStr, _: *mut u8, _: usize) -> isize {
+            0
+        }
+        pub fn get(_: &CStr, _: &CStr, _: *mut u8, _: usize) -> isize {
+            -1
+        }
+        pub fn set(_: &CStr, _: &CStr, _: &[u8]) -> libc::c_int {
+            -1
+        }
+        pub fn remove(_: &CStr, _: &CStr) -> libc::c_int {
+            -1
+        }
+    }
 }
 
 fn cstr(path: &Path) -> Result<std::ffi::CString, Refusal> {

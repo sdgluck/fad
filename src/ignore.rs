@@ -47,11 +47,11 @@ impl Rules {
                 Some(b) => (b, true),
                 None => (line, false),
             };
-            if let Some(rest) = body.strip_prefix("~/") {
-                if let Some(home) = crate::paths::home() {
-                    rules.absolute.push(home.join(rest));
-                    continue;
-                }
+            if let Some(rest) = body.strip_prefix("~/")
+                && let Some(home) = crate::paths::home()
+            {
+                rules.absolute.push(home.join(rest));
+                continue;
             }
             if body.starts_with('/') {
                 rules.absolute.push(PathBuf::from(body));

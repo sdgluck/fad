@@ -735,7 +735,7 @@ fn overlay_footers_stay_pinned_on_small_terminals() {
     app.search = "o".into();
     app.run_search();
     app.history = (0..30)
-        .map(|i| fad::delete::Batch { at: i, entries: Vec::new() })
+        .map(|i| fad::delete::Batch { id: i + 1, at: i, entries: Vec::new() })
         .collect();
     app.history_cursor = 29;
 
