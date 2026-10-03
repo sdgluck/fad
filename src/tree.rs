@@ -770,6 +770,12 @@ pub struct Snapshot {
 
 const NO_PARENT: u32 = u32::MAX;
 
+/// One path component, and nothing that could make a joined path go
+/// anywhere else.
+fn is_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
+}
+
 fn why_to_u8(k: std::io::ErrorKind) -> u8 {
     match k {
         std::io::ErrorKind::PermissionDenied => 1,
@@ -936,6 +942,15 @@ impl Tree {
 
     /// Rebuild a tree from a snapshot, rejecting anything internally
     /// inconsistent rather than indexing off the end of an array later.
+    ///
+    /// In-bounds is not enough. A parent cycle sends `path` and `roll_up`
+    /// round it forever; a node listed under two parents gets its size taken
+    /// out twice when deleted; and a name of `..` or `a/b` rebuilds a path
+    /// that leaves the directory it claims to be in — which is the path a
+    /// delete would be aimed at. So the shape the scan always produces is
+    /// required exactly: node 0 is the only root, every parent comes before
+    /// its children, each child is listed once and only by its own parent,
+    /// and every name is a single path component.
     pub fn from_snapshot(s: Snapshot) -> Option<Tree> {
         let n = s.name_len.len();
         if n == 0
@@ -959,23 +974,33 @@ impl Tree {
         let mut nodes = Vec::with_capacity(n);
         let mut name_at = 0usize;
         let mut child_at = 0usize;
+        let mut listed = vec![false; n];
         for i in 0..n {
             let len = s.name_len[i] as usize;
             let end = name_at.checked_add(len)?;
             let name = s.names.get(name_at..end)?;
             name_at = end;
+            // The root's name is display only (it is `/` for `/`); every other
+            // name is joined onto a path.
+            if i > 0 && !is_component(name) {
+                return None;
+            }
 
             let clen = s.child_len[i] as usize;
             let cend = child_at.checked_add(clen)?;
             let children = s.child_ids.get(child_at..cend)?.to_vec();
-            if children.iter().any(|c| *c as usize >= n) {
-                return None;
+            for c in &children {
+                let c = *c as usize;
+                if c <= i || c >= n || s.parent[c] as usize != i || listed[c] {
+                    return None;
+                }
+                listed[c] = true;
             }
             child_at = cend;
 
-            let parent = match s.parent[i] {
-                NO_PARENT => None,
-                p if (p as usize) < n => Some(p),
+            let parent = match (i, s.parent[i]) {
+                (0, NO_PARENT) => None,
+                (i, p) if i > 0 && (p as usize) < i => Some(p),
                 _ => return None,
             };
 
@@ -1019,12 +1044,16 @@ impl Tree {
         }
 
         use std::os::unix::ffi::OsStringExt;
+        let root_path = PathBuf::from(std::ffi::OsString::from_vec(s.root_path));
+        if !root_path.is_absolute() {
+            return None;
+        }
         let completed_at = std::time::UNIX_EPOCH
             .checked_add(std::time::Duration::new(s.completed_at.0, s.completed_at.1.min(999_999_999)))?;
         Some(Tree {
             nodes,
             root: 0,
-            root_path: PathBuf::from(std::ffi::OsString::from_vec(s.root_path)),
+            root_path,
             by_scan_id: HashMap::new(),
             orphans: Vec::new(),
             links,
@@ -1046,5 +1075,95 @@ impl Tree {
                 .map(|(i, v)| (i, skip_from_u8(v)))
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::walk::Entry;
+
+    fn meta(kind: Kind) -> Meta {
+        Meta { blocks: 4096, len: 4096, mtime: 0, dev: 1, ino: 0, nlink: 1, kind }
+    }
+
+    /// root ─ a ─ f, and root ─ g.
+    fn snapshot() -> Snapshot {
+        let mut t = Tree::new(PathBuf::from("/r"), &meta(Kind::Dir));
+        let e = |name: &str, kind, descend| Entry { name: name.into(), meta: meta(kind), descend, skip: None };
+        t.apply(Batch {
+            parent: ROOT_ID,
+            entries: vec![e("a", Kind::Dir, Some(1)), e("g", Kind::File, None)],
+            unreadable: None,
+        });
+        t.apply(Batch { parent: 1, entries: vec![e("f", Kind::File, None)], unreadable: None });
+        t.to_snapshot()
+    }
+
+    fn rename(s: &mut Snapshot, i: usize, to: &str) {
+        let mut at = 0;
+        for l in &s.name_len[..i] {
+            at += *l as usize;
+        }
+        let len = s.name_len[i] as usize;
+        s.names.replace_range(at..at + len, to);
+        s.name_len[i] = to.len() as u32;
+    }
+
+    #[test]
+    fn a_sound_snapshot_loads() {
+        let t = Tree::from_snapshot(snapshot()).unwrap();
+        assert!(t.find_path(Path::new("/r/a/f")).is_some());
+    }
+
+    #[test]
+    fn a_parent_cycle_is_rejected() {
+        let mut s = snapshot();
+        // a's parent is f, f's parent is a.
+        s.parent[1] = 3;
+        assert!(Tree::from_snapshot(s).is_none());
+    }
+
+    #[test]
+    fn a_second_root_is_rejected() {
+        let mut s = snapshot();
+        s.parent[2] = NO_PARENT;
+        assert!(Tree::from_snapshot(s).is_none());
+        let mut s = snapshot();
+        s.parent[0] = 1;
+        assert!(Tree::from_snapshot(s).is_none());
+    }
+
+    #[test]
+    fn a_child_listed_by_the_wrong_parent_or_twice_is_rejected() {
+        let mut s = snapshot();
+        // Root lists f, whose parent is a.
+        let at = s.child_ids.iter().position(|c| *c == 2).unwrap();
+        s.child_ids[at] = 3;
+        assert!(Tree::from_snapshot(s).is_none());
+
+        let mut s = snapshot();
+        let at = s.child_ids.iter().position(|c| *c == 2).unwrap();
+        s.child_ids[at] = 1;
+        assert!(Tree::from_snapshot(s).is_none(), "a listed twice");
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_component_is_rejected() {
+        for bad in ["", ".", "..", "x/y", "nul\0"] {
+            let mut s = snapshot();
+            rename(&mut s, 3, bad);
+            assert!(Tree::from_snapshot(s).is_none(), "accepted {bad:?}");
+        }
+        let mut s = snapshot();
+        rename(&mut s, 3, "fine name");
+        assert!(Tree::from_snapshot(s).is_some());
+    }
+
+    #[test]
+    fn a_relative_root_is_rejected() {
+        let mut s = snapshot();
+        s.root_path = b"relative".to_vec();
+        assert!(Tree::from_snapshot(s).is_none());
     }
 }
