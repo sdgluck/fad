@@ -181,6 +181,23 @@ fn e_asks_for_the_editor_on_the_selected_path() {
     assert_eq!(effect, Some(fad::run::Effect::Edit(app.tree.path(movies))));
 }
 
+/// `y` commits on the confirmation screen. It must not also be the way into
+/// it, or `y y` from the basket is a delete with nothing read in between.
+#[test]
+fn y_in_the_basket_does_not_head_for_the_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    let movies = find(&app, "Movies");
+    app.stage(movies);
+
+    press(&mut app, KeyCode::Char('x'));
+    press(&mut app, KeyCode::Char('y'));
+    assert!(app.mode == Mode::Basket, "y left the basket for the confirmation");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.mode == Mode::Confirm, "enter is the way on");
+}
+
 #[test]
 fn esc_closes_an_overlay_without_quitting() {
     let dir = tempfile::tempdir().unwrap();

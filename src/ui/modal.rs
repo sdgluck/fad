@@ -125,7 +125,7 @@ pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" enter ", theme.mode_badge),
+        Span::styled(" enter / y ", theme.mode_badge),
         Span::styled(
             format!(" {}   ", app.disposal.label()),
             if permanent { theme.staged } else { theme.normal },

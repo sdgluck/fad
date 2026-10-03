@@ -528,7 +528,10 @@ fn basket_key(app: &mut App, k: KeyEvent) {
             app.mode = Mode::Normal;
             app.status = Some("batch cleared".into());
         }
-        KeyCode::Enter | KeyCode::Char('y') => {
+        // Enter only. `y` copies a path everywhere else, and it is also what
+        // commits on the next screen — so with it here, `y y` from the basket
+        // deleted the batch with no screen read in between.
+        KeyCode::Enter => {
             app.review_batch();
             app.mode = Mode::Confirm;
         }
