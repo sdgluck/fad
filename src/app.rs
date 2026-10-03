@@ -1901,17 +1901,37 @@ impl App {
         Some((free.saturating_add(self.trash_pending.1), free))
     }
 
-    /// Free space once this batch lands, and the total, for the one number the
-    /// user actually came for.
+    /// Free space once this batch lands, and what it is now, for the one
+    /// number the user actually came for.
+    ///
+    /// Files only count when they are going for good. The Trash is a folder on
+    /// the same volume, so a batch moved there costs exactly what it cost
+    /// before until the trash goes out — and this used to add it anyway, which
+    /// on the default disposal made the headline promise space that would not
+    /// arrive until `E`. What the trash will give back is `staged_to_trash`.
     pub fn after_commit(&self) -> Option<(u64, u64)> {
         let root = self.tree.root_path();
         let free = crate::platform::free_space(root)?;
+        let files = match self.disposal {
+            Disposal::Permanent => self.staged_disk_bytes(),
+            Disposal::Trash => 0,
+        };
         // Only tool bytes that really come back to this disk. Everything inside
         // a VM image that does not shrink frees space inside that image and
         // nothing here, and putting it in this figure would make the one number
-        // the user came for the one number that is wrong.
-        let gained = self.staged_disk_bytes().saturating_add(self.staged_tool_host_bytes());
+        // the user came for the one number that is wrong. These never go near
+        // the trash, so they count whatever `D` says.
+        let gained = files.saturating_add(self.staged_tool_host_bytes());
         Some((free.saturating_add(gained), free))
+    }
+
+    /// What this batch puts in the Trash: on the volume still, and reclaimed
+    /// only when the trash is emptied. Zero when the batch is permanent.
+    pub fn staged_to_trash(&self) -> u64 {
+        match self.disposal {
+            Disposal::Trash => self.staged_disk_bytes(),
+            Disposal::Permanent => 0,
+        }
     }
 
     /// What this path did since the last scan. Resolved by path, not by id:

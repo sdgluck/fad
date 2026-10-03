@@ -303,8 +303,10 @@ fn apparent_sizes_never_reach_the_free_space_prediction() {
     // The displayed total still follows the flag, as the rows beside it do.
     assert_eq!(app.staged_bytes(), CLAIMED);
 
-    // What the volume would actually get back does not.
+    // What the volume would actually get back does not. Permanent, because a
+    // batch bound for the Trash gives nothing back until the trash goes out.
     assert_eq!(app.staged_disk_bytes(), on_disk);
+    app.disposal = fad::delete::Disposal::Permanent;
     let (after, before) = app.after_commit().expect("no free-space figure");
     assert_eq!(
         after - before,

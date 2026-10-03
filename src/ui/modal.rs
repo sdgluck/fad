@@ -28,17 +28,32 @@ pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let mut lines = Vec::new();
 
     if !items.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", items.len()), theme.emphasis),
-            Span::styled("item(s), ", theme.normal),
-            Span::styled(human(total), theme.emphasis),
-            Span::styled(" reclaimed", theme.normal),
-        ]));
-        lines.push(Line::from(if permanent {
-            Span::styled("permanently deleted — this cannot be undone", theme.staged)
+        // "Reclaimed" only when it is. A batch going to the Trash is still on
+        // the volume afterwards, and calling it reclaimed beside "moved to the
+        // Trash" was two claims on one screen that could not both be true.
+        if permanent {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", items.len()), theme.emphasis),
+                Span::styled("item(s), ", theme.normal),
+                Span::styled(human(total), theme.emphasis),
+                Span::styled(" reclaimed", theme.normal),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "permanently deleted \u{2014} this cannot be undone",
+                theme.staged,
+            )));
         } else {
-            Span::styled("moved to the Trash — u puts them back", theme.normal)
-        }));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", items.len()), theme.emphasis),
+                Span::styled("item(s), ", theme.normal),
+                Span::styled(human(total), theme.emphasis),
+                Span::styled(" moves to the Trash \u{2014} u puts them back", theme.normal),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "reclaimed only when the trash is emptied (E)",
+                theme.dim,
+            )));
+        }
         lines.push(Line::from(""));
 
         // Show the biggest handful; the tail is what the count is for.
@@ -110,6 +125,18 @@ pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 )));
             }
         }
+    }
+
+    // Only when it moves. A batch that is all Trash leaves free space where it
+    // is, and a line reading "120G \u{2192} 120G" says that less clearly than
+    // the line above already did.
+    if let Some((after, before)) = app.after_commit().filter(|(a, b)| a != b) {
+        lines.push(Line::from(vec![
+            Span::styled("free space  ", theme.dim),
+            Span::styled(human(before), theme.normal),
+            Span::styled(" \u{2192} ", theme.dim),
+            Span::styled(human(after), theme.emphasis),
+        ]));
     }
 
     if !app.refused.is_empty() {
@@ -263,13 +290,23 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let Some(job) = app.job.as_ref() {
         total += job.total;
         done += job.done.len();
+        // Three different things, and only two of them give space back. The
+        // trash going out does — the bytes were deleted when the batch was
+        // committed, and what happens now is only that they stop being held. A
+        // batch going *into* the trash does not, and saying "reclaimed" about it
+        // was the confirm screen's mistake made again one screen later.
+        let (verb, outcome) = if app.emptying {
+            ("emptied \u{b7} ", " reclaimed")
+        } else if job.disposal == Disposal::Trash {
+            ("trashed \u{b7} ", " moved to the Trash")
+        } else {
+            ("deleted \u{b7} ", " reclaimed")
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{}/{} ", job.done.len(), job.total), theme.emphasis),
-            // The bytes were deleted when the batch was committed; what is
-            // happening now is only that they stop being held.
-            Span::styled(if app.emptying { "emptied · " } else { "deleted · " }, theme.dim),
+            Span::styled(verb, theme.dim),
             Span::styled(human(job.freed()), theme.emphasis),
-            Span::styled(" reclaimed", theme.dim),
+            Span::styled(outcome, theme.dim),
         ]));
         for o in job.failures().iter().take(3) {
             let why = o.result.as_ref().err().cloned().unwrap_or_default();
@@ -325,7 +362,7 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .is_some_and(|j| j.disposal == Disposal::Trash && j.failures().len() < j.total);
         lines.push(Line::from(Span::styled(
             if undoable {
-                "enter to close · u to undo the deleted files"
+                "enter to close \u{b7} u puts the trashed files back"
             } else {
                 "enter to close"
             },
