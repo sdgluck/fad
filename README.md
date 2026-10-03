@@ -411,9 +411,12 @@ batch over the cap rather than stopping there — otherwise a 2G cap could recla
 nothing at all when the biggest candidate happens to be 3G.
 
 `--since` compares against the saved snapshot and prints the biggest changes
-first, then leaves the fresh walk behind as the new baseline, so it can be run
-on a timer. It answers "what did that install just add?", which no single scan
-can.
+first — growth, entries that are new, and entries that are gone, each reported
+once at the top of what appeared or went — then leaves the fresh walk behind as
+the new baseline, so it can be run on a timer. It answers "what did that install
+just add?", which no single scan can. A snapshot only counts as a baseline for a
+scan of the same root with the same `--cross-device` and `--cloud`; the first
+run of a new combination saves one and exits 1.
 
 ### In your shell
 

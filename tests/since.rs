@@ -202,3 +202,64 @@ fn a_root_that_is_not_utf8_reports_and_keeps_a_baseline() {
     assert_eq!(code, 0, "no baseline was saved: {err}");
     assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
 }
+
+/// A cleanup is a change too. Paths only in the old scan were never visited,
+/// because the walk went over the new tree alone.
+#[test]
+fn what_was_removed_is_reported_as_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("old/inner")).unwrap();
+    std::fs::write(dir.path().join("old/inner/big"), vec![0u8; 300 * 1024]).unwrap();
+    std::fs::write(dir.path().join("stays"), vec![0u8; 4096]).unwrap();
+
+    let (_, err, code) = fad(dir.path(), cache.path(), &["--since"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("saved one now"), "told to run fad first after saving: {err}");
+
+    std::fs::remove_dir_all(dir.path().join("old")).unwrap();
+
+    let (out, err, code) = fad(dir.path(), cache.path(), &["--since"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let line = out.lines().find(|l| l.ends_with("/old  (gone)")).unwrap_or_else(|| panic!("{out}"));
+    assert!(line.starts_with('-'), "a removal reported as growth: {line}");
+    // Once, at the top of what went, not for every file it held.
+    assert!(!out.contains("inner"), "{out}");
+
+    // The baseline moved on, so ask the same question against the old one
+    // again through JSON.
+    std::fs::create_dir_all(dir.path().join("old2")).unwrap();
+    std::fs::write(dir.path().join("old2/f"), vec![0u8; 300 * 1024]).unwrap();
+    fad(dir.path(), cache.path(), &["--since"]);
+    std::fs::remove_dir_all(dir.path().join("old2")).unwrap();
+    let (out, _, code) = fad(dir.path(), cache.path(), &["--since", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let gone = v["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["path"].as_str().unwrap().ends_with("/old2"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert_eq!(gone["gone"], serde_json::json!(true));
+    assert_eq!(gone["new"], serde_json::json!(false));
+    assert!(gone["delta"].as_i64().unwrap() <= -300 * 1024);
+}
+
+/// Walked in step, by name: a wide directory where most entries are unchanged
+/// still lines every one up with its old self.
+#[test]
+fn a_wide_directory_is_matched_entry_for_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("w")).unwrap();
+    for i in 0..2000 {
+        std::fs::write(dir.path().join(format!("w/{i}")), b"x").unwrap();
+    }
+    fad(dir.path(), cache.path(), &["--since"]);
+    std::fs::write(dir.path().join("w/1999"), vec![0u8; 200 * 1024]).unwrap();
+    let (out, err, code) = fad(dir.path(), cache.path(), &["--since", "--min-size", "100K"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.lines().any(|l| l.ends_with("/w/1999")), "{out}");
+    assert!(!out.contains("(new)") && !out.contains("(gone)"), "lost track of a name: {out}");
+}

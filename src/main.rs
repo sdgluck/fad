@@ -197,18 +197,34 @@ fn main() {
     // was unreachable and `--since --json` quietly printed a plain tree dump.
     if args.since {
         scan.finish(&mut tree);
-        let code = print_since(&tree, &args);
+        // Read before writing, since the write replaces it.
+        let previous = fad::cache::load(tree.root_path(), tree.scan_opts());
         // Leave this walk behind as the new baseline, or a script that runs
         // --since on a timer would keep measuring against the same old scan.
-        if !args.no_cache {
-            // Said, not swallowed: a baseline that silently failed to save
-            // makes the next --since compare against something older than
-            // the person running it believes.
-            if let Err(e) = fad::cache::save(&tree) {
-                eprintln!("fad: could not save this scan as the next baseline: {e}");
+        // Said, not swallowed, when it fails: a baseline that silently did
+        // not save makes the next --since compare against something older
+        // than the person running it believes.
+        let saved = !args.no_cache
+            && match fad::cache::save(&tree) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("fad: could not save this scan as the next baseline: {e}");
+                    false
+                }
+            };
+        let Some((previous, at)) = previous else {
+            let root = display_path(tree.root_path());
+            if saved {
+                eprintln!(
+                    "fad: no earlier scan of {root} to compare against; saved one now \u{2014} \
+                     run --since again later"
+                );
+            } else {
+                eprintln!("fad: no earlier scan of {root} to compare against, and none was saved");
             }
-        }
-        std::process::exit(code);
+            std::process::exit(1);
+        };
+        std::process::exit(print_since(&tree, &previous, at, &args));
     }
 
     if args.json {
@@ -612,55 +628,81 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
     i32::from(!failures.is_empty())
 }
 
-/// What changed since the last saved scan of this root. Answers "what did that
-/// install just add?", which no single scan can.
-fn print_since(tree: &Tree, args: &Args) -> i32 {
-    let Some((previous, at)) = fad::cache::load(tree.root_path(), tree.scan_opts()) else {
-        eprintln!(
-            "fad: no saved scan of {} to compare against \u{2014} run fad once first",
-            tree.root_path().display()
-        );
-        return 1;
-    };
+/// How a path moved between two scans.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Grew,
+    New,
+    Gone,
+}
 
-    // One entry per path present in either tree, at any depth down to --depth.
-    let mut changes: Vec<(PathBuf, i64, bool)> = Vec::new();
-    let mut stack = vec![(tree.root(), 0usize)];
-    while let Some((id, depth)) = stack.pop() {
-        let path = tree.path(id);
-        let now = tree.size(id, args.apparent) as i64;
-        let (delta, is_new) = match previous.find_path(&path) {
-            Some(then) => (now - previous.size(then, args.apparent) as i64, false),
-            None => (now, true),
-        };
-        if delta.unsigned_abs() >= args.min_size.max(1) {
-            changes.push((path, delta, is_new));
+/// What changed since the last saved scan of this root. Answers "what did that
+/// install just add?", which no single scan can — and "what did that cleanup
+/// take?", which needs the paths that are no longer there.
+///
+/// Both trees are walked together, matching children by name: one pass over
+/// each, where resolving every path from the root again was quadratic in the
+/// depth and in the width of every directory on the way down.
+fn print_since(tree: &Tree, previous: &Tree, at: std::time::SystemTime, args: &Args) -> i32 {
+    let threshold = args.min_size.max(1);
+    let mut changes: Vec<(PathBuf, i64, Change)> = Vec::new();
+    let mut stack = vec![(tree.root(), previous.root(), 0usize)];
+    while let Some((now_id, then_id, depth)) = stack.pop() {
+        let delta = tree.size(now_id, args.apparent) as i64
+            - previous.size(then_id, args.apparent) as i64;
+        if delta.unsigned_abs() >= threshold {
+            changes.push((tree.path(now_id), delta, Change::Grew));
         }
-        // A directory that is entirely new is reported once, not once per file
-        // inside it.
-        if depth < args.depth && !is_new {
-            stack.extend(tree.node(id).children.iter().map(|c| (*c, depth + 1)));
+        if depth >= args.depth {
+            continue;
+        }
+        let mut before: std::collections::HashMap<&str, NodeId> = previous
+            .node(then_id)
+            .children
+            .iter()
+            .map(|c| (previous.node(*c).name.as_ref(), *c))
+            .collect();
+        for c in &tree.node(now_id).children {
+            match before.remove(tree.node(*c).name.as_ref()) {
+                Some(then) => stack.push((*c, then, depth + 1)),
+                // Entirely new: reported once, not once per file inside it.
+                None => {
+                    let size = tree.size(*c, args.apparent);
+                    if size >= threshold {
+                        changes.push((tree.path(*c), size as i64, Change::New));
+                    }
+                }
+            }
+        }
+        // What is left was there last time and is not now. Reported once,
+        // at the top of whatever went, with everything it held as the loss.
+        for (_, c) in before {
+            let size = previous.size(c, args.apparent);
+            if size >= threshold {
+                changes.push((previous.path(c), -(size as i64), Change::Gone));
+            }
         }
     }
-    changes.sort_unstable_by_key(|(_, d, _)| std::cmp::Reverse(d.abs()));
+    changes.sort_by(|(pa, a, _), (pb, b, _)| b.abs().cmp(&a.abs()).then_with(|| pa.cmp(pb)));
 
     if args.json {
         let items: Vec<_> = changes
             .iter()
-            .map(|(path, delta, is_new)| {
+            .map(|(path, delta, change)| {
                 serde_json::json!({
                     "path": json_path(path),
                     "delta": delta,
                     "change": format!("{}{}", if *delta < 0 { "-" } else { "+" }, human(delta.unsigned_abs())),
-                    "new": is_new,
+                    "new": *change == Change::New,
+                    "gone": *change == Change::Gone,
                 })
             })
             .collect();
         print_json_value(&serde_json::json!({
-                "root": json_path(tree.root_path()),
-                "since": at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-                "changes": items,
-            }));
+            "root": json_path(tree.root_path()),
+            "since": at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            "changes": items,
+        }));
         return 0;
     }
 
@@ -668,13 +710,17 @@ fn print_since(tree: &Tree, args: &Args) -> i32 {
         println!("fad: nothing changed by more than {}", human(args.min_size.max(1)));
         return 0;
     }
-    for (path, delta, is_new) in &changes {
+    for (path, delta, change) in &changes {
         println!(
             "{}{:>7}  {}{}",
             if *delta < 0 { '-' } else { '+' },
             human(delta.unsigned_abs()),
-            path.display(),
-            if *is_new { "  (new)" } else { "" }
+            display_path(path),
+            match change {
+                Change::New => "  (new)",
+                Change::Gone => "  (gone)",
+                Change::Grew => "",
+            }
         );
     }
     0
