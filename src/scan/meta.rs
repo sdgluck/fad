@@ -1,7 +1,7 @@
 //! One `lstat` worth of facts about a directory entry.
 
 use std::fs::Metadata;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
@@ -36,9 +36,9 @@ impl Meta {
             Kind::Symlink
         } else if ft.is_file() {
             Kind::File
-        } else if ft.is_socket() || ft.is_fifo() || ft.is_block_device() || ft.is_char_device() {
-            Kind::Other
         } else {
+            // Sockets, FIFOs, device nodes, and anything a future platform
+            // invents: none of them is something a size tool can descend into.
             Kind::Other
         };
         Meta {
@@ -53,6 +53,11 @@ impl Meta {
     }
 
     /// Build directly from a raw `stat`, skipping the `std::fs::Metadata` round trip.
+    ///
+    /// The casts are not all no-ops everywhere: `stat`'s field types differ by
+    /// platform (`st_nlink` is 16 bits on macOS, `st_dev` is signed there), so a
+    /// cast that is redundant on one target is load-bearing on another.
+    #[allow(clippy::unnecessary_cast)]
     pub fn from_stat(st: &libc::stat) -> Self {
         let fmt = st.st_mode & libc::S_IFMT;
         let kind = match fmt {

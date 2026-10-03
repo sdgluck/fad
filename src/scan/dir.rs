@@ -6,7 +6,7 @@
 //! directory's own descriptor and calling `fstatat` against it resolves a
 //! single component instead, which is most of the walk's cost.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -32,22 +32,33 @@ pub struct DirEntry {
     pub meta: Meta,
 }
 
-/// Read every entry of `path`, stat'ing each without following symlinks.
-/// Entries that vanish or refuse to stat mid-walk are skipped, not fatal.
-pub fn read_dir_stat(path: &Path) -> io::Result<Vec<DirEntry>> {
-    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))?;
+/// One directory's worth of entries, and what could not be had.
+pub struct Listing {
+    pub entries: Vec<DirEntry>,
+    /// Entries `readdir` named but that would not `fstatat`, for a reason
+    /// other than having been deleted in the meantime.
+    pub failed: u32,
+    /// Why the first of those failed.
+    pub error: Option<io::ErrorKind>,
+}
 
-    // SAFETY: cpath is a valid NUL-terminated path for the duration of the call.
-    let dir = unsafe { libc::opendir(cpath.as_ptr()) };
-    if dir.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let guard = DirGuard(dir);
+/// Read every entry of `path`, stat'ing each without following symlinks.
+///
+/// Entries that vanish mid-walk are skipped: a file deleted between `readdir`
+/// and `fstatat` is not part of the tree, and saying nothing about it is
+/// right. Any other refusal is counted in `failed` rather than skipped in
+/// silence. A directory with read but not search permission (mode 644) lists
+/// its names and refuses to stat every one of them; reporting that as an
+/// empty, complete directory of 0 B was a total that looked authoritative and
+/// was not.
+pub fn read_dir_stat(path: &Path) -> io::Result<Listing> {
+    let guard = DirGuard(open_dir(path)?);
     // SAFETY: `dir` is a live DIR* owned by `guard`.
     let fd = unsafe { libc::dirfd(guard.0) };
 
     let mut out = Vec::new();
+    let mut failed = 0u32;
+    let mut error = None;
     loop {
         // `readdir` returns a pointer into DIR-private storage that is valid
         // until the next call on this same DIR*, which we do not share.
@@ -75,7 +86,12 @@ pub fn read_dir_stat(path: &Path) -> io::Result<Vec<DirEntry>> {
             libc::fstatat(fd, name_ptr, &mut st, libc::AT_SYMLINK_NOFOLLOW)
         };
         if rc != 0 {
-            continue; // raced with a delete, or we cannot stat it; either way, skip
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOENT) {
+                failed += 1;
+                error.get_or_insert(err.kind());
+            }
+            continue;
         }
 
         let name = String::from_utf8_lossy(name_bytes);
@@ -85,7 +101,63 @@ pub fn read_dir_stat(path: &Path) -> io::Result<Vec<DirEntry>> {
             meta: Meta::from_stat(&st),
         });
     }
-    Ok(out)
+    Ok(Listing { entries: out, failed, error })
+}
+
+/// `opendir`, and when the path is too long for one call, the same directory
+/// reached a component at a time.
+///
+/// `PATH_MAX` is 1024 bytes on macOS and 4096 on Linux, and nothing stops a
+/// tree from being deeper than that — a runaway build, a recursive copy, a
+/// `node_modules` nested inside itself. The kernel refuses the whole path, but
+/// it will happily open each component relative to the last. Only the walk
+/// that has already gone too deep pays for that; everything else is one call.
+fn open_dir(path: &Path) -> io::Result<*mut libc::DIR> {
+    let cpath = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"))?;
+    // SAFETY: cpath is a valid NUL-terminated path for the duration of the call.
+    let dir = unsafe { libc::opendir(cpath.as_ptr()) };
+    if !dir.is_null() {
+        return Ok(dir);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::ENAMETOOLONG) || !path.is_absolute() {
+        return Err(err);
+    }
+
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: a static NUL-terminated path.
+    let mut fd = unsafe { libc::open(c"/".as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for part in path.components() {
+        let std::path::Component::Normal(name) = part else { continue };
+        let Ok(cname) = CString::new(name.as_bytes()) else {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL"));
+        };
+        // No following symlinks on the way down: every component here is one
+        // the walk lstat'ed and found to be a directory, and a symlink in its
+        // place now would lead somewhere the tree does not say.
+        // SAFETY: fd is an open directory we own; cname is NUL-terminated.
+        let next = unsafe { libc::openat(fd, cname.as_ptr(), flags | libc::O_NOFOLLOW) };
+        let open_err = io::Error::last_os_error();
+        // SAFETY: fd is ours and is not used again.
+        unsafe { libc::close(fd) };
+        if next < 0 {
+            return Err(open_err);
+        }
+        fd = next;
+    }
+    // SAFETY: fd is an open directory; on success the DIR* owns it.
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    Ok(dir)
 }
 
 /// `readdir` signals "end of directory" and "error" the same way — a null

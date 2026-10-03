@@ -531,6 +531,9 @@ pub struct App {
     pub should_quit: bool,
     /// What the screen remembers between keys and nothing else needs to know.
     pub ui: crate::ui::UiState,
+    /// Quit with ctrl-c rather than `q`: the session ends with nothing
+    /// chosen, so `--print-path` prints nothing.
+    pub cancelled: bool,
 }
 
 impl App {
@@ -538,9 +541,10 @@ impl App {
     /// live by the time this returns.
     pub fn load_snapshot_async(&mut self) {
         let root = self.tree.root_path().to_path_buf();
+        let opts = self.opts.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send(crate::cache::load(&root));
+            let _ = tx.send(crate::cache::load(&root, &opts));
         });
         self.snapshot_rx = Some(rx);
     }
@@ -696,6 +700,7 @@ impl App {
             dirty: true,
             should_quit: false,
             ui: crate::ui::UiState::default(),
+            cancelled: false,
         };
         app.rebuild_rows();
         app

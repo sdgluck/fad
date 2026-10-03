@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{CommandFactory, Parser, ValueEnum};
 
 use fad::app::App;
-use fad::format::human;
+use fad::format::{escape_controls, human};
 use fad::run;
 use fad::scan::Scan;
 use fad::scan::walk::{ScanOpts, Skip};
@@ -11,8 +11,13 @@ use fad::presets::Category;
 use fad::tree::{NodeId, Tree};
 
 /// Find and delete what is eating your disk.
+//
+// The flags that act without a person watching are tied together in the
+// parser rather than checked by hand: a `--dry-run` that was silently ignored
+// because `--yes` was missing reads as a promise it did not keep.
 #[derive(Parser, Debug)]
 #[command(name = "fad", version, about)]
+#[command(group(clap::ArgGroup::new("act").args(["reclaim", "tools"]).multiple(true)))]
 struct Args {
     /// Directory to scan.
     #[arg(default_value = None)]
@@ -31,11 +36,14 @@ struct Args {
     #[arg(long)]
     apparent: bool,
 
-    /// Hide entries below this size, e.g. 100M, 2G.
+    /// Leave out entries below this size, e.g. 100M, 2G (powers of 1024).
+    /// Applies to --json, --since, --reclaim --yes and --tools --yes; the
+    /// interactive view shows everything.
     #[arg(long, value_parser = parse_size, default_value = "0")]
     min_size: u64,
 
-    /// How deep to print. Only meaningful with --json.
+    /// How many levels deep to report. Applies to --json and --since; the
+    /// interactive view opens as deep as you go.
     #[arg(long, default_value_t = 2)]
     depth: usize,
 
@@ -65,32 +73,33 @@ struct Args {
     clear_cache: bool,
 
     /// Print the selected path to stdout on exit, so `cd "$(fad --print-path)"`
-    /// works.
-    #[arg(long)]
+    /// works. Quitting with ctrl-c prints nothing and exits 1.
+    #[arg(long, conflicts_with = "json")]
     print_path: bool,
 
     /// With --reclaim or --tools, act instead of opening the UI. With --tools
     /// it only ever touches resources the tool itself reports as unused, and
     /// removal there is permanent: there is no trash for `docker image rm`.
-    #[arg(long)]
+    #[arg(long, requires = "act")]
     yes: bool,
 
-    /// With --reclaim --yes, stop once this much has been staged, largest
-    /// first. e.g. 10G.
-    #[arg(long, value_parser = parse_size)]
+    /// With --reclaim --yes or --tools --yes, take candidates largest first
+    /// and skip any that would go over this much, e.g. 10G.
+    #[arg(long, value_parser = parse_size, requires = "yes")]
     max: Option<u64>,
 
-    /// With --reclaim --yes, print what would go and delete nothing.
-    #[arg(long)]
+    /// With --reclaim --yes or --tools --yes, print what would go and remove
+    /// nothing.
+    #[arg(long, requires = "yes")]
     dry_run: bool,
 
     /// With --reclaim --yes, delete permanently instead of trashing.
-    #[arg(long)]
+    #[arg(long, requires = "yes")]
     permanent: bool,
 
     /// Print what changed since the last saved scan of this root, largest
-    /// change first.
-    #[arg(long)]
+    /// change first: growth, new entries and removed ones.
+    #[arg(long, conflicts_with_all = ["reclaim", "tools", "yes"])]
     since: bool,
 
     /// Print shell integration for your shell and exit: completions, and a
@@ -109,6 +118,105 @@ struct Args {
     no_mouse: bool,
 }
 
+/// What the parser cannot generate: the keys, the files, the environment.
+/// Kept beside the flags so a change to one is a reminder to look at the
+/// other; the keys mirror the README's table, the files `paths.rs`, and the
+/// environment every variable fad reads.
+const MAN_EXTRA: &str = r#".SH KEYS
+.TP
+\fBj\fR, \fBk\fR, \fBUp\fR, \fBDown\fR
+Move. \fBg\fR and \fBG\fR go to the first and last row; \fBctrl\-d\fR and \fBctrl\-u\fR jump ten.
+.TP
+\fBl\fR, \fBRight\fR, \fBEnter\fR
+Expand. \fBh\fR or \fBLeft\fR collapses, or jumps to the parent.
+.TP
+\fBspace\fR
+Stage or unstage. \fBA\fR stages everything in this directory or category.
+.TP
+\fBx\fR
+Open the staging basket: review, unstage, commit.
+.TP
+\fBu\fR
+Undo the last committed batch. \fBU\fR opens the undo history, to put back any of the last 20.
+.TP
+\fBE\fR
+Empty the trash \(em only what fad put there, and only then is the space reclaimed.
+.TP
+\fBr\fR
+Reclaimable view: build artifacts, package caches, app caches, VM images.
+.TP
+\fBt\fR
+Tool storage: what Docker and friends hold that a walk cannot see.
+.TP
+\fBd\fR
+Duplicate view: files whose contents are byte\-for\-byte equal. \fBL\fR there makes the copies share one copy of the storage.
+.TP
+\fBa\fR
+Age filter: any age, untouched 90 days, 1 year, 2 years.
+.TP
+\fB/\fR
+Fuzzy filter on what is on screen. \fBEnter\fR keeps it, \fBEsc\fR clears it.
+.TP
+\fBf\fR
+Find any entry in the tree by name, biggest first.
+.TP
+\fBs\fR
+Cycle the sort: size, count, modified, name. \fBR\fR rescans.
+.TP
+\fBS\fR
+Bring the next detail breakdown to the top.
+.TP
+\fBo\fR, \fBe\fR, \fBy\fR
+Reveal in the file manager, open in \fB$EDITOR\fR, copy the path.
+.TP
+\fBi\fR
+Never rank this again: adds it to the ignore list.
+.TP
+\fB!\fR
+What is not in these numbers: skipped, unreadable, ignored.
+.TP
+\fB?\fR
+Help.
+.TP
+\fBq\fR, \fBEsc\fR
+Quit. With \fB\-\-print\-path\fR, the path under the cursor is printed.
+.TP
+\fBctrl\-c\fR
+Quit without choosing. With \fB\-\-print\-path\fR, nothing is printed and fad exits 1, so \fBfad\-cd\fR stays where it is.
+.SH FILES
+.TP
+\fI~/Library/Caches/fad\fR (macOS), \fI$XDG_CACHE_HOME/fad\fR (elsewhere)
+Snapshots of completed scans, one \fI*.snap\fR file per root and set of scan options. Pruned on every save: anything unused for 60 days goes, then the least recently used until the rest fits in 1 GiB. \fB\-\-clear\-cache\fR removes them.
+.TP
+\fI~/Library/Application Support/fad/undo.jsonl\fR (macOS), \fI$XDG_DATA_HOME/fad/undo.jsonl\fR (elsewhere)
+The undo journal: what each committed batch moved to the trash, and from where.
+.TP
+\fI~/.config/fad/ignore\fR, or \fI$XDG_CONFIG_HOME/fad/ignore\fR
+The ignore list, one path or pattern per line.
+.SH ENVIRONMENT
+.TP
+\fBFAD_CACHE_DIR\fR
+The snapshot directory itself; no \fIfad/\fR is appended.
+.TP
+\fBFAD_STATE_DIR\fR
+The directory holding the undo journal.
+.TP
+\fBFAD_CONFIG_DIR\fR
+The directory holding the ignore list.
+.TP
+\fBFAD_DOCKER_BIN\fR, \fBFAD_PODMAN_BIN\fR, \fBFAD_TMUTIL_BIN\fR
+The program asked about Docker, Podman, and Time Machine local snapshots, in place of the one on \fBPATH\fR.
+.TP
+\fBXDG_CACHE_HOME\fR, \fBXDG_DATA_HOME\fR, \fBXDG_CONFIG_HOME\fR
+Base directories for the files above, honoured when absolute.
+.TP
+\fBHOME\fR
+The default scan root, and the base of every default location.
+.TP
+\fBEDITOR\fR
+What \fBe\fR opens an entry in.
+"#;
+
 /// The shells `--init` knows how to write for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Shell {
@@ -117,23 +225,55 @@ enum Shell {
     Fish,
 }
 
+/// A size on the command line: a number, optionally fractional, and an
+/// optional unit — `500`, `1.5G`, `100mb`, `2GiB`.
+///
+/// Every unit is a power of 1024, whichever way it is spelled. That is what
+/// every size fad prints means (`human` is `du -h`'s base-1024 `K`/`M`/`G`), so
+/// `--min-size 1G` hides exactly what shows as under `1.0G`; reading `GB` as
+/// 10^9 would make the same letters mean two sizes 7% apart in one tool.
+///
+/// Refused outright rather than read as something: an empty string, a
+/// negative, `nan` and `inf` (all of which `f64` parses happily, and which
+/// cast to 0 or `u64::MAX` — `--max -5G` was "no limit at all"), anything too
+/// big for a byte count, and an unknown unit.
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
-    let (num, mult) = match s.chars().last() {
-        Some('K') | Some('k') => (&s[..s.len() - 1], 1024u64),
-        Some('M') | Some('m') => (&s[..s.len() - 1], 1024 * 1024),
-        Some('G') | Some('g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        Some('T') | Some('t') => (&s[..s.len() - 1], 1024u64.pow(4)),
-        _ => (s, 1),
+    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+    let (num, unit) = (&s[..split], s[split..].trim());
+    if num.is_empty() {
+        return Err(format!("not a size: {s:?} (expected a number and an optional unit, e.g. 500M)"));
+    }
+    let n: f64 = num.parse().map_err(|_| format!("not a size: {s:?}"))?;
+    let power = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 1,
+        "m" | "mb" | "mib" => 2,
+        "g" | "gb" | "gib" => 3,
+        "t" | "tb" | "tib" => 4,
+        "p" | "pb" | "pib" => 5,
+        _ => return Err(format!("not a size: {s:?} (units are K, M, G, T, P \u{2014} powers of 1024)")),
     };
-    num.trim()
-        .parse::<f64>()
-        .map(|n| (n * mult as f64) as u64)
-        .map_err(|_| format!("not a size: {s}"))
+    let bytes = n * 1024f64.powi(power);
+    if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+        return Err(format!("too large: {s:?}"));
+    }
+    Ok(bytes as u64)
 }
 
 fn main() {
     let args = Args::parse();
+    // Not a plain `conflicts_with`: the generic message would say the two
+    // cannot be combined and not why, and the why is the thing to know.
+    if args.permanent && args.tools {
+        Args::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--permanent does not apply to --tools: what --tools --yes removes \
+                 never goes to a trash, so it is always permanent",
+            )
+            .exit();
+    }
 
     if let Some(shell) = args.init {
         print_init(shell);
@@ -148,6 +288,7 @@ fn main() {
             eprintln!("fad: could not render the man page: {e}");
             std::process::exit(1);
         }
+        out.extend_from_slice(MAN_EXTRA.as_bytes());
         use std::io::Write;
         let _ = std::io::stdout().write_all(&out);
         return;
@@ -170,16 +311,7 @@ fn main() {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let opts = ScanOpts { cross_device: args.cross_device, cloud: args.cloud };
-    let (mut tree, scan) = match Scan::start(&root, opts.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("fad: {}: {e}", root.display());
-            std::process::exit(1);
-        }
-    };
-
-    // Asking the tools has nothing to do with the walk, so it does not wait for
+    // Asking the tools has nothing to do with the walk, so it does not start
     // one. `--tools --json` on a big home directory should not cost a scan it
     // will not print.
     if args.tools && (args.json || args.yes) {
@@ -192,25 +324,60 @@ fn main() {
         });
     }
 
+    let opts = ScanOpts { cross_device: args.cross_device, cloud: args.cloud };
+    let (mut tree, scan) = match Scan::start(&root, opts.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fad: {}: {e}", display_path(&root));
+            std::process::exit(1);
+        }
+    };
+
     // Ahead of --json, because --since has a JSON shape of its own: a list of
     // changes, which is the whole question being asked. Below it, that shape
     // was unreachable and `--since --json` quietly printed a plain tree dump.
     if args.since {
         scan.finish(&mut tree);
-        let code = print_since(&tree, &args);
+        require_readable_root(&tree);
+        // Read before writing, since the write replaces it.
+        let previous = fad::cache::load(tree.root_path(), tree.scan_opts());
         // Leave this walk behind as the new baseline, or a script that runs
         // --since on a timer would keep measuring against the same old scan.
-        if !args.no_cache {
-            let _ = fad::cache::save(&tree);
-        }
-        std::process::exit(code);
+        // Said, not swallowed, when it fails: a baseline that silently did
+        // not save makes the next --since compare against something older
+        // than the person running it believes.
+        let saved = !args.no_cache
+            && match fad::cache::save(&tree) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("fad: could not save this scan as the next baseline: {e}");
+                    false
+                }
+            };
+        let Some((previous, at)) = previous else {
+            let root = display_path(tree.root_path());
+            if saved {
+                eprintln!(
+                    "fad: no earlier scan of {root} to compare against; saved one now \u{2014} \
+                     run --since again later"
+                );
+            } else {
+                eprintln!("fad: no earlier scan of {root} to compare against, and none was saved");
+            }
+            std::process::exit(1);
+        };
+        std::process::exit(print_since(&tree, &previous, at, &args));
     }
 
     if args.json {
         scan.finish(&mut tree);
+        require_readable_root(&tree);
         tree.sort_all_by_size(args.apparent);
         if args.reclaim {
             print_reclaim_json(&tree, &args);
+            // The reclaimable set is drawn from the same scan, and is short by
+            // the same omissions.
+            warn_omissions(&tree);
         } else {
             print_json(&tree, &args);
         }
@@ -219,6 +386,7 @@ fn main() {
 
     if args.reclaim && args.yes {
         scan.finish(&mut tree);
+        require_readable_root(&tree);
         std::process::exit(reclaim_now(&tree, &args));
     }
 
@@ -237,6 +405,10 @@ fn main() {
         app.load_snapshot_async();
     }
     let save = !args.no_cache;
+    if let Err(why) = check_terminal(args.print_path) {
+        eprintln!("fad: {why}");
+        std::process::exit(1);
+    }
     // With --print-path the shell is reading stdout, so the interface has to go
     // somewhere else. See `run::Screen`.
     match run::run(app, args.print_path) {
@@ -246,21 +418,53 @@ fn main() {
             if let (true, Some(final_tree)) = (save, outcome.tree.as_ref()) {
                 // Best effort: failing to write a cache is never worth an error
                 // on the way out of a session that otherwise went fine.
-                let _ = fad::cache::save(final_tree);
+                // In a debug build, say so anyway: a cache that never saves
+                // looks exactly like one that works until the next launch.
+                if let Err(e) = fad::cache::save(final_tree)
+                    && cfg!(debug_assertions)
+                {
+                    eprintln!("fad: could not save the scan for next time: {e}");
+                }
             }
             // Last, and on stdout alone, so it is the only thing a shell
             // substitution picks up.
+            // Nothing chosen — quit with ctrl-c, or on a row that is not a
+            // path — prints nothing and fails, so `fad-cd` stays put rather
+            // than taking you somewhere you backed out of.
             if args.print_path {
-                if let Some(p) = outcome.selected {
-                    println!("{}", p.display());
+                match outcome.selected {
+                    Some(p) => println!("{}", p.display()),
+                    None => std::process::exit(1),
                 }
             }
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+            eprintln!("fad: {NEEDS_TERMINAL}");
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("fad: {e}");
             std::process::exit(1);
         }
     }
+}
+
+const NEEDS_TERMINAL: &str = "fad needs a terminal for the interactive view; \
+     use --json, --since, or --reclaim/--tools --yes";
+
+/// Whether there is a terminal to draw on and read keys from. Without one,
+/// the first raw-mode call fails with ENXIO and the user is told "Device not
+/// configured (os error 6)", which says nothing about what to do instead.
+///
+/// Keys come from the controlling terminal; the screen goes to stdout, or to
+/// the terminal itself under `--print-path` (see `run::Screen`).
+fn check_terminal(print_path: bool) -> Result<(), &'static str> {
+    use std::io::IsTerminal;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok();
+    if !tty || (!print_path && !std::io::stdout().is_terminal()) {
+        return Err(NEEDS_TERMINAL);
+    }
+    Ok(())
 }
 
 /// Everything the shell needs: completions from the parser itself, and the
@@ -275,7 +479,29 @@ fn print_init(shell: Shell) {
         Shell::Zsh => clap_complete::Shell::Zsh,
         Shell::Fish => clap_complete::Shell::Fish,
     };
-    clap_complete::generate(target, &mut cmd, "fad", &mut std::io::stdout());
+    let mut buf = Vec::new();
+    clap_complete::generate(target, &mut cmd, "fad", &mut buf);
+    let mut completions = String::from_utf8_lossy(&buf).into_owned();
+
+    // `fad-cd` takes fad's arguments, so it gets fad's completions. And in zsh,
+    // registering them needs `compdef`, which exists only once `compinit` has
+    // run — a startup file that evals this first got "command not found:
+    // compdef" on every new shell. Guarded, it simply skips completions there;
+    // eval after `compinit` to have them.
+    match shell {
+        Shell::Zsh => {
+            completions = completions.replace(
+                "    compdef _fad fad\n",
+                "    if (( $+functions[compdef] )); then compdef _fad fad fad-cd; fi\n",
+            );
+        }
+        Shell::Bash => {
+            completions = completions
+                .replace("-o default fad\n", "-o default fad\n    complete -F _fad -o default fad-cd\n");
+        }
+        Shell::Fish => {}
+    }
+    print!("{completions}");
 
     // `fad` on its own cannot change your shell's directory — nothing can, from
     // a child process — so the one thing a shell function is needed for is the
@@ -291,7 +517,7 @@ fad-cd() {
 }
 "#;
     let fish = r#"
-function fad-cd --description 'run fad and cd to where you left the cursor'
+function fad-cd --wraps fad --description 'run fad and cd to where you left the cursor'
   set -l target (command fad --print-path $argv)
   or return
   test -n "$target"; or return
@@ -302,29 +528,83 @@ end
     println!("{}", if shell == Shell::Fish { fish } else { sh });
 }
 
+/// A root that could not be read has no numbers to report. Printing
+/// `"bytes": 0` for it — and exiting 0 — told a script the directory was
+/// empty, which is the one thing nobody knows about it.
+fn require_readable_root(tree: &Tree) {
+    let root = tree.node(tree.root());
+    if root.flags & fad::tree::flags::UNREADABLE == 0 || !root.children.is_empty() {
+        return;
+    }
+    let why = tree
+        .unreadable_why
+        .iter()
+        .find(|(id, _)| *id == tree.root())
+        .map(|(_, k)| fad::tree::unreadable_reason(*k))
+        .unwrap_or_else(|| "could not be read".into());
+    eprintln!("fad: {}: {why}", display_path(tree.root_path()));
+    std::process::exit(1);
+}
+
 fn print_json(tree: &Tree, args: &Args) {
     let v = node_json(tree, tree.root(), args, 0);
-    println!("{}", serde_json::to_string_pretty(&v).unwrap());
-    if tree.unreadable_count > 0 {
-        eprintln!(
-            "fad: {} directories were unreadable and are not counted \
-             (grant Full Disk Access to your terminal to include them)",
-            tree.unreadable_count
-        );
+    print_json_value(&v);
+    warn_omissions(tree);
+}
+
+/// Everything the totals just printed do not include, on stderr, path by
+/// path — the same account the `!` screen gives, for a reader with no screen.
+///
+/// Every kind of omission is listed, not only the ones with a flag to fix
+/// them: a mount point that was not entered is as missing from the numbers as
+/// a cloud folder, and a script comparing totals against `df` needs to know.
+fn warn_omissions(tree: &Tree) {
+    /// Past this, a list is noise; the count still says how many.
+    const SHOW: usize = 20;
+
+    fn list(paths: &[(PathBuf, String)]) {
+        for (p, why) in paths.iter().take(SHOW) {
+            if why.is_empty() {
+                eprintln!("       {}", display_path(p));
+            } else {
+                eprintln!("       {}  ({why})", display_path(p));
+            }
+        }
+        if paths.len() > SHOW {
+            eprintln!("       ... and {} more", paths.len() - SHOW);
+        }
     }
-    let cloud: Vec<_> = tree
-        .skipped
+
+    let unreadable: Vec<(PathBuf, String)> = tree
+        .unreadable_why
         .iter()
-        .filter(|(_, r)| *r == Skip::CloudStorage)
-        .map(|(id, _)| tree.path(*id))
+        .filter(|(id, _)| tree.node(*id).flags & fad::tree::flags::DELETED == 0)
+        .map(|(id, kind)| (tree.path(*id), fad::tree::unreadable_reason(*kind)))
         .collect();
-    if !cloud.is_empty() {
+    if !unreadable.is_empty() {
         eprintln!(
-            "fad: skipped {} cloud folder(s), not counted — rescan with --cloud to include:",
-            cloud.len()
+            "fad: {} director{} could not be read, in whole or in part, and {} not fully counted:",
+            unreadable.len(),
+            if unreadable.len() == 1 { "y" } else { "ies" },
+            if unreadable.len() == 1 { "is" } else { "are" },
         );
-        for p in &cloud {
-            eprintln!("       {}", p.display());
+        list(&unreadable);
+    }
+
+    for (reason, heading) in [
+        (Skip::OtherDevice, "mount point(s) not entered, not counted \u{2014} rescan with --cross-device to include"),
+        (Skip::CloudStorage, "cloud folder(s) skipped, not counted \u{2014} rescan with --cloud to include"),
+        (Skip::UnrepresentableName, "entr(ies) whose name is not valid UTF-8, not counted \u{2014} fad cannot name them to act on them"),
+    ] {
+        let paths: Vec<(PathBuf, String)> = tree
+            .skipped
+            .iter()
+            .filter(|(id, r)| *r == reason && tree.node(*id).flags & fad::tree::flags::DELETED == 0)
+            .map(|(id, _)| (tree.path(*id), String::new()))
+            .collect();
+        if !paths.is_empty() {
+            eprintln!("fad: {} {heading}:", paths.len());
+            list(&paths);
         }
     }
 }
@@ -337,21 +617,23 @@ fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
     let ignore = fad::ignore::Rules::load();
     let root = tree.root_path();
 
-    let chosen = fad::reclaim::under_cap(
-        fad::reclaim::auto_candidates(tree, args.apparent, args.min_size, &ignore),
-        args.max,
-    );
+    let all = fad::reclaim::auto_candidates(tree, args.apparent, args.min_size, &ignore);
+    let found = all.len();
+    let chosen = fad::reclaim::under_cap(all, args.max);
     let total: u64 = chosen.iter().map(|(_, b)| b).sum();
     let batch: Vec<(PathBuf, u64)> =
         chosen.iter().map(|(id, bytes)| (tree.path(*id), *bytes)).collect();
 
     if batch.is_empty() {
-        println!("fad: nothing reclaimable under {}", root.display());
+        match nothing_under_cap(found, args.max) {
+            Some(why) => println!("fad: {why}"),
+            None => println!("fad: nothing reclaimable under {}", display_path(root)),
+        }
         return 0;
     }
 
     for (path, bytes) in &batch {
-        println!("{:>8}  {}", human(*bytes), path.display());
+        println!("{:>8}  {}", human(*bytes), display_path(path));
     }
     let verb = if args.dry_run {
         "would reclaim"
@@ -377,7 +659,7 @@ fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
 
     let failures = job.failures();
     for o in &failures {
-        eprintln!("fad: {}: {}", o.path.display(), o.result.as_ref().err().cloned().unwrap_or_default());
+        eprintln!("fad: {}: {}", display_path(&o.path), o.result.as_ref().err().cloned().unwrap_or_default());
     }
     println!("reclaimed {}", human(job.freed()));
     if !args.permanent {
@@ -455,16 +737,12 @@ fn print_tools_json(report: &fad::tools::Report) {
         })
         .collect();
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
+    print_json_value(&json!({
             "sources": sources,
             "totals_are_not_sums_of_items":
                 "each source's totals come from the tool itself; item sizes are \
                  per-item unique storage and shared bytes are reported separately",
-        }))
-        .unwrap()
-    );
+        }));
 }
 
 fn tool_item_json(r: &fad::tools::Resource) -> serde_json::Value {
@@ -506,9 +784,32 @@ fn status_word(s: &fad::tools::Status) -> &'static str {
 /// every command before running it. It is also the one scripted path in fad
 /// that cannot be undone, so it says so before it starts.
 fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
+    // A source that is installed and could not be asked is a cleanup that did
+    // not happen, not a clean bill of health. Said up front, and in the exit
+    // status: a script that runs this nightly with the daemon down was being
+    // told "nothing the tools report as unused" and exit 0, every night.
+    let unreachable: Vec<String> = report
+        .sources
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status,
+                fad::tools::Status::NotRunning(_)
+                    | fad::tools::Status::Failed(_)
+                    | fad::tools::Status::TimedOut
+            )
+        })
+        .filter_map(|s| s.status.line(s.source))
+        .collect();
+    for line in &unreachable {
+        eprintln!("fad: {}", escape_controls(line));
+    }
+    let unreachable = i32::from(!unreachable.is_empty());
+
     let chosen = report.candidates(args.min_size);
     let items: Vec<&fad::tools::Resource> =
         chosen.iter().filter_map(|k| report.get(k)).collect();
+    let found = items.len();
 
     // Same rule as --reclaim --max: skip anything that would take the batch
     // over the cap rather than stopping at the first overshoot.
@@ -525,12 +826,18 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
         .collect();
 
     if items.is_empty() {
-        println!("fad: nothing the tools report as unused");
-        return 0;
+        match nothing_under_cap(found, args.max) {
+            Some(why) => println!("fad: {why}"),
+            None if unreachable != 0 => {
+                println!("fad: nothing to remove from the tools that answered")
+            }
+            None => println!("fad: nothing the tools report as unused"),
+        }
+        return unreachable;
     }
 
     for r in &items {
-        println!("{:>8}  {}", human(r.bytes), fad::tools::remove_line(&r.key()));
+        println!("{:>8}  {}", human(r.bytes), escape_controls(&fad::tools::remove_line(&r.key())));
     }
     // Report-aware, so that taking *every* image of a kind reports the tool's
     // own exact total rather than a floor: with nothing left behind to hold a
@@ -548,7 +855,7 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
         }
     }
     if args.dry_run {
-        return 0;
+        return unreachable;
     }
 
     let batch: Vec<_> = items.iter().map(|r| (r.key(), r.name.clone(), r.bytes)).collect();
@@ -561,69 +868,106 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
 
     let failures = job.failures();
     for o in &failures {
-        eprintln!("fad: {}: {}", o.label, o.result.as_ref().err().cloned().unwrap_or_default());
+        eprintln!("fad: {}: {}", escape_controls(&o.label), o.result.as_ref().err().cloned().unwrap_or_default());
     }
-    // Measured by asking the tools again, not by adding up what we hoped for.
+    // Measured by asking the tools again where they would answer; otherwise
+    // what the removed items were reported to hold, and labelled as such.
     match job.measured {
         Some(bytes) => println!("freed {} (measured)", human(bytes)),
-        None => println!("removed {} item(s)", job.done.len() - failures.len()),
+        None => println!("freed about {} (estimated)", human(job.expected())),
     }
-    i32::from(!failures.is_empty())
+    i32::from(!failures.is_empty()).max(unreachable)
+}
+
+/// Why a cleanup with candidates took none of them, when `--max` is the
+/// reason. "Nothing reclaimable" was printed both when there was nothing and
+/// when every candidate was bigger than the cap, which sends someone looking
+/// for a problem in the wrong place.
+fn nothing_under_cap(found: usize, max: Option<u64>) -> Option<String> {
+    let max = max.filter(|_| found > 0)?;
+    Some(format!(
+        "{found} item{}, {}larger than --max {}",
+        if found == 1 { "" } else { "s" },
+        if found == 1 { "" } else { "all " },
+        human(max)
+    ))
+}
+
+/// How a path moved between two scans.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Grew,
+    New,
+    Gone,
 }
 
 /// What changed since the last saved scan of this root. Answers "what did that
-/// install just add?", which no single scan can.
-fn print_since(tree: &Tree, args: &Args) -> i32 {
-    let Some((previous, at)) = fad::cache::load(tree.root_path()) else {
-        eprintln!(
-            "fad: no saved scan of {} to compare against \u{2014} run fad once first",
-            tree.root_path().display()
-        );
-        return 1;
-    };
-
-    // One entry per path present in either tree, at any depth down to --depth.
-    let mut changes: Vec<(PathBuf, i64, bool)> = Vec::new();
-    let mut stack = vec![(tree.root(), 0usize)];
-    while let Some((id, depth)) = stack.pop() {
-        let path = tree.path(id);
-        let now = tree.size(id, args.apparent) as i64;
-        let (delta, is_new) = match previous.find_path(&path) {
-            Some(then) => (now - previous.size(then, args.apparent) as i64, false),
-            None => (now, true),
-        };
-        if delta.unsigned_abs() >= args.min_size.max(1) {
-            changes.push((path, delta, is_new));
+/// install just add?", which no single scan can — and "what did that cleanup
+/// take?", which needs the paths that are no longer there.
+///
+/// Both trees are walked together, matching children by name: one pass over
+/// each, where resolving every path from the root again was quadratic in the
+/// depth and in the width of every directory on the way down.
+fn print_since(tree: &Tree, previous: &Tree, at: std::time::SystemTime, args: &Args) -> i32 {
+    let threshold = args.min_size.max(1);
+    let mut changes: Vec<(PathBuf, i64, Change)> = Vec::new();
+    let mut stack = vec![(tree.root(), previous.root(), 0usize)];
+    while let Some((now_id, then_id, depth)) = stack.pop() {
+        let delta = tree.size(now_id, args.apparent) as i64
+            - previous.size(then_id, args.apparent) as i64;
+        if delta.unsigned_abs() >= threshold {
+            changes.push((tree.path(now_id), delta, Change::Grew));
         }
-        // A directory that is entirely new is reported once, not once per file
-        // inside it.
-        if depth < args.depth && !is_new {
-            stack.extend(tree.node(id).children.iter().map(|c| (*c, depth + 1)));
+        if depth >= args.depth {
+            continue;
+        }
+        let mut before: std::collections::HashMap<&str, NodeId> = previous
+            .node(then_id)
+            .children
+            .iter()
+            .map(|c| (previous.node(*c).name.as_ref(), *c))
+            .collect();
+        for c in &tree.node(now_id).children {
+            match before.remove(tree.node(*c).name.as_ref()) {
+                Some(then) => stack.push((*c, then, depth + 1)),
+                // Entirely new: reported once, not once per file inside it.
+                None => {
+                    let size = tree.size(*c, args.apparent);
+                    if size >= threshold {
+                        changes.push((tree.path(*c), size as i64, Change::New));
+                    }
+                }
+            }
+        }
+        // What is left was there last time and is not now. Reported once,
+        // at the top of whatever went, with everything it held as the loss.
+        for (_, c) in before {
+            let size = previous.size(c, args.apparent);
+            if size >= threshold {
+                changes.push((previous.path(c), -(size as i64), Change::Gone));
+            }
         }
     }
-    changes.sort_unstable_by_key(|(_, d, _)| std::cmp::Reverse(d.abs()));
+    changes.sort_by(|(pa, a, _), (pb, b, _)| b.abs().cmp(&a.abs()).then_with(|| pa.cmp(pb)));
 
     if args.json {
         let items: Vec<_> = changes
             .iter()
-            .map(|(path, delta, is_new)| {
+            .map(|(path, delta, change)| {
                 serde_json::json!({
-                    "path": path,
+                    "path": json_path(path),
                     "delta": delta,
                     "change": format!("{}{}", if *delta < 0 { "-" } else { "+" }, human(delta.unsigned_abs())),
-                    "new": is_new,
+                    "new": *change == Change::New,
+                    "gone": *change == Change::Gone,
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "root": tree.root_path(),
-                "since": at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-                "changes": items,
-            }))
-            .unwrap()
-        );
+        print_json_value(&serde_json::json!({
+            "root": json_path(tree.root_path()),
+            "since": at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            "changes": items,
+        }));
         return 0;
     }
 
@@ -631,13 +975,17 @@ fn print_since(tree: &Tree, args: &Args) -> i32 {
         println!("fad: nothing changed by more than {}", human(args.min_size.max(1)));
         return 0;
     }
-    for (path, delta, is_new) in &changes {
+    for (path, delta, change) in &changes {
         println!(
             "{}{:>7}  {}{}",
             if *delta < 0 { '-' } else { '+' },
             human(delta.unsigned_abs()),
-            path.display(),
-            if *is_new { "  (new)" } else { "" }
+            display_path(path),
+            match change {
+                Change::New => "  (new)",
+                Change::Gone => "  (gone)",
+                Change::Grew => "",
+            }
         );
     }
     0
@@ -670,7 +1018,7 @@ fn print_reclaim_json(tree: &Tree, args: &Args) {
             .map(|id| {
                 let bytes = tree.size(*id, args.apparent);
                 let mut v = serde_json::json!({
-                    "path": tree.path(*id),
+                    "path": json_path(&tree.path(*id)),
                     "bytes": bytes,
                     "size": human(bytes),
                 });
@@ -690,23 +1038,19 @@ fn print_reclaim_json(tree: &Tree, args: &Args) {
     }
 
     let total: u64 = cats.iter().map(|c| c["bytes"].as_u64().unwrap_or(0)).sum();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "root": tree.root_path(),
+    print_json_value(&serde_json::json!({
+            "root": json_path(tree.root_path()),
             "bytes": total,
             "size": human(total),
             "categories": cats,
-        }))
-        .unwrap()
-    );
+        }));
 }
 
 fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::Value {
     let n = tree.node(id);
     let bytes = if args.apparent { n.total_len } else { n.total_bytes };
     let mut v = serde_json::json!({
-        "path": tree.path(id),
+        "path": json_path(&tree.path(id)),
         "bytes": bytes,
         "size": human(bytes),
         "files": n.file_count,
@@ -727,4 +1071,59 @@ fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::
         }
     }
     v
+}
+
+/// A path as it is shown to a person reading the terminal. See
+/// `fad::format::escape_controls`; not for `--print-path`, whose output is a
+/// path for a shell to use, nor for JSON, which escapes for itself.
+fn display_path(p: &std::path::Path) -> String {
+    escape_controls(&p.to_string_lossy())
+}
+
+/// A path for JSON output. Filenames are bytes, and on Linux need not be
+/// UTF-8; serde refuses such a path outright, and `json!` turned that refusal
+/// into a panic, so one oddly named directory under the root took the whole
+/// report down. Lossy is the honest rendering for a reader that only takes
+/// text — and the entries fad cannot name exactly are listed on stderr.
+fn json_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Print a JSON report, or say why it could not be printed. Never a panic.
+fn print_json_value(v: &serde_json::Value) {
+    match serde_json::to_string_pretty(v) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            eprintln!("fad: could not write the JSON report: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn sizes_take_any_spelling_of_a_binary_unit() {
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size("512"), Ok(512));
+        assert_eq!(parse_size("512b"), Ok(512));
+        for k in ["1k", "1K", "1kb", "1KB", "1KiB", "1kib", " 1 K "] {
+            assert_eq!(parse_size(k), Ok(1024), "{k}");
+        }
+        for g in ["2G", "2g", "2GB", "2GiB", "2gib"] {
+            assert_eq!(parse_size(g), Ok(2 << 30), "{g}");
+        }
+        assert_eq!(parse_size("1.5M"), Ok(3 << 19));
+        assert_eq!(parse_size("1T"), Ok(1 << 40));
+        assert_eq!(parse_size("1PiB"), Ok(1 << 50));
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_read_as_something() {
+        for bad in ["", "  ", "-5G", "-0", "nan", "NaN", "inf", "-inf", "infinity", "G", "1.2.3", "10X", "1e3", "99999999999P"] {
+            assert!(parse_size(bad).is_err(), "accepted {bad:?} as {:?}", parse_size(bad));
+        }
+    }
 }

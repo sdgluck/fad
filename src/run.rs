@@ -263,7 +263,8 @@ pub fn run(mut app: App, keep_stdout_clean: bool) -> io::Result<Outcome> {
         std::process::exit(128 + sig);
     }
     result?;
-    let selected = app.selected().map(|id| app.tree.path(id));
+    let selected =
+        if app.cancelled { None } else { app.selected().map(|id| app.tree.path(id)) };
     Ok(Outcome { tree: app.tree_is_complete().then_some(app.tree), selected })
 }
 
@@ -685,15 +686,23 @@ fn normal_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
     // nothing else: a stray `space` meant as "no" should not also unstage
     // something.
     if std::mem::take(&mut app.ui.quit_armed) {
-        if k.code == KeyCode::Char('q') || (ctrl && k.code == KeyCode::Char('c')) {
+        if k.code == KeyCode::Char('q') {
             app.should_quit = true;
+        } else if ctrl && k.code == KeyCode::Char('c') {
+            app.should_quit = true;
+            app.cancelled = true;
         }
         app.mark_dirty();
         return None;
     }
     match k.code {
         KeyCode::Char('q') => request_quit(app),
-        KeyCode::Char('c') if ctrl => request_quit(app),
+        // ctrl-c is the way out with nothing chosen: under `--print-path` it
+        // prints nothing, so `fad-cd` stays where it was.
+        KeyCode::Char('c') if ctrl => {
+            request_quit(app);
+            app.cancelled = app.should_quit;
+        }
         KeyCode::Esc => back_out(app),
 
         KeyCode::Char('j') | KeyCode::Down => move_cursor(app, 1),

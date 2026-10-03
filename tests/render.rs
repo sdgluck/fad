@@ -129,7 +129,7 @@ fn snapshot_round_trips_and_keeps_the_users_place() {
     let staged_path = app.tree.path(biggest);
 
     fad::cache::save(&app.tree).unwrap();
-    let (loaded, _at) = fad::cache::load(dir.path()).expect("snapshot did not load");
+    let (loaded, _at) = fad::cache::load(dir.path(), &ScanOpts::default()).expect("snapshot did not load");
     assert_eq!(
         loaded.node(loaded.root()).total_bytes,
         app.tree.node(root).total_bytes,
@@ -153,7 +153,7 @@ fn a_snapshot_of_another_directory_is_rejected() {
 
     let app = app_for(a.path());
     fad::cache::save(&app.tree).unwrap();
-    assert!(fad::cache::load(b.path()).is_none(), "loaded a foreign snapshot");
+    assert!(fad::cache::load(b.path(), &ScanOpts::default()).is_none(), "loaded a foreign snapshot");
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn the_detail_pane_reports_what_grew_since_the_last_scan() {
     std::fs::write(root.join("cache/b"), vec![0u8; 6 * 1024 * 1024]).unwrap();
 
     let mut app2 = app_for(&root);
-    let (snapshot, at) = fad::cache::load(&root).expect("snapshot did not load");
+    let (snapshot, at) = fad::cache::load(&root, &ScanOpts::default()).expect("snapshot did not load");
     // The walk has already finished here, so the snapshot is no use as a
     // display — it is kept purely for the comparison.
     app2.install_snapshot_for_test(snapshot, at);

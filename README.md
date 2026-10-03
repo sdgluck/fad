@@ -81,7 +81,7 @@ sign of movement reads as a hang.
 | `i` | never rank this again — adds it to your ignore list |
 | `!` | what is not in these numbers — skipped, unreadable, ignored |
 | `esc` | back out one level — the filter, then the view, then the age filter; quits at the top |
-| `?` | help — `j` `k` scroll it, any other key closes it · `q` quit |
+| `?` | help — `j` `k` scroll it, any other key closes it · `q` quit · `ctrl-c` quit without choosing (for `--print-path`) |
 
 The mouse works too: click a row to select it, click its arrow to open or close
 it, click the left edge to stage it, and use the wheel to move the selection.
@@ -117,20 +117,27 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --reclaim         open in the reclaimable view; with --json, print that set
 --tools           open in the tool storage view; with --json, print that report
 --yes             with --reclaim or --tools, act instead of opening the UI
---max 10G         with --yes, stop once this much is staged
---dry-run         with --yes, print what would go and remove nothing
+--max 10G         with --yes (either kind), skip anything that would go over this
+--dry-run         with --yes (either kind), print what would go and remove nothing
 --permanent       with --reclaim --yes, delete outright instead of trashing
 --since           print what changed since the last saved scan of this root
 --print-path      print the selected path on exit, for `cd "$(fad --print-path)"`
 --json            dump the ranked tree as JSON instead of opening the UI
---min-size 100M   hide entries below a threshold (--json)
---depth N         how deep to print (--json, default 2)
+--min-size 100M   leave out smaller entries (--json, --since, --reclaim/--tools --yes)
+--depth N         how deep to report (--json and --since, default 2)
 --init zsh        print shell integration: completions and a `fad-cd` function
 --man             print this tool's man page, in roff
 --no-mouse        do not capture the mouse, so text selection keeps working
 --no-cache        ignore any snapshot and always walk from scratch
 --clear-cache     delete every saved snapshot and exit
 ```
+
+Combinations that would quietly do something other than what they say are
+refused: `--dry-run`, `--permanent` and `--max` need `--yes`; `--yes` needs
+`--reclaim` or `--tools`; `--permanent` does not go with `--tools`, whose
+removals are always permanent; `--since` stands alone; and `--print-path` and
+`--json` both want standard output. Without a terminal, the interactive view
+says so and points at the flags that need none.
 
 ## Where the size is
 
@@ -443,9 +450,12 @@ batch over the cap rather than stopping there — otherwise a 2G cap could recla
 nothing at all when the biggest candidate happens to be 3G.
 
 `--since` compares against the saved snapshot and prints the biggest changes
-first, then leaves the fresh walk behind as the new baseline, so it can be run
-on a timer. It answers "what did that install just add?", which no single scan
-can.
+first — growth, entries that are new, and entries that are gone, each reported
+once at the top of what appeared or went — then leaves the fresh walk behind as
+the new baseline, so it can be run on a timer. It answers "what did that install
+just add?", which no single scan can. A snapshot only counts as a baseline for a
+scan of the same root with the same `--cross-device` and `--cloud`; the first
+run of a new combination saves one and exits 1.
 
 ### In your shell
 
@@ -455,10 +465,16 @@ fad --man > /usr/local/share/man/man1/fad.1  # and man fad works
 ```
 
 That gives you completions for every flag, and `fad-cd`: run `fad`, quit on a
-directory, and land in it. Nothing can change your shell's directory from a
-child process, so this is the one thing a shell function is needed for. Quitting
-on a file lands you in the directory holding it — `cd` into a 40G disk image is
-not what anyone meant.
+directory with `q`, and land in it. Nothing can change your shell's directory
+from a child process, so this is the one thing a shell function is needed for.
+Quitting on a file lands you in the directory holding it — `cd` into a 40G disk
+image is not what anyone meant. Quitting with `ctrl-c` instead chooses nothing:
+`--print-path` prints nothing and exits 1, and `fad-cd` leaves you where you
+were. `fad-cd` completes exactly as `fad` does.
+
+In zsh, put the `eval` after `compinit` (which frameworks such as oh-my-zsh run
+for you). Evaluated before it, the `fad-cd` function still works and the
+completions are skipped rather than failing with "command not found: compdef".
 
 Both are generated from the argument parser itself, so they describe the flags
 this binary has rather than a copy that drifts away from it.
@@ -494,6 +510,12 @@ shows both.
 A file with several hard links is counted once, against the lexicographically
 first of its paths.
 
+Every unit is a power of 1024, as in `du -h`: `1G` is 2³⁰ bytes, on screen and
+on the command line alike. `--min-size` and `--max` take `K`, `M`, `G`, `T` and
+`P` in any case, with or without `B` or `iB` (`100M`, `100mb` and `100MiB` are
+the same size), and refuse negatives, `nan`, `inf` and unknown units rather
+than guessing.
+
 ## What is not scanned
 
 - **Other filesystems.** Mount points are shown but not entered. `--cross-device`
@@ -504,8 +526,12 @@ first of its paths.
 - **Cloud folders (macOS).** iCloud Drive, Dropbox, OneDrive and similar
   FileProvider-backed folders are skipped, because reading inside one can block
   on the network for minutes. `--cloud` opts in. Linux has no equivalent skip.
-- **Directories that cannot be read.** Counted and reported; on macOS, granting
-  your terminal Full Disk Access usually fixes this.
+- **Directories that cannot be read.** Counted and reported, with the reason;
+  when the reason is a permission refusal on macOS, granting your terminal Full
+  Disk Access usually fixes it. A directory that lists its names but will not
+  let them be examined (read without search permission) is reported the same
+  way rather than shown as an empty 0 B, and trees deeper than `PATH_MAX` are
+  walked to the bottom.
 
 Anything skipped is reported in a banner, so an incomplete number is never shown
 as a complete one. A banner says how many, which is enough to know a total is
@@ -639,8 +665,16 @@ banner, and refused for deletion.
 | scan snapshots | `~/Library/Caches/fad` | `$XDG_CACHE_HOME/fad` |
 | undo journal | `~/Library/Application Support/fad` | `$XDG_DATA_HOME/fad` |
 
-`FAD_CONFIG_DIR`, `FAD_CACHE_DIR` and `FAD_STATE_DIR` override these. Snapshots are only written
-for scans that ran to completion, and `--clear-cache` removes them all.
+`FAD_CONFIG_DIR`, `FAD_CACHE_DIR` and `FAD_STATE_DIR` override these, and name
+the directory itself — no `fad/` is appended. Snapshots are only written for
+scans that ran to completion, one per root and set of scan options.
+
+The snapshot cache looks after its own size. Each save drops snapshots that
+have not been saved or read in 60 days, then, if what is left is over 1 GiB,
+the least recently used until it fits; the one just written is always kept.
+`--clear-cache` removes every snapshot — only the `*.snap` files fad wrote,
+never anything else in the directory — and the directory too if that leaves
+it empty.
 
 ## Development
 

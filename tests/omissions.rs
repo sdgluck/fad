@@ -263,3 +263,172 @@ mod unnamed {
         );
     }
 }
+
+/// Read permission without search permission: `readdir` lists the names and
+/// `fstatat` refuses every one of them. That used to come out as an empty,
+/// complete directory of 0 B — the one answer this screen exists to rule out.
+#[test]
+fn a_directory_that_lists_but_will_not_stat_is_reported() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+    let root = dir.path().join("scan");
+    mk(&root, "shut/inside.bin", 64 * 1024);
+    let shut = root.join("shut");
+
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("skipped: running as root, where every entry stats");
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut app = app_for(&root);
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let id = app.tree.find_path(&app.tree.root_path().join("shut")).unwrap();
+    assert_ne!(
+        app.tree.node(id).flags & fad::tree::flags::UNREADABLE,
+        0,
+        "reported as complete when nothing in it could be measured"
+    );
+    assert_eq!(app.tree.unreadable_count, 1);
+    assert_eq!(app.tree.unreadable_why[0].1, std::io::ErrorKind::PermissionDenied);
+
+    app.collect_omissions();
+    let found: Vec<_> = app.omissions.iter().filter(|o| o.why == Why::Unreadable).collect();
+    assert_eq!(found.len(), 1, "not on the omissions screen");
+    assert!(found[0].path.ends_with("shut"));
+}
+
+/// The same thing from a script: `--json` names it on stderr, with a reason.
+#[test]
+fn json_names_a_partly_unreadable_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    mk(dir.path(), "shut/inside.bin", 4096);
+    let shut = dir.path().join("shut");
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_fad"))
+        .arg(dir.path())
+        .arg("--json")
+        .env("FAD_CACHE_DIR", dir.path().join("cache"))
+        .env("FAD_STATE_DIR", dir.path().join("state"))
+        .env("FAD_CONFIG_DIR", dir.path().join("config"))
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {err}");
+    assert!(err.contains("could not be read"), "no warning: {err}");
+    assert!(err.contains("/shut"), "the directory is not named: {err}");
+    assert!(err.contains("permission denied"), "no reason given: {err}");
+}
+
+/// Full Disk Access is the remedy for a permission refusal and for nothing
+/// else; a path too long to open gets told what it is.
+#[test]
+fn only_a_permission_refusal_is_told_to_grant_access() {
+    use fad::tree::{PERMISSION_FIX, unreadable_reason};
+    assert!(unreadable_reason(std::io::ErrorKind::PermissionDenied).contains(PERMISSION_FIX));
+    let long = unreadable_reason(std::io::ErrorKind::InvalidFilename);
+    assert!(!long.contains(PERMISSION_FIX), "{long}");
+    assert!(long.contains("too long"), "{long}");
+    assert!(!unreadable_reason(std::io::ErrorKind::NotFound).contains(PERMISSION_FIX));
+}
+
+/// Deeper than `PATH_MAX`: the kernel refuses the whole path, so the walk has
+/// to reach it a component at a time. Built with `mkdirat` for the same reason.
+#[test]
+fn a_tree_deeper_than_path_max_is_walked_to_the_bottom() {
+    use std::ffi::CString;
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let cname = CString::new("d".repeat(200)).unwrap();
+    // 30 levels of 201 bytes is past 4096, which is past every PATH_MAX.
+    let levels = 30;
+    let croot = CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+    let mut fd = unsafe { libc::open(croot.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    assert!(fd >= 0);
+    for _ in 0..levels {
+        assert_eq!(unsafe { libc::mkdirat(fd, cname.as_ptr(), 0o755) }, 0);
+        let next =
+            unsafe { libc::openat(fd, cname.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        unsafe { libc::close(fd) };
+        assert!(next >= 0);
+        fd = next;
+    }
+    let file = CString::new("bottom.bin").unwrap();
+    let f = unsafe { libc::openat(fd, file.as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644) };
+    assert!(f >= 0);
+    let buf = vec![7u8; 256 * 1024];
+    assert_eq!(unsafe { libc::write(f, buf.as_ptr().cast(), buf.len()) }, buf.len() as isize);
+    unsafe {
+        libc::close(f);
+        libc::close(fd);
+    }
+
+    let (mut tree, scan) = Scan::start(&root, ScanOpts::default()).unwrap();
+    scan.finish(&mut tree);
+    assert_eq!(tree.unreadable_count, 0, "{:?}", tree.unreadable_why);
+    let r = tree.node(tree.root());
+    assert_eq!(r.dir_count, levels as u64);
+    assert_eq!(r.file_count, 1, "never reached the bottom");
+    assert!(r.total_bytes >= 256 * 1024);
+}
+
+fn fad_json(root: &Path, extra: &[&str]) -> std::process::Output {
+    let cache = tempfile::tempdir().unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_fad"))
+        .arg(root)
+        .args(extra)
+        .env("FAD_CACHE_DIR", cache.path())
+        .env("FAD_STATE_DIR", cache.path().join("state"))
+        .env("FAD_CONFIG_DIR", cache.path().join("config"))
+        .output()
+        .unwrap()
+}
+
+/// A root that cannot be read has no size to report. It used to print
+/// `"bytes": 0` and exit 0 — an empty directory, as far as a script could tell.
+#[test]
+fn an_unreadable_root_is_an_error_not_zero_bytes() {
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    for mode in [0o000, 0o644] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        mk(&root, "inside.bin", 4096);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+        let json = fad_json(&root, &["--json"]);
+        let since = fad_json(&root, &["--since"]);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for out in [json, since] {
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "mode {mode:o}: {err}");
+            assert!(out.stdout.is_empty(), "mode {mode:o} printed a report");
+            assert!(err.to_lowercase().contains("permission denied"), "mode {mode:o}: {err}");
+        }
+    }
+}
+
+/// Every kind of omission reaches `--json`'s stderr, not only the ones with a
+/// flag to fix them.
+#[cfg(target_os = "linux")]
+#[test]
+fn json_lists_entries_it_cannot_name() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir"));
+    std::fs::create_dir(&bad).unwrap();
+    let out = fad_json(dir.path(), &["--json"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("not valid UTF-8") && err.contains("bad"), "{err}");
+}

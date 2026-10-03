@@ -202,3 +202,119 @@ fn an_ambiguous_image_extension_needs_a_size_to_vouch_for_it() {
         .collect();
     assert!(!offered.iter().any(|n| n == "P1000123.raw"), "offered to --reclaim: {offered:?}");
 }
+
+/// Everything under a removed directory is gone too, not only the directory.
+/// Left looking alive in the arena, the descendants went on being reported by
+/// anything that walks it by index, and were written back into the snapshot.
+#[test]
+fn removing_a_directory_takes_everything_under_it() {
+    use fad::tree::flags;
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut tree = scan(dir.path());
+    let a = find(&tree, "a");
+    let deep = find(&tree, "a/b/c/deep.bin");
+    let other = find(&tree, "other.bin");
+
+    tree.remove(a).unwrap();
+    assert_ne!(tree.node(deep).flags & flags::DELETED, 0, "a descendant still looks alive");
+    assert_eq!(tree.node(other).flags & flags::DELETED, 0, "a bystander was marked");
+    // Removing a descendant of something already removed frees nothing more.
+    assert!(tree.remove(deep).is_none());
+
+    let back = Tree::from_snapshot(tree.to_snapshot()).expect("the snapshot did not load");
+    assert!(back.find_path(&back.root_path().join("a")).is_none(), "came back from the snapshot");
+    let names: Vec<_> = (0..back.len() as NodeId).map(|i| back.node(i).name.to_string()).collect();
+    assert!(!names.iter().any(|n| n == "deep.bin" || n == "mid.bin"), "{names:?}");
+    assert!(back.find_path(&back.root_path().join("other.bin")).is_some());
+    assert_eq!(back.node(back.root()).total_bytes, tree.node(tree.root()).total_bytes);
+}
+
+/// Two names for one file, both in the tree. Removing the one that carries the
+/// bytes frees nothing — the other name still holds the data — and the bytes
+/// have to move to the survivor rather than vanish from the totals.
+#[test]
+fn removing_the_counted_link_moves_its_bytes_to_the_survivor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    std::fs::write(root.join("a/one"), vec![1u8; 1024 * 1024]).unwrap();
+    std::fs::hard_link(root.join("a/one"), root.join("b/two")).unwrap();
+    let mut tree = scan(root);
+
+    let one = find(&tree, "a/one");
+    let two = find(&tree, "b/two");
+    let b = find(&tree, "b");
+    let size = tree.node(one).self_bytes;
+    assert!(size > 0 && tree.node(two).self_bytes == 0, "the scan did not pick `a/one`");
+    let root_before = tree.node(tree.root()).total_bytes;
+
+    assert_eq!(tree.remove(one), Some(0), "reported bytes freed that are still on disk");
+    assert_eq!(tree.node(two).self_bytes, size, "the survivor did not inherit the bytes");
+    assert_eq!(tree.node(b).total_bytes, tree.node(b).self_bytes + size);
+    assert_eq!(tree.node(tree.root()).total_bytes, root_before, "the bytes left the totals");
+    assert_eq!(
+        tree.node(two).flags & fad::tree::flags::HARDLINK_DUPE,
+        0,
+        "the survivor is still marked as a copy"
+    );
+
+    // Now it is the last name, and removing it does free the data.
+    assert_eq!(tree.remove(two), Some(size));
+}
+
+#[test]
+fn removing_an_uncounted_link_frees_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("a"), vec![1u8; 512 * 1024]).unwrap();
+    std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+    let mut tree = scan(root);
+    let before = tree.node(tree.root()).total_bytes;
+    assert_eq!(tree.remove(find(&tree, "b")), Some(0));
+    assert_eq!(tree.node(tree.root()).total_bytes, before);
+}
+
+/// Both links inside one removed directory: the whole file goes.
+#[test]
+fn removing_every_link_at_once_frees_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    std::fs::write(root.join("d/a"), vec![1u8; 512 * 1024]).unwrap();
+    std::fs::hard_link(root.join("d/a"), root.join("d/b")).unwrap();
+    let mut tree = scan(root);
+    let d = find(&tree, "d");
+    let total = tree.node(d).total_bytes;
+    assert_eq!(tree.remove(d), Some(total));
+}
+
+/// A link outside the scan root keeps the data alive however many of the
+/// inside ones go.
+#[test]
+fn a_link_outside_the_tree_keeps_the_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("scan");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("inside"), vec![1u8; 512 * 1024]).unwrap();
+    std::fs::hard_link(root.join("inside"), dir.path().join("outside")).unwrap();
+    let mut tree = scan(&root);
+    assert_eq!(tree.remove(find(&tree, "inside")), Some(0));
+}
+
+/// A tree loaded from a snapshot is on screen while the fresh walk runs, and
+/// can be deleted from. It has to know its hard links as well as a scanned one.
+#[test]
+fn a_snapshot_remembers_which_links_share_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("a"), vec![1u8; 512 * 1024]).unwrap();
+    std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+    let scanned = scan(root);
+    let mut tree = Tree::from_snapshot(scanned.to_snapshot()).unwrap();
+    let a = find(&tree, "a");
+    let size = tree.node(a).self_bytes;
+    assert_eq!(tree.remove(a), Some(0), "the loaded tree forgot `b` holds the same data");
+    assert_eq!(tree.node(find(&tree, "b")).self_bytes, size);
+}

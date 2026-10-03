@@ -301,8 +301,9 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled(
             truncate_end(
                 &format!(
-                    " \u{26a0} {unreadable} unreadable director{} not counted \u{2014} grant Full Disk Access to your terminal",
-                    if unreadable == 1 { "y" } else { "ies" }
+                    " \u{26a0} {unreadable} unreadable director{} not counted \u{2014} {}",
+                    if unreadable == 1 { "y" } else { "ies" },
+                    app.tree.unreadable_fix()
                 ),
                 width,
             ),
