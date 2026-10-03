@@ -124,3 +124,115 @@ fn already_emptied_entries_are_not_offered() {
     assert!(delete::trashed_entries().is_empty(), "offered to empty something already gone");
     assert_eq!(delete::still_in_trash(), (0, 0));
 }
+
+/// A file "trashed" into a `.Trash` inside the scratch tree and journalled the
+/// way `Job` journals it, so these tests never touch the real Trash.
+fn fake_trashed(dir: &std::path::Path, name: &str) -> (PathBuf, PathBuf) {
+    let trash = dir.join(".Trash");
+    std::fs::create_dir_all(&trash).unwrap();
+    let (from, to) = (dir.join(name), trash.join(name));
+    std::fs::write(&to, b"what fad trashed").unwrap();
+    delete::Recorder::new().record(&from, &to, 16).unwrap();
+    (from, to)
+}
+
+fn erase(paths: Vec<PathBuf>) -> Job {
+    let mut job = Job::erase(paths.into_iter().map(|p| (p, 16)).collect());
+    wait(&mut job);
+    job
+}
+
+/// Something else now sitting at the recorded trash path — the user emptied
+/// the trash and trashed another file of the same name — is not fad's to erase.
+#[test]
+fn a_replaced_item_is_not_erased() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let (_, to) = fake_trashed(dir.path(), "report.pdf");
+    std::fs::remove_file(&to).unwrap();
+    std::fs::write(&to, b"somebody else's report").unwrap();
+
+    let job = erase(vec![to.clone()]);
+    let failures = job.failures();
+    assert_eq!(failures.len(), 1, "erased something fad did not trash");
+    assert!(
+        failures[0].result.as_ref().unwrap_err().contains("no longer the thing fad trashed"),
+        "wrong reason: {:?}",
+        failures[0].result
+    );
+    assert_eq!(std::fs::read(&to).unwrap(), b"somebody else's report");
+}
+
+/// The same thing still there is erased as before.
+#[test]
+fn the_item_fad_trashed_is_erased() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let (_, to) = fake_trashed(dir.path(), "old.log");
+    let job = erase(vec![to.clone()]);
+    assert_eq!(job.failures().len(), 0, "{:?}", job.failures());
+    assert!(to.symlink_metadata().is_err());
+}
+
+/// An entry from a journal that predates identities cannot be checked, and an
+/// erase that cannot be checked does not happen.
+#[test]
+fn an_unverifiable_entry_is_not_erased() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let to = dir.path().join(".Trash/legacy.bin");
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::write(&to, b"x").unwrap();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    let line = serde_json::json!({
+        "at": 1,
+        "entries": [{ "from": dir.path().join("legacy.bin"), "to": to, "bytes": 1 }],
+    });
+    std::fs::write(dir.path().join("state/undo.jsonl"), format!("{line}\n")).unwrap();
+
+    let job = erase(vec![to.clone()]);
+    assert_eq!(job.failures().len(), 1);
+    assert!(job.failures()[0].result.as_ref().unwrap_err().contains("older fad"));
+    assert!(to.exists(), "erased an entry it could not verify");
+}
+
+/// A path the journal has never heard of is refused outright, even inside a
+/// trash directory.
+#[test]
+fn a_path_fad_never_trashed_is_not_erased() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let stranger = dir.path().join(".Trash/stranger.bin");
+    std::fs::create_dir_all(stranger.parent().unwrap()).unwrap();
+    std::fs::write(&stranger, b"x").unwrap();
+
+    let job = erase(vec![stranger.clone()]);
+    assert_eq!(job.failures().len(), 1);
+    assert!(stranger.exists());
+}
+
+/// Undo will not put back something that took the trashed item's place.
+#[test]
+fn undo_skips_a_replaced_item() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let (from, to) = fake_trashed(dir.path(), "notes.md");
+    std::fs::remove_file(&to).unwrap();
+    std::fs::write(&to, b"different").unwrap();
+
+    let report = delete::undo_last().unwrap();
+    assert_eq!(report.restored, 0);
+    assert!(report.skipped[0].1.contains("no longer the thing fad trashed"));
+    assert!(!from.exists(), "restored something fad did not trash");
+    assert!(to.exists());
+}

@@ -108,12 +108,26 @@ impl Job {
     /// done to each path, and that nothing is journalled: these entries are
     /// already in the journal, and after this they are the record of a batch
     /// that can no longer be put back.
+    ///
+    /// Each path is checked against the journal immediately before it goes:
+    /// it has to be one fad recorded, and the thing there now has to be the
+    /// thing fad put there (`Entry::check`). Anything else — a path the
+    /// journal does not know, an item replaced since, an entry from a journal
+    /// too old to say what it was — is reported as a failure and left alone.
     pub fn erase(items: Vec<(PathBuf, u64)>) -> Job {
         let total = items.len();
         let (tx, rx) = crossbeam_channel::unbounded();
         std::thread::spawn(move || {
+            let journal = read_journal();
             for (path, bytes) in items {
-                let result = trash::erase(&path).map(|_| None).map_err(|e| e.to_string());
+                // The newest record for this path is the one that describes
+                // what is there now.
+                let entry = journal.iter().flat_map(|b| &b.entries).rev().find(|e| e.to == path);
+                let result = match entry.map(Entry::check) {
+                    None => Err("not something fad trashed — left alone".to_string()),
+                    Some(Err(why)) => Err(why.reason().to_string()),
+                    Some(Ok(())) => trash::erase(&path).map(|_| None).map_err(|e| e.to_string()),
+                };
                 if tx.send(Outcome { path, bytes, result }).is_err() {
                     break;
                 }
@@ -237,6 +251,87 @@ pub struct Entry {
     pub from: PathBuf,
     pub to: PathBuf,
     pub bytes: u64,
+    /// What fad left at `to`, taken just after the move. `None` in a journal
+    /// from before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<Landed>,
+}
+
+/// Enough of an inode to tell that the thing at a trash path is still the
+/// thing fad put there.
+///
+/// The journal is a list of paths, and a path is only a name: the user can
+/// empty the trash and trash something else that lands under the same name,
+/// or restore an item from Finder and have a different one take its slot.
+/// Emptying works off those paths and is irreversible, so it has to know it
+/// is erasing what fad trashed and not whatever is called that now.
+///
+/// Taken *after* the move, because a rename moves `ctime` — which is also why
+/// `ctime` and `mtime` are not part of it. A directory's length is left out
+/// too: it counts entries, and a Finder window opened on the trash can drop a
+/// `.DS_Store` into it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Landed {
+    pub dev: u64,
+    pub ino: u64,
+    /// `f`ile, `d`irectory, `l`ink or `o`ther.
+    pub kind: char,
+    pub len: u64,
+}
+
+impl Landed {
+    pub fn of(path: &Path) -> Option<Landed> {
+        use std::os::unix::fs::MetadataExt;
+
+        let m = std::fs::symlink_metadata(path).ok()?;
+        let t = m.file_type();
+        let kind = if t.is_dir() {
+            'd'
+        } else if t.is_symlink() {
+            'l'
+        } else if t.is_file() {
+            'f'
+        } else {
+            'o'
+        };
+        Some(Landed { dev: m.dev(), ino: m.ino(), kind, len: if kind == 'd' { 0 } else { m.len() } })
+    }
+}
+
+/// What makes an entry not safe to act on, if anything.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unsafe {
+    /// Nothing at the recorded path.
+    Gone,
+    /// Something is there, but not what fad put there.
+    Replaced,
+    /// Recorded before fad kept identities, so there is no telling.
+    Unverifiable,
+}
+
+impl Unsafe {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Unsafe::Gone => "no longer in the Trash",
+            Unsafe::Replaced => "no longer the thing fad trashed — left alone",
+            Unsafe::Unverifiable => {
+                "trashed by an older fad that did not record what it was, so it cannot be \
+                 checked — left alone; empty it from the Trash yourself"
+            }
+        }
+    }
+}
+
+impl Entry {
+    /// Is the thing at `to` still what fad trashed?
+    pub fn check(&self) -> Result<(), Unsafe> {
+        let now = Landed::of(&self.to).ok_or(Unsafe::Gone)?;
+        match self.landed {
+            None => Err(Unsafe::Unverifiable),
+            Some(was) if was == now => Ok(()),
+            Some(_) => Err(Unsafe::Replaced),
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -303,7 +398,12 @@ impl Recorder {
         let line = Batch {
             id: self.id,
             at: self.at,
-            entries: vec![Entry { from: from.to_path_buf(), to: to.to_path_buf(), bytes }],
+            entries: vec![Entry {
+                from: from.to_path_buf(),
+                to: to.to_path_buf(),
+                bytes,
+                landed: Landed::of(to),
+            }],
         };
         if !self.started {
             let mut batches = read_at(&path);
@@ -446,9 +546,17 @@ pub fn undo_batch(id: u64) -> Result<UndoReport, String> {
 
     let mut report = UndoReport { restored: 0, bytes: 0, skipped: Vec::new() };
     for e in &batch.entries {
-        if !e.to.exists() {
-            report.skipped.push((e.from.clone(), "no longer in the Trash".into()));
-            continue;
+        // Putting back whatever is at the recorded path now would move some
+        // other trashed thing into a place the user never had it. An entry
+        // from before identities were kept is let through: a restore moves
+        // rather than destroys, and refusing would strand every batch an
+        // older fad trashed.
+        match e.check() {
+            Ok(()) | Err(Unsafe::Unverifiable) => {}
+            Err(why) => {
+                report.skipped.push((e.from.clone(), why.reason().into()));
+                continue;
+            }
         }
         if e.from.exists() {
             report.skipped.push((e.from.clone(), "something is there now".into()));
