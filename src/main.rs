@@ -11,10 +11,10 @@ use fad::presets::Category;
 use fad::tree::{NodeId, Tree};
 
 /// Find and delete what is eating your disk.
-///
-/// The flags that act without a person watching are tied together in the
-/// parser rather than checked by hand: a `--dry-run` that was silently ignored
-/// because `--yes` was missing reads as a promise it did not keep.
+//
+// The flags that act without a person watching are tied together in the
+// parser rather than checked by hand: a `--dry-run` that was silently ignored
+// because `--yes` was missing reads as a promise it did not keep.
 #[derive(Parser, Debug)]
 #[command(name = "fad", version, about)]
 #[command(group(clap::ArgGroup::new("act").args(["reclaim", "tools"]).multiple(true)))]
@@ -118,6 +118,105 @@ struct Args {
     no_mouse: bool,
 }
 
+/// What the parser cannot generate: the keys, the files, the environment.
+/// Kept beside the flags so a change to one is a reminder to look at the
+/// other; the keys mirror the README's table, the files `paths.rs`, and the
+/// environment every variable fad reads.
+const MAN_EXTRA: &str = r#".SH KEYS
+.TP
+\fBj\fR, \fBk\fR, \fBUp\fR, \fBDown\fR
+Move. \fBg\fR and \fBG\fR go to the first and last row; \fBctrl\-d\fR and \fBctrl\-u\fR jump ten.
+.TP
+\fBl\fR, \fBRight\fR, \fBEnter\fR
+Expand. \fBh\fR or \fBLeft\fR collapses, or jumps to the parent.
+.TP
+\fBspace\fR
+Stage or unstage. \fBA\fR stages everything in this directory or category.
+.TP
+\fBx\fR
+Open the staging basket: review, unstage, commit.
+.TP
+\fBu\fR
+Undo the last committed batch. \fBU\fR opens the undo history, to put back any of the last 20.
+.TP
+\fBE\fR
+Empty the trash \(em only what fad put there, and only then is the space reclaimed.
+.TP
+\fBr\fR
+Reclaimable view: build artifacts, package caches, app caches, VM images.
+.TP
+\fBt\fR
+Tool storage: what Docker and friends hold that a walk cannot see.
+.TP
+\fBd\fR
+Duplicate view: files whose contents are byte\-for\-byte equal. \fBL\fR there makes the copies share one copy of the storage.
+.TP
+\fBa\fR
+Age filter: any age, untouched 90 days, 1 year, 2 years.
+.TP
+\fB/\fR
+Fuzzy filter on what is on screen. \fBEnter\fR keeps it, \fBEsc\fR clears it.
+.TP
+\fBf\fR
+Find any entry in the tree by name, biggest first.
+.TP
+\fBs\fR
+Cycle the sort: size, count, modified, name. \fBR\fR rescans.
+.TP
+\fBS\fR
+Bring the next detail breakdown to the top.
+.TP
+\fBo\fR, \fBe\fR, \fBy\fR
+Reveal in the file manager, open in \fB$EDITOR\fR, copy the path.
+.TP
+\fBi\fR
+Never rank this again: adds it to the ignore list.
+.TP
+\fB!\fR
+What is not in these numbers: skipped, unreadable, ignored.
+.TP
+\fB?\fR
+Help.
+.TP
+\fBq\fR, \fBEsc\fR
+Quit. With \fB\-\-print\-path\fR, the path under the cursor is printed.
+.TP
+\fBctrl\-c\fR
+Quit without choosing. With \fB\-\-print\-path\fR, nothing is printed and fad exits 1, so \fBfad\-cd\fR stays where it is.
+.SH FILES
+.TP
+\fI~/Library/Caches/fad\fR (macOS), \fI$XDG_CACHE_HOME/fad\fR (elsewhere)
+Snapshots of completed scans, one \fI*.snap\fR file per root and set of scan options. Pruned on every save: anything unused for 60 days goes, then the least recently used until the rest fits in 1 GiB. \fB\-\-clear\-cache\fR removes them.
+.TP
+\fI~/Library/Application Support/fad/undo.jsonl\fR (macOS), \fI$XDG_DATA_HOME/fad/undo.jsonl\fR (elsewhere)
+The undo journal: what each committed batch moved to the trash, and from where.
+.TP
+\fI~/.config/fad/ignore\fR, or \fI$XDG_CONFIG_HOME/fad/ignore\fR
+The ignore list, one path or pattern per line.
+.SH ENVIRONMENT
+.TP
+\fBFAD_CACHE_DIR\fR
+The snapshot directory itself; no \fIfad/\fR is appended.
+.TP
+\fBFAD_STATE_DIR\fR
+The directory holding the undo journal.
+.TP
+\fBFAD_CONFIG_DIR\fR
+The directory holding the ignore list.
+.TP
+\fBFAD_DOCKER_BIN\fR, \fBFAD_PODMAN_BIN\fR, \fBFAD_TMUTIL_BIN\fR
+The program asked about Docker, Podman, and Time Machine local snapshots, in place of the one on \fBPATH\fR.
+.TP
+\fBXDG_CACHE_HOME\fR, \fBXDG_DATA_HOME\fR, \fBXDG_CONFIG_HOME\fR
+Base directories for the files above, honoured when absolute.
+.TP
+\fBHOME\fR
+The default scan root, and the base of every default location.
+.TP
+\fBEDITOR\fR
+What \fBe\fR opens an entry in.
+"#;
+
 /// The shells `--init` knows how to write for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Shell {
@@ -189,6 +288,7 @@ fn main() {
             eprintln!("fad: could not render the man page: {e}");
             std::process::exit(1);
         }
+        out.extend_from_slice(MAN_EXTRA.as_bytes());
         use std::io::Write;
         let _ = std::io::stdout().write_all(&out);
         return;

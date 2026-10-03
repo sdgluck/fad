@@ -203,3 +203,41 @@ fn tools_yes_with_the_daemon_down_says_so_and_fails() {
     assert!(err.contains("not running"), "{err}");
     assert!(!text.contains("nothing the tools report as unused"), "{text}");
 }
+
+/// The parser can describe the flags and nothing else. The keys, the files
+/// fad writes and the environment it reads are what a man page is opened for.
+#[test]
+fn the_man_page_covers_keys_files_and_environment() {
+    let out = fad().arg("--man").output().expect("could not run fad");
+    let text = String::from_utf8(out.stdout).expect("not utf-8");
+    for section in [".SH KEYS", ".SH FILES", ".SH ENVIRONMENT"] {
+        assert!(text.contains(section), "no {section}");
+    }
+    let env = text.split(".SH ENVIRONMENT").nth(1).unwrap();
+    // Every FAD_ variable the source reads, found the way a reviewer would.
+    let mut vars = std::collections::BTreeSet::new();
+    let mut stack = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let src = std::fs::read_to_string(&p).unwrap();
+                for (i, _) in src.match_indices("\"FAD_") {
+                    let name: String = src[i + 1..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                        .collect();
+                    vars.insert(name);
+                }
+            }
+        }
+    }
+    assert!(vars.len() >= 6, "found {vars:?}");
+    for v in &vars {
+        assert!(env.contains(v.as_str()), "the man page does not mention {v}");
+    }
+    assert!(text.contains("ctrl\\-c"), "the quit-without-choosing key is not documented");
+    assert!(text.contains("undo.jsonl") && text.contains("ignore"), "files missing");
+}
