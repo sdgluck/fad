@@ -1,4 +1,8 @@
 //! Shared test scaffolding.
+//!
+//! Each test binary compiles its own copy and uses some of it, so whatever one
+//! binary leaves alone would otherwise be reported as dead there.
+#![allow(dead_code)]
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
