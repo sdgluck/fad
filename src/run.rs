@@ -451,7 +451,7 @@ fn restore_selected(app: &mut App) {
     app.refresh_history();
     app.mode = Mode::Normal;
     app.status = Some(match outcome {
-        Ok(r) => undo_message(&r),
+        Ok(r) => undo_message(app, &r),
         Err(e) => e,
     });
 }
@@ -909,12 +909,12 @@ fn undo(app: &mut App) {
     let outcome = delete::undo_last();
     app.refresh_history();
     app.status = Some(match outcome {
-        Ok(r) => undo_message(&r),
+        Ok(r) => undo_message(app, &r),
         Err(e) => e,
     });
 }
 
-fn undo_message(r: &delete::UndoReport) -> String {
+fn undo_message(app: &App, r: &delete::UndoReport) -> String {
     if r.restored == 0 && r.skipped.is_empty() {
         return "nothing to undo".into();
     }
@@ -922,7 +922,13 @@ fn undo_message(r: &delete::UndoReport) -> String {
     if !r.skipped.is_empty() {
         msg.push_str(&format!(", {} could not be put back", r.skipped.len()));
     }
-    msg.push_str(" \u{2014} press R to rescan");
+    // In the tools view R asks Docker again and leaves the tree alone, which
+    // is exactly the wrong thing after putting files back.
+    msg.push_str(if app.tools_view {
+        " \u{2014} esc, then R to rescan"
+    } else {
+        " \u{2014} press R to rescan"
+    });
     msg
 }
 
@@ -1103,7 +1109,7 @@ fn toggle_dupes(app: &mut App) {
         return;
     }
     if app.scanning() {
-        app.status = Some("still scanning \u{2014} duplicates need the whole tree".into());
+        app.status = Some("duplicates are found once the scan finishes".into());
         return;
     }
     app.start_dupe_hunt();

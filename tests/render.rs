@@ -687,6 +687,22 @@ fn a_filter_that_matches_nothing_says_so() {
     assert!(out.contains("nothing matches \"zzqqxx\""), "no explanation for the empty tree:\n{out}");
 }
 
+/// Asked for mid-scan, the duplicate hunt waits for the walk and then starts on
+/// its own. The empty view must not send the user off to press R for it.
+#[test]
+fn the_duplicate_view_mid_scan_says_it_will_start_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    assert!(app.scanning(), "fixture expected a live scan");
+    app.show_view(Some(fad::app::View::Dupes));
+
+    let out = render(&mut app, 100, 20);
+    println!("{out}");
+    assert!(out.contains("starts when the scan finishes"), "{out}");
+    assert!(!out.contains("R to rescan"), "{out}");
+}
+
 /// A kept filter is as easy to forget as an age filter, and has to be as
 /// visible: rows missing with no reason on screen read as a bug.
 #[test]

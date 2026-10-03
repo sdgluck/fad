@@ -194,8 +194,12 @@ fn empty_reason(app: &App) -> String {
     } else if app.dupe_view {
         if app.dupe_hunt_running() {
             " hashing candidates\u{2026}".to_string()
+        } else if app.dupes.is_none() && app.scanning() {
+            // Asked for already: the hunt starts on its own once the walk is
+            // done, and telling the user to press anything would be wrong.
+            " finding duplicates starts when the scan finishes".to_string()
         } else if app.dupes.is_none() {
-            " duplicates need a finished scan \u{2014} R to rescan".to_string()
+            " no duplicate search has run \u{2014} d to leave, d again to start one".to_string()
         } else {
             " no duplicates over 1M \u{2014} d for the full tree".to_string()
         }
