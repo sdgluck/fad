@@ -370,9 +370,20 @@ pub fn on_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
 }
 
 /// Clicks and the wheel. A modal owns the screen while it is up, so the mouse
-/// does nothing there rather than quietly moving a selection underneath it.
+/// never moves a selection underneath it — but the wheel does scroll a list
+/// inside it, which is what anyone turning it over a list expects.
 pub fn on_mouse(app: &mut App, m: MouseEvent) {
     if app.mode != Mode::Normal {
+        let code = match m.kind {
+            MouseEventKind::ScrollDown => KeyCode::Down,
+            MouseEventKind::ScrollUp => KeyCode::Up,
+            _ => return,
+        };
+        if matches!(app.mode, Mode::Basket | Mode::History | Mode::Omissions | Mode::Search) {
+            for _ in 0..3 {
+                on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+            }
+        }
         return;
     }
     match m.kind {

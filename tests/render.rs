@@ -703,6 +703,64 @@ fn the_duplicate_view_mid_scan_says_it_will_start_by_itself() {
     assert!(!out.contains("R to rescan"), "{out}");
 }
 
+/// The footer is the only place an overlay says how to leave it, so it has to
+/// be on the overlay's last row however small the terminal and however long
+/// the list. Omissions used to forget its headings take rows too.
+#[test]
+fn overlay_footers_stay_pinned_on_small_terminals() {
+    use fad::app::{Mode, Omission, Why};
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    // Staging: every file and directory, so the basket outgrows the screen.
+    let root = app.tree.root();
+    for c in app.tree.node(root).children.clone() {
+        for g in app.tree.node(c).children.clone() {
+            app.staged.insert(g);
+        }
+    }
+    // Omissions of three kinds, cursor on the last, so the window must make
+    // room for headings it has scrolled past.
+    let kinds = [Why::Unreadable, Why::Cloud, Why::Ignored];
+    app.omissions = (0..30)
+        .map(|i| Omission {
+            path: dir.path().join(format!("o{i}")),
+            why: kinds[i / 10],
+            bytes: Some(1024),
+        })
+        .collect();
+    app.omission_cursor = 29;
+    app.search = "o".into();
+    app.run_search();
+    app.history = (0..30)
+        .map(|i| fad::delete::Batch { at: i, entries: Vec::new() })
+        .collect();
+    app.history_cursor = 29;
+
+    for (w, h) in [(40u16, 10u16), (80, 24)] {
+        for (mode, footer, chosen) in [
+            (Mode::Basket, "review and commit", None),
+            (Mode::Omissions, "copy the path", Some("o29")),
+            (Mode::Search, "go there", None),
+            (Mode::History, "put this batch back", None),
+        ] {
+            app.mode = mode;
+            let out = render(&mut app, w, h);
+            let lines: Vec<&str> = out.lines().collect();
+            // The footer's row, and directly under it the overlay's bottom
+            // border: nothing between them, and nothing cut off below.
+            let at = lines.iter().position(|l| l.contains(footer));
+            let pinned = at.is_some_and(|i| lines.get(i + 1).is_some_and(|l| l.contains('\u{2514}')));
+            assert!(pinned, "{w}x{h}: the footer is not on the last row:\n{out}");
+            if let Some(name) = chosen {
+                assert!(out.contains(name), "{w}x{h}: the cursor's row is off screen:\n{out}");
+            }
+        }
+    }
+}
+
 /// A kept filter is as easy to forget as an age filter, and has to be as
 /// visible: rows missing with no reason on screen read as a bug.
 #[test]

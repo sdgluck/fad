@@ -99,17 +99,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         )));
     }
 
-    while lines.len() + 1 < inner.height as usize {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(vec![
+    let footer = Line::from(vec![
         Span::styled(" enter ", theme.mode_badge),
         Span::styled(" go there   ", theme.dim),
         Span::styled(" \u{2191} \u{2193} ", theme.emphasis),
         Span::styled("choose   ", theme.dim),
         Span::styled(" esc ", theme.emphasis),
         Span::styled("back", theme.dim),
-    ]));
+    ]);
+    let lines = super::pin_footer(lines, footer, inner.height as usize);
 
     f.render_widget(Clear, rect);
     f.render_widget(

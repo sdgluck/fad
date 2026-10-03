@@ -85,6 +85,20 @@ pub(crate) fn pad(s: &str, width: usize) -> String {
     format!("{s}{}", " ".repeat(width - w))
 }
 
+/// A list overlay's lines with its footer on the last row, whatever the list
+/// did. The footer is the only place an overlay says how to leave it or act on
+/// it, so on a short terminal it is the list that gives way: lines past the
+/// room are dropped, a short list is padded down to it.
+pub(crate) fn pin_footer(mut lines: Vec<Line<'static>>, footer: Line<'static>, height: usize) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    lines.truncate(height - 1);
+    lines.resize(height - 1, Line::from(""));
+    lines.push(footer);
+    lines
+}
+
 /// Keep the start and the end of a path, drop the middle: both halves carry
 /// information, the middle rarely does.
 pub(crate) fn compress(s: &str, width: usize) -> String {

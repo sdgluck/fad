@@ -198,6 +198,30 @@ fn y_in_the_basket_does_not_head_for_the_commit() {
     assert!(app.mode == Mode::Confirm, "enter is the way on");
 }
 
+/// The wheel over an open overlay scrolls its list; the tree underneath stays
+/// where it was.
+#[test]
+fn the_wheel_scrolls_the_list_in_an_overlay() {
+    use ratatui::crossterm::event::{MouseEvent, MouseEventKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    let root = app.tree.root();
+    for c in app.tree.node(root).children.clone() {
+        app.stage(c);
+    }
+    press(&mut app, KeyCode::Char('x'));
+    let tree_cursor = app.cursor;
+    let wheel = |kind| MouseEvent { kind, column: 10, row: 5, modifiers: KeyModifiers::NONE };
+
+    fad::run::on_mouse(&mut app, wheel(MouseEventKind::ScrollDown));
+    assert!(app.basket_cursor > 0, "the wheel did nothing in the basket");
+    assert_eq!(app.cursor, tree_cursor, "the wheel moved the tree under the basket");
+    fad::run::on_mouse(&mut app, wheel(MouseEventKind::ScrollUp));
+    assert_eq!(app.basket_cursor, 0);
+}
+
 #[test]
 fn esc_closes_an_overlay_without_quitting() {
     let dir = tempfile::tempdir().unwrap();

@@ -122,8 +122,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         lines.push(if selected { line.style(theme.selection) } else { line });
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    let footer = Line::from(vec![
         Span::styled(" enter ", theme.mode_badge),
         Span::styled(" review and commit   ", theme.dim),
         Span::styled(" space ", theme.emphasis),
@@ -132,7 +131,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Span::styled("clear   ", theme.dim),
         Span::styled(" esc ", theme.emphasis),
         Span::styled("back", theme.dim),
-    ]));
+    ]);
 
+    let lines = super::pin_footer(lines, footer, inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
 }
