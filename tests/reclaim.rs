@@ -82,3 +82,49 @@ fn the_cap_skips_what_would_overshoot_rather_than_stopping() {
 
     assert_eq!(reclaim::under_cap(items, None).len(), 2, "no cap means take everything");
 }
+
+/// A build directory the scan could not see all of is not handed to an
+/// unattended delete — whether the unreadable part is the directory itself or
+/// somewhere inside it.
+#[test]
+fn an_unreadable_candidate_or_corner_is_not_offered() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: a plain query.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root reads everything");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let locked = [dir.path().join("web/node_modules/dep"), dir.path().join("proj/target")];
+    for p in &locked {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let tree = scanned(dir.path());
+    for p in &locked {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let items = reclaim::candidates(&tree, false, 0, &Rules::default());
+    assert!(items.is_empty(), "offered: {:?}", names(&tree, &items));
+}
+
+/// Something under a directory deleted this session is gone, even though only
+/// the detached directory itself carries the mark.
+#[test]
+fn nothing_under_a_deleted_directory_is_offered() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut tree = scanned(dir.path());
+
+    let web = tree
+        .reclaimable
+        .iter()
+        .find(|id| tree.path(**id).ends_with("web/node_modules"))
+        .and_then(|id| tree.node(*id).parent)
+        .unwrap();
+    tree.remove(web).unwrap();
+
+    let items = reclaim::candidates(&tree, false, 0, &Rules::default());
+    assert_eq!(names(&tree, &items), vec!["proj/target"]);
+}

@@ -65,6 +65,56 @@ pub fn guard(path: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse a directory that holds another filesystem or a cloud folder,
+/// before anything in it is touched.
+///
+/// `remove_dir_all` does not follow symlinks, but it does walk straight
+/// through a mount point: a disk image attached under a build directory, a
+/// bind mount, a network share someone mounted inside a cache — all emptied
+/// along with the directory around them. A cloud provider's folder reports the
+/// boot volume's device, so the device check does not see it, and emptying one
+/// deletes the files from every machine that syncs it. Trashing is held to the
+/// same rule: the move would carry the mount, or the synced folder, with it.
+///
+/// So the whole tree is walked first, without following symlinks, and one
+/// such directory anywhere refuses the whole entry. A directory that cannot be
+/// read refuses it too, since what is under it cannot be vouched for — and
+/// the delete would fail there anyway, part-way through.
+pub fn contained(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    use crate::scan::cloud::is_cloud_root;
+
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    if is_cloud_root(path) {
+        return Err("it is a cloud-synced folder".into());
+    }
+    let dev = meta.dev();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let unreadable = |e: io::Error| format!("could not look inside {}: {e}", dir.display());
+        for entry in std::fs::read_dir(&dir).map_err(unreadable)? {
+            let entry = entry.map_err(unreadable)?;
+            // From the directory entry itself: never follows a symlink.
+            if !entry.file_type().map_err(unreadable)?.is_dir() {
+                continue;
+            }
+            let p = entry.path();
+            let m = std::fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
+            if m.dev() != dev {
+                return Err(format!("{} is another filesystem mounted inside it", p.display()));
+            }
+            if is_cloud_root(&p) {
+                return Err(format!("{} inside it is a cloud-synced folder", p.display()));
+            }
+            stack.push(p);
+        }
+    }
+    Ok(())
+}
+
 pub fn permanent(path: &Path) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() {
@@ -126,7 +176,11 @@ impl Job {
                 let result = match entry.map(Entry::check) {
                     None => Err("not something fad trashed — left alone".to_string()),
                     Some(Err(why)) => Err(why.reason().to_string()),
-                    Some(Ok(())) => trash::erase(&path).map(|_| None).map_err(|e| e.to_string()),
+                    Some(Ok(())) => contained(&path)
+                        .map_err(|why| format!("refused: {why}"))
+                        .and_then(|()| {
+                            trash::erase(&path).map(|_| None).map_err(|e| e.to_string())
+                        }),
                 };
                 if tx.send(Outcome { path, bytes, result }).is_err() {
                     break;
@@ -168,10 +222,12 @@ impl Job {
 fn run_batch(items: Vec<(PathBuf, u64)>, disposal: Disposal, tx: Sender<Outcome>) {
     let mut journal = Recorder::new();
     for (path, bytes) in items {
-        let result = match disposal {
-            Disposal::Trash => trash::trash(&path).map(Some).map_err(|e| e.to_string()),
-            Disposal::Permanent => permanent(&path).map(|_| None).map_err(|e| e.to_string()),
-        };
+        let result = contained(&path)
+            .map_err(|why| format!("refused: {why}"))
+            .and_then(|()| match disposal {
+                Disposal::Trash => trash::trash(&path).map(Some).map_err(|e| e.to_string()),
+                Disposal::Permanent => permanent(&path).map(|_| None).map_err(|e| e.to_string()),
+            });
         // Written down the moment the move lands, not when the batch ends: a
         // fad killed halfway through a two-hundred-item batch has still moved
         // the first hundred, and they have to be on the undo list.

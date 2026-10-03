@@ -371,6 +371,64 @@ fn an_item_that_could_not_be_restored_can_be_retried() {
     assert!(delete::read_journal().is_empty(), "an empty batch stayed in the journal");
 }
 
+/// A cloud provider's folder inside a directory refuses the whole directory —
+/// before anything in it is deleted, not when the walk reaches it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_directory_holding_a_cloud_folder_is_refused_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("cache");
+    std::fs::create_dir_all(tree.join("a/synced")).unwrap();
+    std::fs::write(tree.join("a/first.bin"), b"x").unwrap();
+    std::fs::write(tree.join("a/synced/doc.txt"), b"in the cloud").unwrap();
+    let c = std::ffi::CString::new(tree.join("a/synced").as_os_str().as_encoded_bytes()).unwrap();
+    let name = c"com.apple.file-provider-domain-id";
+    // SAFETY: NUL-terminated strings and a buffer of the length passed.
+    let rc = unsafe { libc::setxattr(c.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0, 0) };
+    assert_eq!(rc, 0);
+
+    for disposal in [Disposal::Permanent, Disposal::Trash] {
+        let mut job = Job::start(vec![(tree.clone(), 1)], disposal);
+        wait(&mut job);
+        let failures = job.failures();
+        assert_eq!(failures.len(), 1, "{disposal:?} went ahead");
+        assert!(failures[0].result.as_ref().unwrap_err().contains("cloud"));
+        assert!(tree.join("a/first.bin").exists(), "{disposal:?} touched the tree before refusing");
+        assert!(tree.join("a/synced/doc.txt").exists());
+    }
+}
+
+/// What is under a directory that cannot be read cannot be vouched for.
+#[test]
+fn a_directory_with_an_unreadable_corner_is_refused_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: a plain query.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root reads everything");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("build");
+    std::fs::create_dir_all(tree.join("locked")).unwrap();
+    std::fs::write(tree.join("keep.bin"), b"x").unwrap();
+    std::fs::set_permissions(tree.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let refused = delete::contained(&tree);
+    std::fs::set_permissions(tree.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(refused.is_err(), "an unreadable directory was vouched for");
+}
+
+/// A symlink to another filesystem is not a mount inside the tree: it is not
+/// followed, and it does not refuse the delete.
+#[test]
+fn a_symlink_out_of_the_tree_is_not_a_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("node_modules");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::os::unix::fs::symlink("/dev", tree.join("devices")).unwrap();
+    assert_eq!(delete::contained(&tree), Ok(()));
+}
+
 /// A trashed dangling symlink is still in the trash, and still recoverable.
 #[test]
 fn a_trashed_dangling_symlink_is_still_recoverable() {
