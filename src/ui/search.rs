@@ -73,12 +73,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         let path = app.tree.path(*id);
         let shown = path.strip_prefix(app.tree.root_path()).unwrap_or(&path).display().to_string();
         let size = human(*bytes);
-        let room = width.saturating_sub(size.chars().count() + 4);
+        let room = width.saturating_sub(super::cols(&size) + 4);
         let style = if n.flags & flags::IS_DIR != 0 { theme.dir } else { theme.normal };
         let line = Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("{:<room$}", super::compress(&shown, room), room = room),
+                super::pad(&super::compress(&shown, room), room),
                 style,
             ),
             Span::raw(" "),

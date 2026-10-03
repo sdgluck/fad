@@ -6,7 +6,7 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::Theme;
+use super::{Theme, cols, pad, truncate_end, truncate_start as truncate};
 use crate::app::{App, Heading};
 use crate::format::human;
 use crate::tree::flags;
@@ -16,6 +16,26 @@ use crate::tree::flags;
 const EIGHTHS: [&str; 9] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"];
 
 const BAR_WIDTH: usize = 12;
+
+/// Everything on a tree row but the indent and the name: the stage marker, the
+/// twisty and its space, a space, the size, a space, the bar, and one column
+/// of slack on the right.
+const ROW_FIXED: usize = 1 + 2 + 1 + 8 + 1 + BAR_WIDTH + 1;
+
+/// The narrowest a name is squeezed to before the indent gives way instead.
+const MIN_NAME: usize = 8;
+
+/// Columns of indent for a row at `depth` in a pane `width` wide.
+///
+/// Two a level, until the name would drop below `MIN_NAME`, and then no more:
+/// a deep row keeps its name readable and stays inside the pane, at the cost of
+/// lining up with its parent. Before, the name had a floor and the indent did
+/// not, so a deep enough row ran off the right edge and took its size and bar
+/// with it. Public because a click on the twisty is hit-tested against it.
+pub(crate) fn indent(depth: u16, width: usize) -> usize {
+    let room = width.saturating_sub(ROW_FIXED + MIN_NAME);
+    (2 * depth as usize).min(room / 2 * 2)
+}
 
 pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     let title = header(app, area.width.saturating_sub(2) as usize);
@@ -143,7 +163,7 @@ fn header(app: &App, width: usize) -> Line<'static> {
     const MIN_PATH: usize = 16;
 
     let width_of =
-        |v: &[Span<'static>]| v.iter().map(|s| s.content.chars().count()).sum::<usize>();
+        |v: &[Span<'static>]| v.iter().map(|s| cols(&s.content)).sum::<usize>();
     if width.saturating_sub(width_of(&spans) + 1) < MIN_PATH {
         spans.remove(counts);
     }
@@ -211,7 +231,7 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
 
         if let Some(f) = fraction {
             let left = remaining(&p, f);
-            let cells = width.saturating_sub(left.chars().count() + 4);
+            let cells = width.saturating_sub(cols(&left) + 4);
             let filled = (f * cells as f64) as usize;
             out.push(Line::from(vec![
                 Span::raw(" "),
@@ -384,12 +404,6 @@ fn si(v: f64) -> String {
     }
 }
 
-fn truncate_end(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return s.to_string();
-    }
-    s.chars().take(width.saturating_sub(1)).collect::<String>() + "\u{2026}"
-}
 
 /// Keep the cursor on screen with a little breathing room above and below.
 fn scroll_into_view(app: &mut App, height: usize) {
@@ -457,14 +471,13 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
         &n.name
     };
 
-    let indent = "  ".repeat(row.depth as usize);
+    let indent = " ".repeat(indent(row.depth, width));
     let bytes = app.tree.size(row.id, app.apparent);
     let size = human(bytes);
     let bar = bar(bytes, row.sibling_max);
 
     // Name column gets whatever the fixed columns leave behind.
-    let fixed = 1 + 1 + indent.len() + 2 + 8 + 1 + BAR_WIDTH + 1;
-    let name_w = width.saturating_sub(fixed).max(6);
+    let name_w = width.saturating_sub(ROW_FIXED + indent.len());
     let name = truncate(label, name_w);
 
     let name_style = if staged {
@@ -481,7 +494,7 @@ fn row_line(app: &App, theme: &Theme, i: usize, width: usize) -> Line<'static> {
         Span::styled(marker.to_string(), theme.staged),
         Span::raw(indent),
         Span::styled(format!("{twisty} "), theme.dim),
-        Span::styled(format!("{name:<name_w$}"), name_style),
+        Span::styled(pad(&name, name_w), name_style),
         Span::raw(" "),
         Span::styled(format!("{size:>8}"), theme.emphasis),
         Span::raw(" "),
@@ -509,7 +522,7 @@ fn category_line(app: &App, theme: &Theme, cat: crate::presets::Category, select
     let head =
         format!(" {arrow} {} \u{b7} {} \u{b7} {} ", cat.label(), items.len(), human(total));
     let note = format!(" {} ", cat.note());
-    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let rule = width.saturating_sub(cols(&head) + cols(&note) + 1);
     let line = Line::from(vec![
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.dim),
@@ -554,7 +567,7 @@ fn tool_line(
         Some((_, recl)) if recl > 0 => format!(" {} reclaimable ", human(recl)),
         _ => format!(" {} ", kind.note()),
     };
-    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let rule = width.saturating_sub(cols(&head) + cols(&note) + 1);
     let line = Line::from(vec![
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.dim),
@@ -614,9 +627,11 @@ fn tool_row_line(
         String::new()
     };
 
-    let indent = "  ".repeat(row.depth as usize);
-    let fixed = 1 + indent.len() + 2 + 8 + 1 + BAR_WIDTH + 1 + suffix.chars().count();
-    let name_w = width.saturating_sub(fixed).max(6);
+    let indent = " ".repeat(indent(row.depth, width));
+    // The suffix gives way before the name does: which image this is matters
+    // more than the note about it.
+    let suffix = truncate_end(&suffix, width.saturating_sub(ROW_FIXED + indent.len() + MIN_NAME));
+    let name_w = width.saturating_sub(ROW_FIXED + indent.len() + cols(&suffix));
     let name = truncate(&r.name, name_w);
 
     let name_style = if staged {
@@ -631,7 +646,7 @@ fn tool_row_line(
         Span::styled(marker.to_string(), theme.staged),
         Span::raw(indent),
         Span::styled("  ".to_string(), theme.dim),
-        Span::styled(format!("{name:<name_w$}"), name_style),
+        Span::styled(pad(&name, name_w), name_style),
         Span::raw(" "),
         Span::styled(format!("{size:>8}"), theme.emphasis),
         Span::raw(" "),
@@ -664,7 +679,7 @@ fn dupe_line(app: &App, theme: &Theme, group: usize, selected: bool, width: usiz
         human(each)
     );
     let note = format!(" {} reclaimable ", human(wasted));
-    let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+    let rule = width.saturating_sub(cols(&head) + cols(&note) + 1);
     let line = Line::from(vec![
         Span::styled(head, theme.emphasis),
         Span::styled(note, theme.bar_hot),
@@ -695,12 +710,3 @@ fn bar(bytes: u64, max: u64) -> String {
     s
 }
 
-/// Truncate from the left: the tail of a filename is what distinguishes it.
-fn truncate(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count <= width {
-        return s.to_string();
-    }
-    let skip = count - width + 1;
-    format!("…{}", s.chars().skip(skip).collect::<String>())
-}

@@ -409,7 +409,7 @@ fn click(app: &mut App, column: u16, row: u16) {
     let x = column - list.x;
     if x == 0 {
         toggle_stage(app);
-    } else if x == 1 + 2 * r.depth {
+    } else if x as usize == 1 + ui::row_indent(r.depth, list.width as usize) {
         // Clicking the arrow toggles, rather than stepping in the way `l` does
         // on an already-open row: a second click in the same place undoing the
         // first is the only behaviour a pointer can have.

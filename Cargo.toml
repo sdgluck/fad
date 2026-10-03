@@ -15,6 +15,7 @@ ratatui = "0.30.2"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 # The age tests backdate files with `utimes`; one call is not worth a crate.

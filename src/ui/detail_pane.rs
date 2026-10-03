@@ -6,7 +6,7 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::Theme;
+use super::{Theme, cols, pad, truncate_end, truncate_start};
 use crate::app::App;
 use crate::format::human;
 use crate::tree::{NodeId, flags};
@@ -349,7 +349,7 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         let widest = b.children.first().map(|c| c.bytes).unwrap_or(0);
         for c in &b.children {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<12}", shorten(&c.name, 12)), theme.normal),
+                Span::styled(format!("  {}", pad(&truncate_start(&c.name, 12), 12)), theme.normal),
                 Span::styled(format!("{:>6} ", human(c.bytes)), theme.emphasis),
                 Span::styled(format!("{:>4} ", percent(c.bytes, headline_bytes)), theme.dim),
                 Span::styled(minibar(c.bytes, widest), theme.bar),
@@ -448,16 +448,16 @@ fn heading(label: &str, cut: Option<(usize, usize)>, more: bool, width: u16) -> 
     let room = (width as usize).saturating_sub(4);
     // The pane's width is fixed, so no label reaches this — but the guarantee
     // is the point of the function, not a comment about one.
-    let mut head: String = label.chars().take(room).collect();
+    let mut head = truncate_end(label, room);
     if let Some((shown, total)) = cut {
         let with = format!("{head} \u{b7} top {shown} of {total}");
-        if with.chars().count() <= room {
+        if cols(&with) <= room {
             head = with;
         }
     }
     if more {
         let with = format!("{head} \u{b7} S");
-        if with.chars().count() <= room {
+        if cols(&with) <= room {
             head = with;
         }
     }
@@ -492,7 +492,7 @@ fn section_rows(
                 let name =
                     if r.ext.is_empty() { "(no ext)".to_string() } else { format!(".{}", r.ext) };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<10}", shorten(&name, 10)), theme.normal),
+                    Span::styled(format!("  {}", pad(&truncate_start(&name, 10), 10)), theme.normal),
                     Span::styled(format!("{:>6} ", human(r.bytes)), theme.emphasis),
                     Span::styled(format!("{:>5} ", tally(r.count)), theme.dim),
                     Span::styled(minibar(r.bytes, widest), theme.bar),
@@ -526,7 +526,7 @@ fn section_rows(
             let widest = b.biggest.first().map(|r| r.bytes).unwrap_or(0);
             for r in &b.biggest {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {:<14}", shorten(&r.name, 14)), theme.normal),
+                    Span::styled(format!("  {}", pad(&truncate_start(&r.name, 14), 14)), theme.normal),
                     Span::styled(format!("{:>6} ", human(r.bytes)), theme.emphasis),
                     Span::styled(minibar(r.bytes, widest), theme.bar),
                 ]));
@@ -645,10 +645,10 @@ fn draw_staged(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let width = inner.width as usize;
     let row = |name: &str, size: String, mark: &'static str, tint| {
-        let name_w = width.saturating_sub(size.chars().count() + 3);
+        let name_w = width.saturating_sub(cols(&size) + 3);
         Line::from(vec![
             Span::styled(mark, tint),
-            Span::styled(format!("{:<name_w$}", shorten(name, name_w)), theme.normal),
+            Span::styled(pad(&truncate_start(name, name_w), name_w), theme.normal),
             Span::styled(size, theme.emphasis),
         ])
     };
@@ -676,13 +676,6 @@ fn draw_staged(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn shorten(s: &str, width: usize) -> String {
-    let count = s.chars().count();
-    if count <= width {
-        return s.to_string();
-    }
-    format!("…{}", s.chars().skip(count - width + 1).collect::<String>())
-}
 
 /// When the last scan was, phrased the way someone would say it out loud.
 ///

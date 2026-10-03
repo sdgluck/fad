@@ -71,7 +71,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             BasketRow::Group { cat, count, bytes } => {
                 let label = cat.map(|c| c.label()).unwrap_or("everything else");
                 let head = format!(" {label} \u{b7} {count} \u{b7} {} ", human(*bytes));
-                let rule = width.saturating_sub(head.chars().count() + 1);
+                let rule = width.saturating_sub(super::cols(&head) + 1);
                 Line::from(vec![
                     Span::styled(head, theme.emphasis),
                     Span::styled("\u{2500}".repeat(rule), theme.dim),
@@ -83,7 +83,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 let head = format!(" tool storage \u{b7} {count} \u{b7} {} ", freed.label());
                 let note = " permanent \u{b7} no trash, no undo ";
                 let rule = width
-                    .saturating_sub(head.chars().count() + note.chars().count() + 1);
+                    .saturating_sub(super::cols(&head) + super::cols(note) + 1);
                 Line::from(vec![
                     Span::styled(head, theme.staged),
                     Span::styled(note, theme.warn),
@@ -111,10 +111,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .unwrap_or(&app.tree.path(*id))
                     .display()
                     .to_string();
-                let room = width.saturating_sub(size.len() + 5);
+                let room = width.saturating_sub(super::cols(&size) + 5);
                 Line::from(vec![
                     Span::styled("  \u{25cf} ", theme.staged),
-                    Span::styled(format!("{:<room$}", super::compress(&path, room), room = room), theme.normal),
+                    Span::styled(super::pad(&super::compress(&path, room), room), theme.normal),
                     Span::styled(size, theme.emphasis),
                 ])
             }

@@ -16,10 +16,13 @@ use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::app::{App, Mode};
 use crate::format::human;
 
 pub use theme::Theme;
+pub(crate) use tree_pane::indent as row_indent;
 
 /// What the screen remembers from one key to the next that nothing outside
 /// the interface has any reason to read.
@@ -33,20 +36,90 @@ pub struct UiState {
     pub quit_armed: bool,
 }
 
+// Every width below is in terminal columns, never in chars. A CJK name or an
+// emoji is one char and two columns, so counting chars let those rows run two
+// columns long per character — off the edge of the pane, taking the size and
+// the bar with them — and `{:<w$}` padding, which also counts chars, left the
+// columns after them ragged.
+
+/// How many terminal columns `s` takes.
+pub(crate) fn cols(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+fn char_cols(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// The longest start of `s` that fits in `width` columns. A wide character
+/// that would straddle the edge is left off whole, never split.
+fn head_cols(s: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        used += char_cols(c);
+        if used > width {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+/// The longest end of `s` that fits in `width` columns.
+fn tail_cols(s: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices().rev() {
+        used += char_cols(c);
+        if used > width {
+            return &s[i + c.len_utf8()..];
+        }
+    }
+    s
+}
+
+/// `s` padded with spaces to `width` columns: `{:<width$}`, counting columns.
+pub(crate) fn pad(s: &str, width: usize) -> String {
+    let w = cols(s);
+    if w >= width {
+        return s.to_string();
+    }
+    format!("{s}{}", " ".repeat(width - w))
+}
+
 /// Keep the start and the end of a path, drop the middle: both halves carry
 /// information, the middle rarely does.
 pub(crate) fn compress(s: &str, width: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= width {
+    if cols(s) <= width {
         return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
     }
     let tail = width * 2 / 3;
     let head = width.saturating_sub(tail + 1);
-    format!(
-        "{}\u{2026}{}",
-        chars[..head].iter().collect::<String>(),
-        chars[chars.len() - tail..].iter().collect::<String>()
-    )
+    format!("{}\u{2026}{}", head_cols(s, head), tail_cols(s, tail))
+}
+
+/// Cut from the right, marking the cut.
+pub(crate) fn truncate_end(s: &str, width: usize) -> String {
+    if cols(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("{}\u{2026}", head_cols(s, width - 1))
+}
+
+/// Cut from the left, marking the cut: the tail of a filename is what tells it
+/// apart from its neighbours.
+pub(crate) fn truncate_start(s: &str, width: usize) -> String {
+    if cols(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("\u{2026}{}", tail_cols(s, width - 1))
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {

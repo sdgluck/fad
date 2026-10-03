@@ -81,7 +81,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             last = Some(o.why);
             let head = format!(" {} ", o.why.heading());
             let note = format!(" {} ", o.why.note());
-            let rule = width.saturating_sub(head.chars().count() + note.chars().count() + 1);
+            let rule = width.saturating_sub(super::cols(&head) + super::cols(&note) + 1);
             lines.push(Line::from(vec![
                 Span::styled(head, theme.emphasis),
                 Span::styled(note, if o.why.uncounted() { theme.warn } else { theme.dim }),
@@ -92,12 +92,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         // A size we do not have is left blank, never shown as zero. Not knowing
         // what an unread directory holds is the entire point of the row.
         let size = o.bytes.map(human).unwrap_or_else(|| "\u{2014}".into());
-        let room = width.saturating_sub(size.chars().count() + 4);
+        let room = width.saturating_sub(super::cols(&size) + 4);
         let path = o.path.strip_prefix(app.tree.root_path()).unwrap_or(&o.path);
         let line = Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("{:<room$}", super::compress(&path.display().to_string(), room), room = room),
+                super::pad(&super::compress(&path.display().to_string(), room), room),
                 theme.normal,
             ),
             Span::raw(" "),

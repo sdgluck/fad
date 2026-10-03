@@ -581,6 +581,97 @@ fn the_omissions_screen_says_what_would_fix_each_kind() {
     assert!(out.contains("is short by whatever it holds"), "does not say the totals are wrong:\n{out}");
 }
 
+/// The last column of each tree row's size, read straight from the buffer, for
+/// every row that has one. The size is right-aligned in front of a fixed-width
+/// bar, so on a row whose name was measured correctly it ends in the same
+/// column as on every other row; a name measured in chars rather than columns
+/// pushes it right, or off the pane altogether.
+fn size_column_holds_a_size(app: &mut App, w: u16, h: u16, wanted: &[&str]) {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    app.rebuild_rows();
+    terminal.draw(|f| fad::ui::draw(f, app)).unwrap();
+    let buf = terminal.backend().buffer();
+    // The tree pane is everything left of the 38-column detail pane; inside its
+    // border the size ends 15 columns from the right (one of slack, the bar,
+    // and the space in front of it).
+    let inner_w = (w - 38 - 2) as usize;
+    let x = 1 + (inner_w - 15) as u16;
+    // A wide character's second cell is filler; skip it so names read whole.
+    let text = |y: u16| {
+        let mut out = String::new();
+        let mut x = 0;
+        while x < w - 38 {
+            let s = buf[(x, y)].symbol();
+            out.push_str(s);
+            x += unicode_width::UnicodeWidthStr::width(s).max(1) as u16;
+        }
+        out
+    };
+
+    for name in wanted {
+        let y = (1..h - 1)
+            .find(|y| text(*y).contains(name))
+            .unwrap_or_else(|| panic!("no row for {name}:\n{}", (0..h).map(text).collect::<Vec<_>>().join("\n")));
+        let last = buf[(x, y)].symbol();
+        assert!(
+            matches!(last, "B" | "K" | "M" | "G"),
+            "the size on the row for {name} is not where the others are (found {last:?}):\n{}",
+            (0..h).map(text).collect::<Vec<_>>().join("\n")
+        );
+    }
+}
+
+/// Wide characters are two columns each. Counting them as one let a CJK name
+/// run twice the width it was given and push its size and bar off the pane.
+#[test]
+fn wide_names_keep_the_columns_lined_up() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let long = "写真".repeat(20);
+    std::fs::create_dir_all(dir.path().join(&long)).unwrap();
+    std::fs::write(dir.path().join(&long).join("a.bin"), vec![0u8; 5 * 1024 * 1024]).unwrap();
+    std::fs::write(dir.path().join("🎉🎉 party 🎉.txt"), vec![0u8; 4 * 1024 * 1024]).unwrap();
+    std::fs::write(dir.path().join("休暇.mov"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+    let mut app = app_for(dir.path());
+    app.mark_dirty();
+
+    // The long one is cut, so it is found by its tail.
+    for (w, h) in [(100, 24), (80, 24)] {
+        size_column_holds_a_size(&mut app, w, h, &["写真写真", "arty", "休暇.mov", "Movies"]);
+    }
+
+    let out = render(&mut app, 100, 24);
+    println!("{out}");
+    assert!(out.contains("\u{2026}真"), "the long name was not cut from the left:\n{out}");
+}
+
+/// A row nested deeper than the pane has room to indent stops indenting; it
+/// does not push its own size off the edge.
+#[test]
+fn a_deep_row_stays_inside_the_pane() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rel = std::path::PathBuf::new();
+    for i in 0..30 {
+        rel.push(format!("d{i}"));
+    }
+    std::fs::create_dir_all(dir.path().join(&rel)).unwrap();
+    std::fs::write(dir.path().join(&rel).join("deepest.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+    let mut app = app_for(dir.path());
+    let mut id = app.tree.root();
+    loop {
+        app.expanded.insert(id);
+        match app.tree.node(id).children.first() {
+            Some(c) => id = *c,
+            None => break,
+        }
+    }
+    app.mark_dirty();
+    app.rebuild_rows();
+    app.cursor = app.rows.len() - 1;
+
+    size_column_holds_a_size(&mut app, 80, 40, &["est.bin", "d29"]);
+}
+
 /// A kept filter is as easy to forget as an age filter, and has to be as
 /// visible: rows missing with no reason on screen read as a bug.
 #[test]
