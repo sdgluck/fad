@@ -177,3 +177,28 @@ fn clearing_the_cache_touches_only_what_fad_wrote() {
     assert!(out.status.success());
     assert!(!own.exists());
 }
+
+/// A scan root whose name is not UTF-8 — possible on Linux, refused by APFS.
+/// `--json` panicked serialising its path, and the snapshot could not be saved
+/// at all, so `--since` never had a baseline for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_root_that_is_not_utf8_reports_and_keeps_a_baseline() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let root = dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xffroot"));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("f"), vec![0u8; 4096]).unwrap();
+
+    let (out, err, code) = fad(&root, cache.path(), &["--json"]);
+    assert_eq!(code, 0, "stderr: {err}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["path"].as_str().unwrap().contains("bad\u{fffd}root"));
+
+    let (_, _, code) = fad(&root, cache.path(), &["--since"]);
+    assert_eq!(code, 1);
+    let (out, err, code) = fad(&root, cache.path(), &["--since", "--json"]);
+    assert_eq!(code, 0, "no baseline was saved: {err}");
+    assert!(serde_json::from_str::<serde_json::Value>(&out).is_ok());
+}

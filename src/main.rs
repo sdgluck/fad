@@ -201,7 +201,12 @@ fn main() {
         // Leave this walk behind as the new baseline, or a script that runs
         // --since on a timer would keep measuring against the same old scan.
         if !args.no_cache {
-            let _ = fad::cache::save(&tree);
+            // Said, not swallowed: a baseline that silently failed to save
+            // makes the next --since compare against something older than
+            // the person running it believes.
+            if let Err(e) = fad::cache::save(&tree) {
+                eprintln!("fad: could not save this scan as the next baseline: {e}");
+            }
         }
         std::process::exit(code);
     }
@@ -246,7 +251,13 @@ fn main() {
             if let (true, Some(final_tree)) = (save, outcome.tree.as_ref()) {
                 // Best effort: failing to write a cache is never worth an error
                 // on the way out of a session that otherwise went fine.
-                let _ = fad::cache::save(final_tree);
+                // In a debug build, say so anyway: a cache that never saves
+                // looks exactly like one that works until the next launch.
+                if let Err(e) = fad::cache::save(final_tree)
+                    && cfg!(debug_assertions)
+                {
+                    eprintln!("fad: could not save the scan for next time: {e}");
+                }
             }
             // Last, and on stdout alone, so it is the only thing a shell
             // substitution picks up.
@@ -302,7 +313,7 @@ end
 
 fn print_json(tree: &Tree, args: &Args) {
     let v = node_json(tree, tree.root(), args, 0);
-    println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    print_json_value(&v);
     warn_omissions(tree);
 }
 
@@ -489,16 +500,12 @@ fn print_tools_json(report: &fad::tools::Report) {
         })
         .collect();
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
+    print_json_value(&json!({
             "sources": sources,
             "totals_are_not_sums_of_items":
                 "each source's totals come from the tool itself; item sizes are \
                  per-item unique storage and shared bytes are reported separately",
-        }))
-        .unwrap()
-    );
+        }));
 }
 
 fn tool_item_json(r: &fad::tools::Resource) -> serde_json::Value {
@@ -642,22 +649,18 @@ fn print_since(tree: &Tree, args: &Args) -> i32 {
             .iter()
             .map(|(path, delta, is_new)| {
                 serde_json::json!({
-                    "path": path,
+                    "path": json_path(path),
                     "delta": delta,
                     "change": format!("{}{}", if *delta < 0 { "-" } else { "+" }, human(delta.unsigned_abs())),
                     "new": is_new,
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "root": tree.root_path(),
+        print_json_value(&serde_json::json!({
+                "root": json_path(tree.root_path()),
                 "since": at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                 "changes": items,
-            }))
-            .unwrap()
-        );
+            }));
         return 0;
     }
 
@@ -704,7 +707,7 @@ fn print_reclaim_json(tree: &Tree, args: &Args) {
             .map(|id| {
                 let bytes = tree.size(*id, args.apparent);
                 let mut v = serde_json::json!({
-                    "path": tree.path(*id),
+                    "path": json_path(&tree.path(*id)),
                     "bytes": bytes,
                     "size": human(bytes),
                 });
@@ -724,23 +727,19 @@ fn print_reclaim_json(tree: &Tree, args: &Args) {
     }
 
     let total: u64 = cats.iter().map(|c| c["bytes"].as_u64().unwrap_or(0)).sum();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "root": tree.root_path(),
+    print_json_value(&serde_json::json!({
+            "root": json_path(tree.root_path()),
             "bytes": total,
             "size": human(total),
             "categories": cats,
-        }))
-        .unwrap()
-    );
+        }));
 }
 
 fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::Value {
     let n = tree.node(id);
     let bytes = if args.apparent { n.total_len } else { n.total_bytes };
     let mut v = serde_json::json!({
-        "path": tree.path(id),
+        "path": json_path(&tree.path(id)),
         "bytes": bytes,
         "size": human(bytes),
         "files": n.file_count,
@@ -766,4 +765,24 @@ fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::
 /// A path as it is shown to a person reading the terminal.
 fn display_path(p: &std::path::Path) -> String {
     p.display().to_string()
+}
+
+/// A path for JSON output. Filenames are bytes, and on Linux need not be
+/// UTF-8; serde refuses such a path outright, and `json!` turned that refusal
+/// into a panic, so one oddly named directory under the root took the whole
+/// report down. Lossy is the honest rendering for a reader that only takes
+/// text — and the entries fad cannot name exactly are listed on stderr.
+fn json_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Print a JSON report, or say why it could not be printed. Never a panic.
+fn print_json_value(v: &serde_json::Value) {
+    match serde_json::to_string_pretty(v) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            eprintln!("fad: could not write the JSON report: {e}");
+            std::process::exit(1);
+        }
+    }
 }
