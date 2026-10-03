@@ -1197,15 +1197,19 @@ impl App {
             return "only one copy left".into();
         }
         let keep_path = self.tree.path(*keep);
-        let bytes_each =
-            self.dupes.as_ref().and_then(|r| r.groups.get(group)).map(|g| g.bytes_each);
-        let Some(bytes_each) = bytes_each else { return "that group has gone".into() };
+        // What each copy was when it was hashed: `share` refuses any that has
+        // moved on since, which the length alone could not tell it.
+        let identity = |id: NodeId| {
+            self.dupes.as_ref().and_then(|r| r.groups.get(group)).and_then(|g| g.identity(id))
+        };
+        let Some(keep_was) = identity(*keep) else { return "that group has gone".into() };
 
         let (mut shared, mut freed) = (0usize, 0u64);
         let mut refused: Option<String> = None;
         for id in copies {
             let path = self.tree.path(*id);
-            match crate::clone::share(&keep_path, &path, bytes_each) {
+            let Some(was) = identity(*id) else { continue };
+            match crate::clone::share(&keep_path, &keep_was, &path, &was) {
                 Ok(()) => {
                     shared += 1;
                     // Allocated blocks, not length: what came back is what the

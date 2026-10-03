@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::hash::Sha256;
 use crate::tree::NodeId;
@@ -31,9 +31,63 @@ const EDGE: u64 = 64 << 10;
 /// bigger news to deliver first.
 const READ_BUDGET: u64 = 8 << 30;
 
+/// Which file a path named, and what state it was in, at the moment its
+/// contents were read.
+///
+/// A hash proves two files were identical *when they were read*. Anything that
+/// acts on that proof later — `clone::share` replacing one with a clone of the
+/// other — has to be able to tell whether either file has moved on since, and
+/// the length alone cannot: an in-place edit that keeps the size is the most
+/// ordinary kind there is. So the whole identity is kept, to the nanosecond:
+///
+/// - `dev` and `ino` say it is still the same file, not a new one saved over
+///   the old name;
+/// - `mtime` catches an ordinary write;
+/// - `ctime` catches the write that hid itself. A program can write through an
+///   open handle and put the old `mtime` back afterwards — `rsync -t`, `touch
+///   -r`, any editor that preserves timestamps — but it cannot set `ctime`,
+///   which the kernel moves on every change to the inode, including that
+///   `utimes` itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Identity {
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub mtime: i64,
+    pub mtime_nsec: i64,
+    pub ctime: i64,
+    pub ctime_nsec: i64,
+}
+
+impl Identity {
+    /// The identity of the plain file at `path`, without following a symlink.
+    /// `None` for anything that is not a plain file, or not there.
+    pub fn of(path: &Path) -> Option<Identity> {
+        let m = std::fs::symlink_metadata(path).ok()?;
+        m.is_file().then(|| Identity::from_meta(&m))
+    }
+
+    pub fn from_meta(m: &std::fs::Metadata) -> Identity {
+        use std::os::unix::fs::MetadataExt;
+        Identity {
+            dev: m.dev(),
+            ino: m.ino(),
+            len: m.len(),
+            mtime: m.mtime(),
+            mtime_nsec: m.mtime_nsec(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
+        }
+    }
+}
+
 pub struct Group {
     /// Every copy, newest first, so "keep one" has an obvious default.
     pub ids: Vec<NodeId>,
+    /// What each of `ids` was when it was hashed, in the same order. This is
+    /// what the hash is a statement about, and acting on the hash without it
+    /// would be acting on a statement about some earlier file.
+    pub identities: Vec<Identity>,
     pub bytes_each: u64,
 }
 
@@ -41,6 +95,12 @@ impl Group {
     /// What deleting all but one copy would give back.
     pub fn wasted(&self) -> u64 {
         self.bytes_each * (self.ids.len() as u64 - 1)
+    }
+
+    /// What this copy was when its contents were proved to match the others.
+    pub fn identity(&self, id: NodeId) -> Option<Identity> {
+        let i = self.ids.iter().position(|x| *x == id)?;
+        self.identities.get(i).copied()
     }
 }
 
@@ -59,11 +119,11 @@ impl Report {
 
     /// Record a group, unless collapsing shared storage has left it with
     /// nothing to reclaim.
-    fn push(&mut self, ids: Vec<NodeId>, bytes_each: u64) {
+    fn push(&mut self, (ids, identities): (Vec<NodeId>, Vec<Identity>), bytes_each: u64) {
         if ids.len() < 2 {
             return;
         }
-        self.groups.push(Group { ids, bytes_each });
+        self.groups.push(Group { ids, identities, bytes_each });
     }
 }
 
@@ -76,6 +136,23 @@ pub struct Candidate {
     pub mtime: i64,
 }
 
+/// A candidate on its way through the passes, with the identity it had before
+/// the first byte of it was read.
+struct Suspect {
+    c: Candidate,
+    before: Identity,
+}
+
+impl Suspect {
+    /// Still the file it was when reading began? Checked after the last read,
+    /// so a write that lands while the hash is running cannot produce a group
+    /// whose identities describe one version of a file and whose hash describes
+    /// another.
+    fn unchanged(&self) -> bool {
+        Identity::of(&self.c.path) == Some(self.before)
+    }
+}
+
 pub fn find(candidates: Vec<Candidate>) -> Report {
     let mut by_size: HashMap<u64, Vec<Candidate>> = HashMap::new();
     for c in candidates {
@@ -83,15 +160,20 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
     }
 
     // Same size and same fingerprint. Still only a candidate.
-    let mut suspects: Vec<Vec<Candidate>> = Vec::new();
+    let mut suspects: Vec<Vec<Suspect>> = Vec::new();
     for group in by_size.into_values() {
         if group.len() < 2 {
             continue;
         }
-        let mut by_print: HashMap<[u8; 32], Vec<Candidate>> = HashMap::new();
+        let mut by_print: HashMap<[u8; 32], Vec<Suspect>> = HashMap::new();
         for c in group {
+            // A length that no longer matches the scan's is a file that has
+            // already moved on; there is nothing to prove about it.
+            let Some(before) = Identity::of(&c.path).filter(|i| i.len == c.bytes) else {
+                continue;
+            };
             let Some(print) = fingerprint(&c) else { continue };
-            by_print.entry(print).or_default().push(c);
+            by_print.entry(print).or_default().push(Suspect { c, before });
         }
         for (_, same) in by_print {
             if same.len() >= 2 {
@@ -102,18 +184,19 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
 
     // Spend the budget where it buys the most: the biggest piles first.
     suspects.sort_unstable_by_key(|g| {
-        std::cmp::Reverse(g[0].bytes * (g.len() as u64 - 1))
+        std::cmp::Reverse(g[0].c.bytes * (g.len() as u64 - 1))
     });
 
     let mut report = Report { groups: Vec::new(), bytes_read: 0, unverified: 0 };
     for group in suspects {
-        let bytes = group[0].bytes;
+        let bytes = group[0].c.bytes;
         // A file no larger than both edges was read end to end by the
         // fingerprint, so its fingerprint *is* its full hash: it is already
         // verified. See `fingerprint`, which reads the tail from one edge up
         // precisely so that this holds.
         if bytes <= EDGE * 2 {
             report.bytes_read += bytes * group.len() as u64;
+            let group: Vec<Suspect> = group.into_iter().filter(Suspect::unchanged).collect();
             report.push(newest_first(group), bytes);
             continue;
         }
@@ -124,10 +207,13 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
         }
         report.bytes_read += cost;
 
-        let mut by_hash: HashMap<[u8; 32], Vec<Candidate>> = HashMap::new();
-        for c in group {
-            let Some(h) = full_hash(&c) else { continue };
-            by_hash.entry(h).or_default().push(c);
+        let mut by_hash: HashMap<[u8; 32], Vec<Suspect>> = HashMap::new();
+        for s in group {
+            let Some(h) = full_hash(&s.c) else { continue };
+            if !s.unchanged() {
+                continue;
+            }
+            by_hash.entry(h).or_default().push(s);
         }
         for (_, same) in by_hash {
             if same.len() >= 2 {
@@ -153,14 +239,16 @@ pub fn find(candidates: Vec<Candidate>) -> Report {
 ///
 /// A filesystem that will not report extents says nothing either way, and
 /// nothing is collapsed on the strength of not knowing.
-fn newest_first(mut group: Vec<Candidate>) -> Vec<NodeId> {
-    group.sort_unstable_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.path.cmp(&b.path)));
+fn newest_first(mut group: Vec<Suspect>) -> (Vec<NodeId>, Vec<Identity>) {
+    group.sort_unstable_by(|a, b| {
+        b.c.mtime.cmp(&a.c.mtime).then_with(|| a.c.path.cmp(&b.c.path))
+    });
     let mut seen = std::collections::HashSet::new();
-    group.retain(|c| match crate::clone::physical_start(&c.path) {
+    group.retain(|s| match crate::clone::physical_start(&s.c.path) {
         Some(start) => seen.insert(start),
         None => true,
     });
-    group.into_iter().map(|c| c.id).collect()
+    group.into_iter().map(|s| (s.c.id, s.before)).unzip()
 }
 
 /// The first and last 64K, plus the size. Cheap enough to run on every

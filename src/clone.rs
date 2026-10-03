@@ -24,6 +24,15 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::dupes::Identity;
+
+/// Up to this size, the two files are compared byte for byte once more before
+/// one replaces the other. The identity check already says neither has been
+/// touched; this is the belt to its braces, on a filesystem that does not keep
+/// `ctime` honestly (a FUSE mount, an SMB share) and for the price of a read
+/// that is quick at this size. Larger pairs rely on the identity alone.
+const RECHECK_LIMIT: u64 = 32 << 20;
+
 /// Why a clone did not happen.
 #[derive(Debug)]
 pub enum Refusal {
@@ -137,11 +146,18 @@ pub fn already_shared(a: &Path, b: &Path) -> bool {
 /// Replace `dst` with a copy-on-write clone of `src`, freeing what `dst`'s own
 /// bytes were costing.
 ///
-/// The caller has to have proved the two files hold identical contents. This
-/// checks everything else: that they are both plain files on the same
-/// filesystem, that neither has changed size since it was hashed, that they are
-/// not the same file, and that they are not already sharing.
-pub fn share(src: &Path, dst: &Path, expect_bytes: u64) -> Result<(), Refusal> {
+/// The caller has to have proved the two files hold identical contents, and
+/// hands over what each file was at the moment it was read (`dupes::Group`
+/// keeps these). This checks everything else: that both are still exactly
+/// those files — same inode, same length, same `mtime` and `ctime` to the
+/// nanosecond — that they are plain files on the same filesystem, that they
+/// are not the same file, and that they are not already sharing.
+///
+/// The identity is checked twice: before anything is built, and again after
+/// the clone exists and just before it is renamed into place. A write to the
+/// source while `clonefile` runs would otherwise be captured into the clone,
+/// and a write to the destination would be thrown away by the rename.
+pub fn share(src: &Path, src_was: &Identity, dst: &Path, dst_was: &Identity) -> Result<(), Refusal> {
     use std::os::unix::fs::MetadataExt;
 
     let sm = std::fs::symlink_metadata(src).map_err(Refusal::Failed)?;
@@ -149,19 +165,25 @@ pub fn share(src: &Path, dst: &Path, expect_bytes: u64) -> Result<(), Refusal> {
     if !sm.is_file() || !dm.is_file() {
         return Err(Refusal::Refused("not both plain files".into()));
     }
-    // The contents were proved equal at some point in the past, and this is the
-    // cheapest evidence available that neither has moved on since.
-    if sm.len() != expect_bytes || dm.len() != expect_bytes {
-        return Err(Refusal::Refused("one of them changed since it was hashed".into()));
+    if sm.dev() == dm.dev() && sm.ino() == dm.ino() {
+        return Err(Refusal::Refused("already the same file".into()));
+    }
+    // The contents were proved equal at some point in the past. Length alone
+    // is no evidence that neither has moved on since — an edit in place that
+    // keeps the size is the commonest edit there is, and the rename below
+    // would destroy it without a trace.
+    unchanged(&sm, src_was, &dm, dst_was)?;
+    if src_was.len != dst_was.len {
+        return Err(Refusal::Refused("they are not the same size".into()));
     }
     if sm.dev() != dm.dev() {
         return Err(Refusal::Refused("they are on different filesystems".into()));
     }
-    if sm.ino() == dm.ino() {
-        return Err(Refusal::Refused("already the same file".into()));
-    }
     if already_shared(src, dst) {
         return Err(Refusal::Refused("already sharing their storage".into()));
+    }
+    if dm.len() <= RECHECK_LIMIT && !same_contents(src, dst).map_err(Refusal::Failed)? {
+        return Err(Refusal::Refused("their contents no longer match".into()));
     }
 
     let tmp = temp_beside(dst)?;
@@ -170,12 +192,63 @@ pub fn share(src: &Path, dst: &Path, expect_bytes: u64) -> Result<(), Refusal> {
         // time. Only where the bytes live is different, and nothing that looks
         // at the file has any business noticing.
         carry_over(&dm, &tmp)?;
+        // The last look before the point of no return. Anything that wrote to
+        // either file while the clone was being built shows up here as a moved
+        // `ctime`.
+        let sm = std::fs::symlink_metadata(src).map_err(Refusal::Failed)?;
+        let dm = std::fs::symlink_metadata(dst).map_err(Refusal::Failed)?;
+        unchanged(&sm, src_was, &dm, dst_was)?;
         std::fs::rename(&tmp, dst).map_err(Refusal::Failed)
     });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Both files still exactly what they were when they were hashed.
+fn unchanged(
+    sm: &std::fs::Metadata,
+    src_was: &Identity,
+    dm: &std::fs::Metadata,
+    dst_was: &Identity,
+) -> Result<(), Refusal> {
+    if Identity::from_meta(sm) != *src_was || Identity::from_meta(dm) != *dst_was {
+        return Err(Refusal::Refused("one of them changed since it was hashed".into()));
+    }
+    Ok(())
+}
+
+/// Byte-for-byte equality, read in step so a mismatch near the start costs
+/// almost nothing.
+fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = read_full(&mut fa, &mut ba)?;
+        let m = read_full(&mut fb, &mut bb)?;
+        if n != m || ba[..n] != bb[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// `read` until the buffer is full or the file ends, so the two sides of
+/// `same_contents` are always compared in equal-sized pieces.
+fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read;
+
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 /// A name beside the destination, so the clone lands on the right filesystem

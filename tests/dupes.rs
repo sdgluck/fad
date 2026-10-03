@@ -91,7 +91,15 @@ fn copies_that_already_share_their_storage_are_not_duplicates() {
     let before = dupes::find(vec![candidate(&a, 1, 100), candidate(&b, 2, 200)]);
     assert_eq!(before.groups.len(), 1, "the plain pair was not found in the first place");
 
-    match fad::clone::share(&a, &b, std::fs::metadata(&a).unwrap().len()) {
+    let g = &before.groups[0];
+    let (keep, other) = (g.ids[0], g.ids[1]);
+    let path = |id| if id == 1 { &a } else { &b };
+    match fad::clone::share(
+        path(keep),
+        &g.identity(keep).unwrap(),
+        path(other),
+        &g.identity(other).unwrap(),
+    ) {
         Ok(()) => {}
         Err(fad::clone::Refusal::Unsupported) => {
             eprintln!("skipped: this filesystem cannot share storage between files");
@@ -129,4 +137,34 @@ fn a_file_between_one_edge_and_two_is_still_read_to_the_end() {
         report.groups.is_empty(),
         "files differing past the first edge were called duplicates"
     );
+}
+
+/// Each member of a group carries what it was when it was read, because that
+/// is what the hash is a statement about — and `clone::share` acts on it.
+#[test]
+fn a_group_remembers_what_each_copy_was_when_it_was_hashed() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write(dir.path(), "a.bin", &body(5));
+    let b = write(dir.path(), "b.bin", &body(5));
+
+    let report = dupes::find(vec![candidate(&a, 1, 100), candidate(&b, 2, 200)]);
+    let g = &report.groups[0];
+    assert_eq!(g.identities.len(), g.ids.len());
+    assert_eq!(g.identity(1), dupes::Identity::of(&a));
+    assert_eq!(g.identity(2), dupes::Identity::of(&b));
+    assert_eq!(g.identity(3), None);
+}
+
+/// A file whose length no longer matches the scan's has moved on, and is not
+/// grouped on the strength of a size it does not have any more.
+#[test]
+fn a_file_that_changed_since_the_scan_is_not_grouped() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = write(dir.path(), "a.bin", &body(5));
+    let b = write(dir.path(), "b.bin", &body(5));
+    let stale = candidate(&b, 2, 200);
+    std::fs::write(&b, body(5).repeat(2)).unwrap();
+
+    let report = dupes::find(vec![candidate(&a, 1, 100), stale]);
+    assert!(report.groups.is_empty(), "grouped a file at a size it no longer has");
 }
