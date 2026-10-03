@@ -223,8 +223,10 @@ mod unnamed {
             .find(|c| app.tree.node(*c).flags & flags::UNNAMED != 0)
             .unwrap();
 
+        // `stage` refuses it outright now, which is the first line.
+        assert!(!app.stage(bad), "staged an entry fad cannot name");
         // Staged directly, as a stale batch carried across a rescan could be.
-        app.stage(bad);
+        app.staged.insert(bad);
         assert_eq!(app.staged.len(), 1);
 
         app.review_batch();
