@@ -147,7 +147,7 @@ pub fn classify(
 ) -> Option<Category> {
     if !is_dir {
         // A dotfile has no extension: `.img` is a name, not an img file.
-        let Some((stem, ext)) = name.rsplit_once('.') else { return None };
+        let (stem, ext) = name.rsplit_once('.')?;
         if stem.is_empty() {
             return None;
         }

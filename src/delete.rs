@@ -54,10 +54,10 @@ pub fn guard(path: &Path, root: &Path) -> Result<(), String> {
     if root.starts_with(path) {
         return Err(format!("{} contains the scan root", path.display()));
     }
-    if let Some(home) = crate::paths::home() {
-        if path == home {
-            return Err("that is your home directory".into());
-        }
+    if let Some(home) = crate::paths::home()
+        && path == home
+    {
+        return Err("that is your home directory".into());
     }
     if path.components().count() < 2 {
         return Err("that is too close to the filesystem root".into());
