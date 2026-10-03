@@ -51,6 +51,16 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Span::styled(human(after), theme.emphasis),
             Span::styled(format!("   (now {})", human(before)), theme.dim),
         ]));
+        // On the default disposal the headline above barely moves, and without
+        // this line it reads as fad having miscounted rather than as the Trash
+        // still holding the bytes.
+        let trashed = app.staged_to_trash();
+        if trashed > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("+{} once the trash is emptied (E), or D on the next screen", human(trashed)),
+                theme.dim,
+            )));
+        }
         lines.push(Line::from(""));
     }
 
