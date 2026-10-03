@@ -907,9 +907,16 @@ impl App {
     /// A tool row carries the root's id as a placeholder — it has no node —
     /// so this has to return `None` there, or `o`, `e`, `i` and `y` would all
     /// quietly act on the scan root instead.
+    ///
+    /// A group heading is not a node either. Reclaim and duplicate headings
+    /// carry the id of the first item under them, for the cursor's sake, and
+    /// returning it here made `i` ignore, `o` reveal, `y` copy and the
+    /// print-on-exit path whichever item happened to sort first — usually one
+    /// inside a closed group the user could not even see. A heading's own
+    /// verb is `A`, which reads the heading, not this.
     pub fn selected(&self) -> Option<NodeId> {
         let row = self.rows.get(self.cursor)?;
-        if row.tool.is_some() {
+        if row.tool.is_some() || row.header.is_some() {
             return None;
         }
         Some(row.id)

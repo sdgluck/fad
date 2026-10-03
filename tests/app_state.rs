@@ -629,3 +629,40 @@ fn the_confirm_keys_survive_a_small_terminal() {
         assert!(out.contains("esc"), "{w}x{h} lost esc:\n{out}");
     }
 }
+
+// ------------------------------------------------------------ group headings
+
+/// A heading carries its first item's id for the cursor's sake. `selected`
+/// handing that out made `i`, `o`, `y` and print-path act on an item the user
+/// was not on — usually inside a closed group. `A` still stages the group.
+#[test]
+fn a_group_heading_is_not_a_selection() {
+    use fad::app::{Heading, View};
+
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = settled(dir.path());
+    app.show_view(Some(View::Reclaim));
+    app.rebuild_rows();
+
+    let Some(Heading::Category(cat)) = app.rows.first().and_then(|r| r.header) else {
+        panic!("the fixture produced no reclaimable category");
+    };
+    app.cursor = 0;
+    assert_eq!(app.selected(), None, "a heading handed out its first item");
+    app.ensure_breakdown();
+    assert!(app.breakdown.is_none());
+
+    // The heading's own verb still works on the whole group.
+    let items = app.reclaim_items(cat);
+    assert!(!items.is_empty());
+    app.stage_all(items.clone());
+    assert!(items.iter().all(|id| app.staged.contains(id)));
+
+    // And an item under an open heading is a selection as before.
+    app.reclaim_open.insert(cat);
+    app.mark_dirty();
+    app.rebuild_rows();
+    app.cursor = 1;
+    assert_eq!(app.selected(), Some(items[0]));
+}
