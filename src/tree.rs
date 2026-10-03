@@ -115,6 +115,22 @@ impl Node {
     }
 }
 
+/// The links to one inode that the tree holds, and which of them carries its
+/// bytes.
+#[derive(Debug)]
+struct LinkSet {
+    /// `st_nlink` when it was scanned: how many names the file has on disk,
+    /// inside the tree or not.
+    nlink: u64,
+    /// The live links in the tree. Removed ones are taken out.
+    members: Vec<NodeId>,
+    /// The one counted at full size; every other member is a dupe at zero.
+    winner: NodeId,
+    /// Links the session has removed, so the last one out can tell whether a
+    /// name outside the tree is still holding the data.
+    removed: u64,
+}
+
 pub struct Tree {
     nodes: Vec<Node>,
     root: NodeId,
@@ -124,9 +140,12 @@ pub struct Tree {
     /// Batches that arrived before their parent was registered. Should stay
     /// empty given the walker's ordering, but correctness should not rest on it.
     orphans: Vec<Batch>,
-    /// Winning node for each multiply-linked inode. Only files with `nlink > 1`
-    /// ever land here, so this stays tiny on a normal filesystem.
-    links: HashMap<(u64, u64), NodeId>,
+    /// Every multiply-linked inode in the tree, keyed by `(dev, ino)`. Only
+    /// files with `nlink > 1` ever land here, so this stays tiny on a normal
+    /// filesystem.
+    links: HashMap<(u64, u64), LinkSet>,
+    /// The other direction, for `remove`: which inode a linked node is.
+    link_of: HashMap<NodeId, (u64, u64)>,
     pub unreadable_count: u64,
     /// Why each unreadable directory was, in the order they were found. The
     /// remedy depends on it: Full Disk Access fixes a permission refusal and
@@ -172,6 +191,7 @@ impl Tree {
             by_scan_id,
             orphans: Vec::new(),
             links: HashMap::new(),
+            link_of: HashMap::new(),
             unreadable_count: 0,
             unreadable_why: Vec::new(),
             reclaimable: Vec::new(),
@@ -324,7 +344,7 @@ impl Tree {
                 self.by_scan_id.insert(scan_id, id);
             }
             if e.meta.nlink > 1 && !e.meta.is_dir() {
-                hardlinks.push((id, e.meta.dev, e.meta.ino));
+                hardlinks.push((id, e.meta.dev, e.meta.ino, e.meta.nlink));
             }
             if let Some(reason) = e.skip {
                 self.skipped.push((id, reason));
@@ -353,8 +373,8 @@ impl Tree {
 
         // Resolved after the rollup so the subtraction never has to underflow a
         // total that has not been added yet.
-        for (id, dev, ino) in hardlinks {
-            self.resolve_hardlink(id, dev, ino);
+        for (id, dev, ino, nlink) in hardlinks {
+            self.resolve_hardlink(id, dev, ino, nlink);
         }
 
         if !self.orphans.is_empty() {
@@ -399,13 +419,20 @@ impl Tree {
     /// the same path: the lexicographically smallest one. Deciding it that way
     /// rather than first-one-wins keeps subtotals stable across runs, which a
     /// parallel walk would otherwise scramble.
-    fn resolve_hardlink(&mut self, id: NodeId, dev: u64, ino: u64) {
-        let Some(&prev) = self.links.get(&(dev, ino)) else {
-            self.links.insert((dev, ino), id);
+    fn resolve_hardlink(&mut self, id: NodeId, dev: u64, ino: u64, nlink: u64) {
+        self.link_of.insert(id, (dev, ino));
+        let Some(prev) = self.links.get(&(dev, ino)).map(|s| s.winner) else {
+            self.links.insert(
+                (dev, ino),
+                LinkSet { nlink, members: vec![id], winner: id, removed: 0 },
+            );
             return;
         };
-        let loser = if self.path(id) < self.path(prev) {
-            self.links.insert((dev, ino), id);
+        let id_wins = self.path(id) < self.path(prev);
+        let set = self.links.get_mut(&(dev, ino)).expect("looked up above");
+        set.members.push(id);
+        let loser = if id_wins {
+            set.winner = id;
             prev
         } else {
             id
@@ -437,7 +464,13 @@ impl Tree {
     }
 
     /// Detach a node and take its weight back out of every ancestor.
-    /// Returns the bytes reclaimed, or None if it was already gone.
+    ///
+    /// Returns the bytes actually freed, or None if it was already gone. That
+    /// is the subtree's total less whatever another name still holds: a file
+    /// counted here whose hard link survives elsewhere in the tree frees
+    /// nothing, and its bytes move over to that link rather than vanishing
+    /// from the totals — they are still on disk, and the surviving link is
+    /// now the only path that reaches them.
     pub fn remove(&mut self, id: NodeId) -> Option<u64> {
         if id == self.root || self.nodes[id as usize].flags & flags::DELETED != 0 {
             return None;
@@ -449,7 +482,18 @@ impl Tree {
         let files = n.file_count + u64::from(n.flags & flags::IS_DIR == 0);
         let dirs = n.dir_count + u64::from(n.flags & flags::IS_DIR != 0);
 
-        self.nodes[id as usize].flags |= flags::DELETED;
+        // Every node under it goes too, not just the one at the top. Left
+        // unmarked, they are detached from the tree but still in the arena
+        // looking alive: everything that walks the arena by index — the
+        // omissions screen, the snapshot writer — would go on reporting files
+        // that are in the trash.
+        let mut gone = Vec::new();
+        let mut stack = vec![id];
+        while let Some(x) = stack.pop() {
+            self.nodes[x as usize].flags |= flags::DELETED;
+            stack.extend_from_slice(&self.nodes[x as usize].children);
+            gone.push(x);
+        }
         self.nodes[parent as usize].children.retain(|c| *c != id);
         self.roll_up(parent, -(bytes as i64), -(len as i64), -(files as i64), -(dirs as i64));
         // `roll_up` walks sizes back; the newest-write rollup cannot be walked
@@ -459,7 +503,63 @@ impl Tree {
         // modified sort, and in the age filter, which would keep hiding a branch
         // that is now exactly what it claims to be looking for.
         self.recompute_newest(parent);
-        Some(bytes)
+
+        let mut kept = 0u64;
+        if !self.link_of.is_empty() {
+            for x in gone {
+                kept += self.unlink(x);
+            }
+        }
+        Some(bytes.saturating_sub(kept))
+    }
+
+    /// Take a removed node out of its hard-link set, if it is in one. Returns
+    /// the bytes that stay on disk because another name still holds them.
+    ///
+    /// Only the winner carries bytes, so only its going needs handling. If
+    /// another link survives in the tree, it takes the bytes over — the same
+    /// path the scan would have chosen had the winner never existed — and its
+    /// ancestors grow by exactly what the removed subtree's ancestors lost. If
+    /// none does but the file had more names than the tree ever saw, one of
+    /// them is outside the scan root and the data is still there.
+    fn unlink(&mut self, x: NodeId) -> u64 {
+        let Some(key) = self.link_of.remove(&x) else { return 0 };
+        let Some(set) = self.links.get_mut(&key) else { return 0 };
+        set.members.retain(|m| *m != x);
+        set.removed += 1;
+        if set.winner != x {
+            return 0;
+        }
+        let (bytes, len) = (self.nodes[x as usize].self_bytes, self.nodes[x as usize].self_len);
+
+        // Members still in the set may be inside the subtree being removed and
+        // not yet unlinked; they are on their way out and cannot inherit.
+        let members = set.members.clone();
+        let survivor = members
+            .into_iter()
+            .filter(|m| self.nodes[*m as usize].flags & flags::DELETED == 0)
+            .min_by_key(|m| self.path(*m));
+        let set = self.links.get_mut(&key).expect("looked up above");
+        match survivor {
+            Some(s) => {
+                set.winner = s;
+                let n = &mut self.nodes[s as usize];
+                n.self_bytes = bytes;
+                n.self_len = len;
+                n.flags &= !flags::HARDLINK_DUPE;
+                self.roll_up(s, bytes as i64, len as i64, 0, 0);
+                bytes
+            }
+            None => {
+                // Nothing left in the tree to carry it. The set stays only while
+                // removed-but-unprocessed members remain in it.
+                let outside = set.nlink > set.removed + set.members.len() as u64;
+                if set.members.is_empty() {
+                    self.links.remove(&key);
+                }
+                if outside { bytes } else { 0 }
+            }
+        }
     }
 
     /// Rebuild `newest_file_mtime` from the children that are left, upwards.
@@ -687,7 +787,20 @@ fn skip_from_u8(v: u8) -> Skip {
 
 impl Tree {
     pub fn to_snapshot(&self) -> Snapshot {
-        let n = self.nodes.len();
+        // Deleted nodes stay in the arena so live indices keep meaning what
+        // they meant; a snapshot has no live indices to protect, and writing
+        // them out would bring back, on the next launch, everything this
+        // session deleted. Renumber the survivors densely, in order — order
+        // is what keeps every parent ahead of its children.
+        let mut remap = vec![NO_PARENT; self.nodes.len()];
+        let mut n = 0usize;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if node.flags & flags::DELETED == 0 {
+                remap[i] = n as u32;
+                n += 1;
+            }
+        }
+        let live = |id: &NodeId| remap[*id as usize] != NO_PARENT;
         let mut snap = Snapshot {
             root_path: self.root_path.clone(),
             names: String::with_capacity(n * 12),
@@ -707,15 +820,26 @@ impl Tree {
             flags: Vec::with_capacity(n),
             preset: Vec::with_capacity(n),
             unreadable_count: self.unreadable_count,
-            reclaimable: self.reclaimable.clone(),
-            skipped: self.skipped.iter().map(|(id, s)| (*id, skip_to_u8(*s))).collect(),
+            reclaimable: self
+                .reclaimable
+                .iter()
+                .filter(|id| live(id))
+                .map(|id| remap[*id as usize])
+                .collect(),
+            skipped: self
+                .skipped
+                .iter()
+                .filter(|(id, _)| live(id))
+                .map(|(id, s)| (remap[*id as usize], skip_to_u8(*s)))
+                .collect(),
         };
-        for node in &self.nodes {
+        for node in self.nodes.iter().filter(|n| n.flags & flags::DELETED == 0) {
             snap.names.push_str(&node.name);
             snap.name_len.push(node.name.len() as u32);
-            snap.parent.push(node.parent.unwrap_or(NO_PARENT));
-            snap.child_len.push(node.children.len() as u32);
-            snap.child_ids.extend_from_slice(&node.children);
+            snap.parent.push(node.parent.map_or(NO_PARENT, |p| remap[p as usize]));
+            let kids = node.children.iter().filter(|c| live(c));
+            snap.child_len.push(kids.clone().count() as u32);
+            snap.child_ids.extend(kids.map(|c| remap[*c as usize]));
             snap.self_bytes.push(node.self_bytes);
             snap.total_bytes.push(node.total_bytes);
             snap.self_len.push(node.self_len);
@@ -801,6 +925,7 @@ impl Tree {
             by_scan_id: HashMap::new(),
             orphans: Vec::new(),
             links: HashMap::new(),
+            link_of: HashMap::new(),
             unreadable_count: s.unreadable_count,
             unreadable_why: Vec::new(),
             reclaimable: s.reclaimable.into_iter().filter(|i| (*i as usize) < n).collect(),
