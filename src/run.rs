@@ -1,12 +1,14 @@
 //! Terminal setup, the event loop, and what each key does.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -77,43 +79,174 @@ impl Screen {
 
 type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<Screen>>;
 
+/// Whether the terminal is currently ours: raw mode on, alternate screen up.
+/// Whoever swaps it back to false does the restoring, so the guard, the panic
+/// hook and the signal path can all race for it and the escape codes still go
+/// out exactly once — and a panic before startup or after a clean exit writes
+/// nothing to a terminal that is already fine.
+static TAKEN: AtomicBool = AtomicBool::new(false);
+static MOUSE: AtomicBool = AtomicBool::new(false);
+static KEEP_STDOUT_CLEAN: AtomicBool = AtomicBool::new(false);
+
+/// The last terminating signal to arrive, or zero. A handler may do almost
+/// nothing safely — no allocation, no locks, no writing escape codes through a
+/// buffered terminal — so it records the number and the event loop, which
+/// wakes at least four times a second, does the restoring on its way out.
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_signal(sig: libc::c_int) {
+    SIGNAL.store(sig, Ordering::SeqCst);
+}
+
+/// SIGTERM from `kill`, SIGHUP from a closed terminal window, SIGINT from
+/// anything that is not the keyboard (raw mode turns ctrl-c into a key). The
+/// default action for each kills the process with the terminal still raw and on
+/// the alternate screen, which leaves the shell unusable until the user types
+/// `reset` blind.
+///
+/// A caught signal goes back to its default disposition across `exec`, so an
+/// editor started from here still gets ctrl-c the normal way.
+fn install_signal_handlers() {
+    for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        // SAFETY: a zeroed `sigaction` is a valid empty one, and the handler
+        // only stores to an atomic, which is async-signal-safe.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            // Restarted, so a signal landing mid-`read` does not surface as an
+            // error that ends the session before the loop has seen the flag.
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// A terminating signal that has arrived since the last call, if any.
+fn take_signal() -> Option<i32> {
+    match SIGNAL.swap(0, Ordering::SeqCst) {
+        0 => None,
+        s => Some(s),
+    }
+}
+
+/// The release profile aborts on panic, so no destructor runs and the guard
+/// below never gets its chance: the terminal would be left raw, reporting mouse
+/// movements as garbage, with the panic message drawn onto the alternate screen
+/// and then thrown away with it. The hook puts the terminal back first and only
+/// then lets the default hook print, so the message lands in the scrollback
+/// where it can be read and reported.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_now();
+            previous(info);
+        }));
+    });
+}
+
+/// Put the terminal back from wherever we are. Opens its own handle rather than
+/// borrowing the session's, which a panicking thread may have been halfway
+/// through writing to.
+fn restore_now() {
+    if !TAKEN.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let mut out = Screen::open(KEEP_STDOUT_CLEAN.load(Ordering::SeqCst));
+    restore(&mut out, MOUSE.load(Ordering::SeqCst));
+}
+
+/// Every step, each attempted whatever the one before it did, and every error
+/// ignored: this runs on the way out of a panic or a signal, where there is
+/// nobody left to report a failure to, and a terminal with raw mode off but the
+/// alternate screen still up is barely better than one with neither undone.
+fn restore(out: &mut impl io::Write, mouse: bool) {
+    let _ = disable_raw_mode();
+    if mouse {
+        let _ = execute!(out, DisableMouseCapture);
+    }
+    let _ = execute!(out, LeaveAlternateScreen, Show);
+}
+
+/// The terminal, taken over, and given back on every way out.
+///
+/// Dropping it is the normal path — an error return, an early `?`, the end of
+/// the session. The panic hook covers a panic, which under `panic = "abort"`
+/// never unwinds as far as a destructor, and the signal flag covers being
+/// killed. All three go through `restore`, and `TAKEN` stops two of them both
+/// doing it.
+struct Session {
+    terminal: Term,
+    mouse: bool,
+}
+
+impl Session {
+    fn enter(mouse: bool, keep_stdout_clean: bool) -> io::Result<Session> {
+        install_panic_hook();
+        install_signal_handlers();
+        MOUSE.store(mouse, Ordering::SeqCst);
+        KEEP_STDOUT_CLEAN.store(keep_stdout_clean, Ordering::SeqCst);
+
+        enable_raw_mode()?;
+        // From here on a failure has something to undo. Marked before the
+        // alternate screen goes up, so a terminal that refuses it is still
+        // taken out of raw mode: raw and nothing else is still a broken shell.
+        TAKEN.store(true, Ordering::SeqCst);
+        let mut out = Screen::open(keep_stdout_clean);
+        let entered = execute!(out, EnterAlternateScreen).and_then(|()| {
+            if mouse { execute!(out, EnableMouseCapture) } else { Ok(()) }
+        });
+        if let Err(e) = entered {
+            restore_now();
+            return Err(e);
+        }
+        match ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(out)) {
+            Ok(terminal) => Ok(Session { terminal, mouse }),
+            Err(e) => {
+                restore_now();
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if TAKEN.swap(false, Ordering::SeqCst) {
+            restore(self.terminal.backend_mut(), self.mouse);
+        }
+    }
+}
+
 pub fn run(mut app: App, keep_stdout_clean: bool) -> io::Result<Outcome> {
-    let mouse = app.mouse;
-    let mut terminal = enter(mouse, keep_stdout_clean)?;
-    let result = event_loop(&mut terminal, &mut app);
+    let mut session = Session::enter(app.mouse, keep_stdout_clean)?;
+    let result = event_loop(&mut session, &mut app);
     // Restore the terminal first: whatever went wrong, the user should not be
     // left staring at a broken shell.
-    leave(&mut terminal, mouse)?;
+    drop(session);
+    if let Some(sig) = take_signal() {
+        // The conventional status for "killed by this signal", which is what a
+        // shell or a supervisor checks for. Nothing is saved and nothing is
+        // printed: a session that was told to stop has no answer to give.
+        std::process::exit(128 + sig);
+    }
     result?;
     let selected = app.selected().map(|id| app.tree.path(id));
     Ok(Outcome { tree: app.tree_is_complete().then_some(app.tree), selected })
 }
 
-fn enter(mouse: bool, keep_stdout_clean: bool) -> io::Result<Term> {
-    enable_raw_mode()?;
-    let mut out = Screen::open(keep_stdout_clean);
-    execute!(out, EnterAlternateScreen)?;
-    if mouse {
-        execute!(out, EnableMouseCapture)?;
-    }
-    let backend = ratatui::backend::CrosstermBackend::new(out);
-    let terminal = ratatui::Terminal::new(backend)?;
-    Ok(terminal)
-}
-
-fn leave(terminal: &mut Term, mouse: bool) -> io::Result<()> {
-    disable_raw_mode()?;
-    if mouse {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
-}
-
-fn event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
+fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
+    let terminal = &mut session.terminal;
     let mut last_draw = Instant::now() - SCAN_TICK;
     loop {
+        // Left set for `run` to find: the flag is all a handler could do, and
+        // the restoring happens on the way out.
+        if SIGNAL.load(Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
+
         app.poll_scan();
         app.poll_job();
         app.poll_dupes();
@@ -128,8 +261,20 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> io::Result<()> {
             last_draw = Instant::now();
         }
 
-        if event::poll(tick)? {
-            match event::read()? {
+        let ready = match event::poll(tick) {
+            Ok(ready) => ready,
+            // A signal arriving mid-poll; the check at the top of the loop is
+            // what deals with it.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if ready {
+            let ev = match event::read() {
+                Ok(ev) => ev,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
                 Event::Mouse(m) => on_mouse(app, m),
                 Event::Resize(_, _) => app.mark_dirty(),
