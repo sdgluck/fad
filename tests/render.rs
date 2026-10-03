@@ -761,6 +761,59 @@ fn overlay_footers_stay_pinned_on_small_terminals() {
     }
 }
 
+/// The help is longer than a short terminal: it has to scroll to its end, and
+/// a description that does not fit has to wrap rather than stop mid-word.
+#[test]
+fn the_help_scrolls_and_wraps() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.mode = fad::app::Mode::Help;
+
+    let top = render(&mut app, 80, 24);
+    println!("{top}");
+    assert!(top.contains("jump 10 lines"), "{top}");
+    assert!(top.contains("j k scroll"), "no sign that it scrolls:\n{top}");
+    assert!(!top.contains("wheel"), "fits without scrolling? the test needs a shorter screen:\n{top}");
+
+    app.ui.help_scroll = usize::MAX;
+    let end = render(&mut app, 80, 24);
+    println!("{end}");
+    assert!(end.contains("wheel"), "could not scroll to the last entry:\n{end}");
+    assert!(app.ui.help_scroll < 100, "the scroll was not clamped to the text");
+
+    // Narrow enough that the long esc line has to wrap: both halves are there
+    // and no word is broken across them.
+    app.ui.help_scroll = 0;
+    let mut found = false;
+    for _ in 0..40 {
+        let out = render(&mut app, 60, 40);
+        if out.contains("back out one level") {
+            assert!(out.contains("quits at the top"), "the wrapped half is missing:\n{out}");
+            found = true;
+            break;
+        }
+        app.ui.help_scroll += 5;
+    }
+    assert!(found, "never saw the esc entry");
+}
+
+/// At 80 columns with a batch staged the hints are cut short, and the two
+/// that must survive are how to get help and how to leave.
+#[test]
+fn the_status_bar_keeps_help_and_quit_when_it_is_narrow() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    let root = app.tree.root();
+    for c in app.tree.node(root).children.clone() {
+        app.staged.insert(c);
+    }
+    let out = render(&mut app, 80, 24);
+    let status = out.lines().last().unwrap_or_default();
+    assert!(status.contains("? help") && status.contains("q quit"), "{status}");
+}
+
 /// A kept filter is as easy to forget as an age filter, and has to be as
 /// visible: rows missing with no reason on screen read as a bug.
 #[test]

@@ -157,7 +157,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, &theme, chunks[1]);
 
     match app.mode {
-        Mode::Help => draw_help(f, &theme, area),
+        Mode::Help => draw_help(f, app, &theme, area),
         Mode::Search => search::draw(f, app, &theme, area),
         Mode::Basket => basket::draw(f, app, &theme, area),
         Mode::History => history::draw(f, app, &theme, area),
@@ -204,18 +204,32 @@ fn draw_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             }
             if let Some(msg) = &app.status {
                 spans.push(Span::styled(msg.clone(), theme.emphasis));
-            } else if app.dupe_view {
+            } else {
+                let used: usize = spans.iter().map(|s| cols(&s.content)).sum();
+                let room = (area.width as usize).saturating_sub(used);
                 // The one view with a second, better verb: the hint is the only
                 // place anyone will find it.
-                spans.push(Span::styled(
-                    "A delete all but the newest \u{b7} L share one copy instead, keeping every path \u{b7} d back",
-                    theme.dim,
-                ));
-            } else {
-                spans.push(Span::styled(
-                    "space stage \u{b7} x basket \u{b7} r reclaimable \u{b7} t tools \u{b7} / filter \u{b7} s sort \u{b7} ? help \u{b7} q quit",
-                    theme.dim,
-                ));
+                let hints: &[&str] = if app.dupe_view {
+                    &[
+                        "A delete all but the newest",
+                        "L share one copy instead, keeping every path",
+                        "esc back",
+                        "? help",
+                        "q quit",
+                    ]
+                } else {
+                    &[
+                        "space stage",
+                        "x basket",
+                        "r reclaimable",
+                        "t tools",
+                        "/ filter",
+                        "s sort",
+                        "? help",
+                        "q quit",
+                    ]
+                };
+                spans.push(Span::styled(fit_hints(hints, room), theme.dim));
             }
             Line::from(spans)
         }
@@ -223,41 +237,127 @@ fn draw_status(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
+/// The hints that fit in `room` columns, in their own order.
+///
+/// The last two — how to get help and how to leave — are kept whatever else
+/// goes: they are the two a newcomer cannot find any other way, and the line
+/// used to be cut from the right, which at 80 columns with a batch staged
+/// lost exactly those. The rest give way from the right-hand end.
+fn fit_hints(hints: &[&str], room: usize) -> String {
+    const SEP: &str = " \u{b7} ";
+    let (rest, kept) = hints.split_at(hints.len().saturating_sub(2));
+    let mut take = rest.len();
+    loop {
+        let line = rest[..take].iter().chain(kept).copied().collect::<Vec<_>>().join(SEP);
+        if cols(&line) <= room || take == 0 {
+            return truncate_end(&line, room);
+        }
+        take -= 1;
+    }
+}
+
+/// Words of `s` packed into lines of at most `width` columns. A word longer
+/// than a whole line is cut rather than left to overflow.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in s.split(' ') {
+        let need = if line.is_empty() { cols(word) } else { cols(&line) + 1 + cols(word) };
+        if need > width && !line.is_empty() {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(&truncate_end(word, width));
+    }
+    out.push(line);
+    out
+}
+
+/// What `o` does here. Said per platform, because "reveal in Finder" on Linux
+/// describes a program that is not there.
+const REVEAL: &str = if cfg!(target_os = "macos") {
+    "reveal in Finder"
+} else {
+    "open in your file manager"
+};
+
+/// Every key, grouped. A key of "" starts a group: its text is the heading.
+const KEYS: &[(&str, &str)] = &[
+    ("j / k, \u{2193} \u{2191}", "move"),
+    ("g / G", "first / last"),
+    ("ctrl-d / ctrl-u", "jump 10 lines down / up"),
+    ("l / \u{2192} / enter", "expand, or open a category"),
+    ("h / \u{2190}", "collapse, or jump to parent"),
+    ("space", "stage / unstage"),
+    ("A", "stage every child of this directory, or a whole group on its heading"),
+    ("x", "open the staging basket: review, edit, then commit"),
+    ("u", "undo the last committed batch"),
+    ("U", "the undo history: put any remembered batch back"),
+    ("E", "empty what fad put in the trash \u{2014} the space is not back until you do"),
+    ("/", "fuzzy filter: narrow what is on screen. enter keeps it, / again refines it"),
+    ("f", "find: every entry in the tree by name, biggest first, and jump to one"),
+    ("r", "reclaimable view: build artifacts, caches, VM images"),
+    ("t", "tool storage: what Docker and friends hold that a walk cannot see"),
+    ("d", "duplicate view: files whose contents are byte-for-byte equal"),
+    ("L", "in the duplicate view: share one copy of the storage, keeping every path"),
+    ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),
+    ("s", "cycle sort: size, count, modified, name"),
+    ("S", "bring the next detail breakdown to the top, when they do not all fit"),
+    ("o", REVEAL),
+    ("e", "open in $EDITOR (or $VISUAL, or vi); fad steps aside until it exits"),
+    ("y", "copy the path \u{2014} on a tool row, the command that removes it"),
+    ("i", "never rank this again \u{2014} adds it to your ignore list"),
+    ("!", "what is not in these numbers: skipped, unreadable, ignored"),
+    ("R", "rescan everything \u{2014} in the tools view, ask the tools again"),
+    ("esc", "back out one level: the filter, then the view, then the age filter; quits at the top"),
+    ("q / ctrl-c", "quit \u{2014} asks first if anything is staged"),
+    ("?", "this help"),
+    ("", "in the basket"),
+    ("space", "unstage the item, or the whole group on its heading"),
+    ("C", "clear the batch"),
+    ("enter", "go on to the confirmation"),
+    ("", "in the confirmation"),
+    ("D", "switch between the trash and a permanent delete"),
+    ("enter / y", "commit"),
+    ("esc / q", "back to the basket"),
+    ("", "mouse"),
+    ("click", "select \u{b7} on the arrow: open \u{b7} on the left edge: stage"),
+    ("wheel", "move the selection, or scroll the list in an overlay"),
+];
+
+/// Every key, wrapped to `width` columns: the key in a column of its own and
+/// the description folded under itself rather than cut mid-word.
+fn help_lines(theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    const KEY_W: usize = 18;
+    let text_w = width.saturating_sub(KEY_W + 1).max(10);
+    let mut lines = Vec::new();
+    for (k, d) in KEYS {
+        if k.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(format!(" {d}"), theme.dim)));
+            continue;
+        }
+        for (i, part) in wrap(d, text_w).into_iter().enumerate() {
+            let key = if i == 0 { pad(&format!(" {k}"), KEY_W) } else { " ".repeat(KEY_W) };
+            lines.push(Line::from(vec![
+                Span::styled(key, theme.emphasis),
+                Span::styled(part, theme.normal),
+            ]));
+        }
+    }
+    lines
+}
+
+fn draw_help(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     use ratatui::widgets::{Block, Borders, Clear};
 
-    const KEYS: &[(&str, &str)] = &[
-        ("j / k, \u{2193} \u{2191}", "move"),
-        ("g / G", "first / last"),
-        ("ctrl-d / ctrl-u", "half page"),
-        ("l / \u{2192} / enter", "expand, or open a category"),
-        ("h / \u{2190}", "collapse, or jump to parent"),
-        ("space", "stage / unstage"),
-        ("A", "stage every child of this directory"),
-        ("x", "open the staging basket: review, edit, commit"),
-        ("u", "undo the last committed batch"),
-        ("E", "empty what fad put in the trash \u{2014} the space is not back until you do"),
-        ("U", "the undo history: put any remembered batch back"),
-        ("/", "fuzzy filter: narrow what is on screen"),
-        ("f", "find: every entry in the tree by name, biggest first, and jump to one"),
-        ("r", "reclaimable view: build artifacts, caches, VM images"),
-        ("t", "tool storage: what Docker and friends hold that a walk cannot see"),
-        ("a", "cycle age filter: any, 90 days, 1 year, 2 years untouched"),
-        ("d", "duplicate view: files whose contents are byte-for-byte equal"),
-        ("L", "in the duplicate view: share one copy of the storage, keeping every path"),
-        ("s", "cycle sort: size, count, modified, name"),
-        ("S", "bring the next detail breakdown to the top, when they do not all fit"),
-        ("o / e / y", "Finder / $EDITOR / copy path"),
-        ("i", "never rank this again \u{2014} adds it to your ignore list"),
-        ("!", "what is not in these numbers: skipped, unreadable, ignored"),
-        ("R", "rescan the selected subtree"),
-        ("click", "select \u{b7} on the arrow: open \u{b7} on the left edge: stage"),
-        ("wheel", "move the selection"),
-        ("q", "quit"),
-    ];
-
-    let w = 66u16.min(area.width.saturating_sub(4));
-    let h = (KEYS.len() as u16 + 2).min(area.height.saturating_sub(2));
+    // Wider when there is room for it: every line that wraps is one more to
+    // scroll past.
+    let w = 96u16.min(area.width.saturating_sub(4));
+    let lines = help_lines(theme, w.saturating_sub(2) as usize);
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
@@ -265,15 +365,19 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
         height: h,
     };
 
-    let lines: Vec<Line> = KEYS
-        .iter()
-        .map(|(k, d)| {
-            Line::from(vec![
-                Span::styled(format!(" {k:<16}"), theme.emphasis),
-                Span::styled((*d).to_string(), theme.normal),
-            ])
-        })
-        .collect();
+    // Clamped here, the one place that knows how long the wrapped text came
+    // out, and written back so `k` after a run of `j` past the end moves at
+    // once instead of first working off the overshoot.
+    let body = h.saturating_sub(2) as usize;
+    let max = lines.len().saturating_sub(body);
+    app.ui.help_scroll = app.ui.help_scroll.min(max);
+    let scroll = app.ui.help_scroll;
+    let hint = if max == 0 {
+        " any other key closes ".to_string()
+    } else {
+        format!(" {}/{} \u{b7} j k scroll \u{b7} any other key closes ", scroll + body, lines.len())
+    };
+    let lines: Vec<Line> = lines.into_iter().skip(scroll).collect();
 
     f.render_widget(Clear, popup);
     f.render_widget(
@@ -281,7 +385,8 @@ fn draw_help(f: &mut Frame, theme: &Theme, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme.border_focus)
-                .title(" keys ".bold()),
+                .title(" keys ".bold())
+                .title_bottom(Line::from(hint).right_aligned()),
         ),
         popup,
     );

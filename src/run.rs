@@ -354,10 +354,7 @@ pub fn on_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
     match app.mode {
         Mode::Filter => filter_key(app, k),
         Mode::Search => search_key(app, k),
-        Mode::Help => {
-            app.mode = Mode::Normal;
-            app.mark_dirty();
-        }
+        Mode::Help => help_key(app, k),
         Mode::Basket => basket_key(app, k),
         Mode::History => history_key(app, k),
         Mode::Omissions => omissions_key(app, k),
@@ -379,7 +376,10 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) {
             MouseEventKind::ScrollUp => KeyCode::Up,
             _ => return,
         };
-        if matches!(app.mode, Mode::Basket | Mode::History | Mode::Omissions | Mode::Search) {
+        if matches!(
+            app.mode,
+            Mode::Basket | Mode::History | Mode::Omissions | Mode::Search | Mode::Help
+        ) {
             for _ in 0..3 {
                 on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
             }
@@ -433,6 +433,26 @@ fn click(app: &mut App, column: u16, row: u16) {
         };
         if open { collapse(app) } else { expand(app) }
     }
+}
+
+/// The help overlay scrolls — it is longer than a short terminal — and any key
+/// that is not scrolling closes it, as it always did. The draw clamps the
+/// offset, since only it knows how many lines the text wrapped to.
+fn help_key(app: &mut App, k: KeyEvent) {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let scroll = &mut app.ui.help_scroll;
+    match k.code {
+        KeyCode::Char('j') | KeyCode::Down => *scroll += 1,
+        KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+        KeyCode::PageDown => *scroll += 10,
+        KeyCode::Char('d') if ctrl => *scroll += 10,
+        KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+        KeyCode::Char('u') if ctrl => *scroll = scroll.saturating_sub(10),
+        KeyCode::Char('g') | KeyCode::Home => *scroll = 0,
+        KeyCode::Char('G') | KeyCode::End => *scroll = usize::MAX,
+        _ => app.mode = Mode::Normal,
+    }
+    app.mark_dirty();
 }
 
 /// The journal. `u` reaches the top of the stack; this reaches the rest of it.
@@ -753,7 +773,10 @@ fn normal_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
                 rescan(app)
             }
         }
-        KeyCode::Char('?') => app.mode = Mode::Help,
+        KeyCode::Char('?') => {
+            app.ui.help_scroll = 0;
+            app.mode = Mode::Help;
+        }
         _ => {}
     }
     app.mark_dirty();

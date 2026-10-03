@@ -252,6 +252,27 @@ fn single_item_keys_refuse_a_group_heading() {
 }
 
 #[test]
+fn the_help_scrolls_on_j_and_closes_on_anything_else() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+
+    press(&mut app, KeyCode::Char('?'));
+    press(&mut app, KeyCode::Char('j'));
+    press(&mut app, KeyCode::PageDown);
+    assert!(app.mode == Mode::Help, "scrolling closed the help");
+    assert_eq!(app.ui.help_scroll, 11);
+    press(&mut app, KeyCode::Char('k'));
+    assert_eq!(app.ui.help_scroll, 10);
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.mode == Mode::Normal);
+
+    // And it opens at the top again.
+    press(&mut app, KeyCode::Char('?'));
+    assert_eq!(app.ui.help_scroll, 0);
+}
+
+#[test]
 fn esc_closes_an_overlay_without_quitting() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
