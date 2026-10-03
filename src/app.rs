@@ -1210,11 +1210,11 @@ impl App {
             let path = self.tree.path(*id);
             let Some(was) = identity(*id) else { continue };
             match crate::clone::share(&keep_path, &keep_was, &path, &was) {
-                Ok(()) => {
+                Ok(bytes) => {
                     shared += 1;
-                    // Allocated blocks, not length: what came back is what the
-                    // second copy was costing the volume.
-                    freed += self.tree.self_size(*id, false);
+                    // What the replaced inode had allocated when it went, as
+                    // `share` measured it — not the scan's figure.
+                    freed += bytes;
                 }
                 // Nothing on this filesystem will work, so stop rather than
                 // fail the same way once per copy. Breaking rather than

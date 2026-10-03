@@ -12,7 +12,7 @@ use fad::dupes::Identity;
 
 /// Share `other`'s storage with `keep`, as the duplicate view would straight
 /// after hashing: with both files' identities taken now.
-fn share_now(keep: &std::path::Path, other: &std::path::Path) -> Result<(), Refusal> {
+fn share_now(keep: &std::path::Path, other: &std::path::Path) -> Result<u64, Refusal> {
     let (k, o) = (Identity::of(keep).unwrap(), Identity::of(other).unwrap());
     clone::share(keep, &k, other, &o)
 }
@@ -215,4 +215,89 @@ fn nothing_is_left_behind() {
         .filter(|n| n.starts_with(".fad-clone-"))
         .collect();
     assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+}
+
+/// Set an extended attribute, or `false` where the filesystem has none.
+fn set_xattr(path: &std::path::Path, name: &str, value: &[u8]) -> bool {
+    let p = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let n = std::ffi::CString::new(name).unwrap();
+    // SAFETY: NUL-terminated strings and a buffer of the length passed.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0, 0) };
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::setxattr(p.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+    rc == 0
+}
+
+fn get_xattr(path: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+    let p = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let n = std::ffi::CString::new(name).unwrap();
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: NUL-terminated strings and a buffer of the length passed.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::getxattr(p.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    (rc >= 0).then(|| {
+        buf.truncate(rc as usize);
+        buf
+    })
+}
+
+/// `clonefile` copies the source's extended attributes along with its data.
+/// Renamed over the destination, that swapped the destination's Finder tags,
+/// resource fork or `user.*` notes for the other copy's. The destination has
+/// to come out of it with its own.
+#[test]
+fn the_destination_keeps_its_own_extended_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x5A, 1 << 20);
+    if !set_xattr(&keep, "user.fad.keep", b"from the kept copy")
+        || !set_xattr(&other, "user.fad.other", b"the destination's own")
+    {
+        eprintln!("skipped: this filesystem has no extended attributes");
+        return;
+    }
+
+    needs_clones!(share_now(&keep, &other)).expect("clone failed");
+
+    assert_eq!(
+        get_xattr(&other, "user.fad.other").as_deref(),
+        Some(&b"the destination's own"[..]),
+        "the destination lost its own attribute"
+    );
+    assert_eq!(get_xattr(&other, "user.fad.keep"), None, "the source's attribute came across");
+    // And the kept file is untouched.
+    assert!(get_xattr(&keep, "user.fad.keep").is_some());
+}
+
+/// Replacing one name of a hard-linked file frees nothing — the other name
+/// keeps the blocks — and it splits the link, so writes through the other
+/// name stop showing up under this one.
+#[test]
+fn a_hard_linked_destination_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x3C, 1 << 20);
+    let twin = dir.path().join("twin.bin");
+    std::fs::hard_link(&other, &twin).unwrap();
+
+    let err = share_now(&keep, &other).expect_err("split a hard link");
+    assert!(
+        matches!(err, Refusal::Refused(ref why) if why.contains("hard link")),
+        "wrong refusal: {err}"
+    );
+    assert_eq!(std::fs::metadata(&other).unwrap().ino(), std::fs::metadata(&twin).unwrap().ino());
+}
+
+/// The "freed" figure is what the replaced inode had allocated when it went,
+/// not a size from the scan.
+#[test]
+fn a_share_reports_what_it_actually_freed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (keep, other) = two_copies(dir.path(), 0x7E, 4 << 20);
+    let allocated = std::fs::metadata(&other).unwrap().blocks() * 512;
+    assert!(allocated > 0);
+
+    let freed = needs_clones!(share_now(&keep, &other)).expect("clone failed");
+    assert_eq!(freed, allocated);
 }

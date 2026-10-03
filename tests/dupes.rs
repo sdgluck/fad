@@ -100,7 +100,7 @@ fn copies_that_already_share_their_storage_are_not_duplicates() {
         path(other),
         &g.identity(other).unwrap(),
     ) {
-        Ok(()) => {}
+        Ok(_) => {}
         Err(fad::clone::Refusal::Unsupported) => {
             eprintln!("skipped: this filesystem cannot share storage between files");
             return;
