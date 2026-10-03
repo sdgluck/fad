@@ -472,8 +472,12 @@ first of its paths.
 - **Cloud folders (macOS).** iCloud Drive, Dropbox, OneDrive and similar
   FileProvider-backed folders are skipped, because reading inside one can block
   on the network for minutes. `--cloud` opts in. Linux has no equivalent skip.
-- **Directories that cannot be read.** Counted and reported; on macOS, granting
-  your terminal Full Disk Access usually fixes this.
+- **Directories that cannot be read.** Counted and reported, with the reason;
+  when the reason is a permission refusal on macOS, granting your terminal Full
+  Disk Access usually fixes it. A directory that lists its names but will not
+  let them be examined (read without search permission) is reported the same
+  way rather than shown as an empty 0 B, and trees deeper than `PATH_MAX` are
+  walked to the bottom.
 
 Anything skipped is reported in a banner, so an incomplete number is never shown
 as a complete one. A banner says how many, which is enough to know a total is

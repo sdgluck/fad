@@ -32,8 +32,8 @@ fn walk_fstatat(root: &Path) -> (u64, u64) {
     let (mut entries, mut bytes) = (0u64, 0u64);
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(items) = read_dir_stat(&d) else { continue };
-        for it in items {
+        let Ok(listing) = read_dir_stat(&d) else { continue };
+        for it in listing.entries {
             entries += 1;
             bytes += it.meta.blocks;
             if it.meta.is_dir() {

@@ -303,26 +303,62 @@ end
 fn print_json(tree: &Tree, args: &Args) {
     let v = node_json(tree, tree.root(), args, 0);
     println!("{}", serde_json::to_string_pretty(&v).unwrap());
-    if tree.unreadable_count > 0 {
-        eprintln!(
-            "fad: {} directories were unreadable and are not counted \
-             (grant Full Disk Access to your terminal to include them)",
-            tree.unreadable_count
-        );
+    warn_omissions(tree);
+}
+
+/// Everything the totals just printed do not include, on stderr, path by
+/// path — the same account the `!` screen gives, for a reader with no screen.
+///
+/// Every kind of omission is listed, not only the ones with a flag to fix
+/// them: a mount point that was not entered is as missing from the numbers as
+/// a cloud folder, and a script comparing totals against `df` needs to know.
+fn warn_omissions(tree: &Tree) {
+    /// Past this, a list is noise; the count still says how many.
+    const SHOW: usize = 20;
+
+    fn list(paths: &[(PathBuf, String)]) {
+        for (p, why) in paths.iter().take(SHOW) {
+            if why.is_empty() {
+                eprintln!("       {}", display_path(p));
+            } else {
+                eprintln!("       {}  ({why})", display_path(p));
+            }
+        }
+        if paths.len() > SHOW {
+            eprintln!("       ... and {} more", paths.len() - SHOW);
+        }
     }
-    let cloud: Vec<_> = tree
-        .skipped
+
+    let unreadable: Vec<(PathBuf, String)> = tree
+        .unreadable_why
         .iter()
-        .filter(|(_, r)| *r == Skip::CloudStorage)
-        .map(|(id, _)| tree.path(*id))
+        .filter(|(id, _)| tree.node(*id).flags & fad::tree::flags::DELETED == 0)
+        .map(|(id, kind)| (tree.path(*id), fad::tree::unreadable_reason(*kind)))
         .collect();
-    if !cloud.is_empty() {
+    if !unreadable.is_empty() {
         eprintln!(
-            "fad: skipped {} cloud folder(s), not counted — rescan with --cloud to include:",
-            cloud.len()
+            "fad: {} director{} could not be read, in whole or in part, and {} not fully counted:",
+            unreadable.len(),
+            if unreadable.len() == 1 { "y" } else { "ies" },
+            if unreadable.len() == 1 { "is" } else { "are" },
         );
-        for p in &cloud {
-            eprintln!("       {}", p.display());
+        list(&unreadable);
+    }
+
+    for (reason, heading) in [
+        (Skip::OtherDevice, "mount point(s) not entered, not counted \u{2014} rescan with --cross-device to include"),
+        (Skip::CloudStorage, "cloud folder(s) skipped, not counted \u{2014} rescan with --cloud to include"),
+        (Skip::UnrepresentableName, "entr(ies) whose name is not valid UTF-8, not counted \u{2014} fad cannot name them to act on them"),
+    ] {
+        let paths: Vec<(PathBuf, String)> = tree
+            .skipped
+            .iter()
+            .filter(|(id, r)| *r == reason && tree.node(*id).flags & fad::tree::flags::DELETED == 0)
+            .map(|(id, _)| (tree.path(*id), String::new()))
+            .collect();
+        if !paths.is_empty() {
+            eprintln!("fad: {} {heading}:", paths.len());
+            list(&paths);
         }
     }
 }
@@ -725,4 +761,9 @@ fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::
         }
     }
     v
+}
+
+/// A path as it is shown to a person reading the terminal.
+fn display_path(p: &std::path::Path) -> String {
+    p.display().to_string()
 }

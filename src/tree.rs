@@ -12,6 +12,23 @@ use crate::scan::walk::{Batch, ROOT_ID, ScanId, Skip};
 
 pub type NodeId = u32;
 
+/// What fixes a directory fad was refused. macOS gates whole areas of a home
+/// directory behind a privacy grant that has nothing to do with Unix modes;
+/// elsewhere a refusal is the modes, and nothing fad can suggest overrides them.
+#[cfg(target_os = "macos")]
+pub const PERMISSION_FIX: &str = "grant Full Disk Access to your terminal";
+#[cfg(not(target_os = "macos"))]
+pub const PERMISSION_FIX: &str = "fad has no permission to read them";
+
+/// A reason a directory could not be read, worded for the person reading it.
+pub fn unreadable_reason(kind: std::io::ErrorKind) -> String {
+    match kind {
+        std::io::ErrorKind::PermissionDenied => format!("permission denied \u{2014} {PERMISSION_FIX}"),
+        std::io::ErrorKind::InvalidFilename => "path too long to open".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sort {
     Size,
@@ -111,6 +128,10 @@ pub struct Tree {
     /// ever land here, so this stays tiny on a normal filesystem.
     links: HashMap<(u64, u64), NodeId>,
     pub unreadable_count: u64,
+    /// Why each unreadable directory was, in the order they were found. The
+    /// remedy depends on it: Full Disk Access fixes a permission refusal and
+    /// does nothing for a path too long to open.
+    pub unreadable_why: Vec<(NodeId, std::io::ErrorKind)>,
     /// Every node matching a reclaimable preset, for the `r` view.
     pub reclaimable: Vec<NodeId>,
     /// Directories we stopped at, so the UI can say so rather than quietly
@@ -152,6 +173,7 @@ impl Tree {
             orphans: Vec::new(),
             links: HashMap::new(),
             unreadable_count: 0,
+            unreadable_why: Vec::new(),
             reclaimable: Vec::new(),
             skipped: Vec::new(),
         }
@@ -223,10 +245,16 @@ impl Tree {
             return;
         };
 
-        if let Some(_kind) = batch.unreadable {
-            self.nodes[parent as usize].flags |= flags::UNREADABLE | flags::SCANNED;
+        if let Some(kind) = batch.unreadable {
+            self.nodes[parent as usize].flags |= flags::UNREADABLE;
             self.unreadable_count += 1;
-            return;
+            self.unreadable_why.push((parent, kind));
+            // With entries, the directory listed and only some of it would not
+            // stat: what did is counted, and the flag says it is not all.
+            if batch.entries.is_empty() {
+                self.nodes[parent as usize].flags |= flags::SCANNED;
+                return;
+            }
         }
 
         let mut added_bytes = 0u64;
@@ -533,6 +561,16 @@ impl Tree {
         if apparent { n.self_len } else { n.self_bytes }
     }
 
+    /// What would get the unreadable directories counted, for the line that
+    /// reports them. Full Disk Access is the answer to a permission refusal
+    /// and to nothing else: telling someone to grant it for a path too long
+    /// to open sends them to System Settings for a problem that is not there.
+    pub fn unreadable_fix(&self) -> &'static str {
+        let denied = self.unreadable_why.is_empty()
+            || self.unreadable_why.iter().any(|(_, k)| *k == std::io::ErrorKind::PermissionDenied);
+        if denied { PERMISSION_FIX } else { "not a permissions problem \u{2014} see `!` for why" }
+    }
+
     fn root_name(root_path: &Path) -> Box<str> {
         match root_path.file_name() {
             Some(n) => n.to_string_lossy().into_owned().into_boxed_str(),
@@ -764,6 +802,7 @@ impl Tree {
             orphans: Vec::new(),
             links: HashMap::new(),
             unreadable_count: s.unreadable_count,
+            unreadable_why: Vec::new(),
             reclaimable: s.reclaimable.into_iter().filter(|i| (*i as usize) < n).collect(),
             skipped: s
                 .skipped

@@ -53,7 +53,12 @@ pub enum Skip {
 pub struct Batch {
     pub parent: ScanId,
     pub entries: Vec<Entry>,
-    /// Set when the directory itself could not be read.
+    /// Set when the directory could not be read, or not all of it could. With
+    /// no entries, the directory itself would not open; with entries, it
+    /// listed but some of what it listed would not stat (a directory with read
+    /// but not search permission does exactly this, to every entry), so what
+    /// is here is real but not the whole of it. Either way the directory is
+    /// short by an amount nobody can know, and is reported as such.
     pub unreadable: Option<std::io::ErrorKind>,
 }
 
@@ -232,7 +237,12 @@ fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s Ctx, path: PathBuf, id: ScanI
     let mut entries = Vec::new();
     let mut subdirs = Vec::new();
 
-    for item in read {
+    let partial = read.error.filter(|_| read.failed > 0);
+    if partial.is_some() {
+        ctx.progress.unreadable.fetch_add(1, Ordering::Relaxed);
+    }
+
+    for item in read.entries {
         let dir::DirEntry { name, representable, mut meta } = item;
         let mut skip = None;
         let mut descend = None;
@@ -272,7 +282,7 @@ fn scan_dir<'s>(scope: &rayon::Scope<'s>, ctx: &'s Ctx, path: PathBuf, id: ScanI
 
     // Send before spawning: guarantees the tree has this node's children
     // registered before any grandchild batch can arrive.
-    if ctx.tx.send(Batch { parent: id, entries, unreadable: None }).is_err() {
+    if ctx.tx.send(Batch { parent: id, entries, unreadable: partial }).is_err() {
         return; // receiver gone; abandon the subtree
     }
 
