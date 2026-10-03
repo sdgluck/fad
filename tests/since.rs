@@ -265,3 +265,31 @@ fn a_wide_directory_is_matched_entry_for_entry() {
     assert!(out.lines().any(|l| l.ends_with("/w/1999")), "{out}");
     assert!(!out.contains("(new)") && !out.contains("(gone)"), "lost track of a name: {out}");
 }
+
+/// A filename is chosen by whoever made the file, and one holding an escape
+/// sequence printed raw can rewrite the terminal it lands on. The listings are
+/// read by a person deciding something, so controls are written out — and the
+/// JSON, which escapes for itself, is left as the real name.
+#[test]
+fn control_characters_in_names_are_escaped_in_listings() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("keep"), b"x").unwrap();
+    fad(dir.path(), cache.path(), &["--since"]);
+    std::fs::write(dir.path().join("evil\u{1b}[2Jname"), vec![0u8; 200 * 1024]).unwrap();
+
+    let (out, err, code) = fad(dir.path(), cache.path(), &["--since"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains('\u{1b}'), "a raw escape reached the terminal: {out:?}");
+    assert!(out.contains("evil\\u{1b}[2Jname  (new)"), "{out:?}");
+
+    std::fs::remove_file(dir.path().join("evil\u{1b}[2Jname")).unwrap();
+    fad(dir.path(), cache.path(), &["--since"]);
+    std::fs::write(dir.path().join("evil\u{1b}[2Jname"), vec![0u8; 200 * 1024]).unwrap();
+    let (out, _, _) = fad(dir.path(), cache.path(), &["--since", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["changes"].as_array().unwrap().iter().any(|c| c["path"].as_str().unwrap().ends_with("evil\u{1b}[2Jname")),
+        "JSON should carry the real name: {out}"
+    );
+}

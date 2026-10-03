@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{CommandFactory, Parser, ValueEnum};
 
 use fad::app::App;
-use fad::format::human;
+use fad::format::{escape_controls, human};
 use fad::run;
 use fad::scan::Scan;
 use fad::scan::walk::{ScanOpts, Skip};
@@ -228,7 +228,7 @@ fn main() {
     let (mut tree, scan) = match Scan::start(&root, opts.clone()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("fad: {}: {e}", root.display());
+            eprintln!("fad: {}: {e}", display_path(&root));
             std::process::exit(1);
         }
     };
@@ -498,12 +498,12 @@ fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
         chosen.iter().map(|(id, bytes)| (tree.path(*id), *bytes)).collect();
 
     if batch.is_empty() {
-        println!("fad: nothing reclaimable under {}", root.display());
+        println!("fad: nothing reclaimable under {}", display_path(root));
         return 0;
     }
 
     for (path, bytes) in &batch {
-        println!("{:>8}  {}", human(*bytes), path.display());
+        println!("{:>8}  {}", human(*bytes), display_path(path));
     }
     let verb = if args.dry_run {
         "would reclaim"
@@ -529,7 +529,7 @@ fn reclaim_now(tree: &Tree, args: &Args) -> i32 {
 
     let failures = job.failures();
     for o in &failures {
-        eprintln!("fad: {}: {}", o.path.display(), o.result.as_ref().err().cloned().unwrap_or_default());
+        eprintln!("fad: {}: {}", display_path(&o.path), o.result.as_ref().err().cloned().unwrap_or_default());
     }
     println!("reclaimed {}", human(job.freed()));
     if !args.permanent {
@@ -678,7 +678,7 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
     }
 
     for r in &items {
-        println!("{:>8}  {}", human(r.bytes), fad::tools::remove_line(&r.key()));
+        println!("{:>8}  {}", human(r.bytes), escape_controls(&fad::tools::remove_line(&r.key())));
     }
     // Report-aware, so that taking *every* image of a kind reports the tool's
     // own exact total rather than a floor: with nothing left behind to hold a
@@ -709,7 +709,7 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
 
     let failures = job.failures();
     for o in &failures {
-        eprintln!("fad: {}: {}", o.label, o.result.as_ref().err().cloned().unwrap_or_default());
+        eprintln!("fad: {}: {}", escape_controls(&o.label), o.result.as_ref().err().cloned().unwrap_or_default());
     }
     // Measured by asking the tools again, not by adding up what we hoped for.
     match job.measured {
@@ -899,9 +899,11 @@ fn node_json(tree: &Tree, id: NodeId, args: &Args, depth: usize) -> serde_json::
     v
 }
 
-/// A path as it is shown to a person reading the terminal.
+/// A path as it is shown to a person reading the terminal. See
+/// `fad::format::escape_controls`; not for `--print-path`, whose output is a
+/// path for a shell to use, nor for JSON, which escapes for itself.
 fn display_path(p: &std::path::Path) -> String {
-    p.display().to_string()
+    escape_controls(&p.to_string_lossy())
 }
 
 /// A path for JSON output. Filenames are bytes, and on Linux need not be
