@@ -31,22 +31,46 @@ impl Disposal {
 }
 
 /// Paths that must never be deleted no matter what is selected, plus anything
-/// at or above the scan root. A tool whose whole job is bulk deletion has to be
-/// the one that says no.
+/// not strictly inside the scan root. A tool whose whole job is bulk deletion
+/// has to be the one that says no.
+///
+/// Every check is made against the path as given *and* as the filesystem
+/// resolves it, because the same directory has more than one name. `$HOME` can
+/// be a symlink (or reached through `/var` → `/private/var`), and on macOS
+/// every user directory is also reachable through the Data volume's firmlink
+/// root: `/System/Volumes/Data/Users` is `/Users` and must be refused as such.
 pub fn guard(path: &Path, root: &Path) -> Result<(), String> {
+    use std::path::Component;
+
+    // Mount roots and scratch roots on both, so a scan rooted at `/` cannot
+    // offer up `/tmp` or a whole attached disk as one entry.
+    const SHARED: &[&str] = &[
+        "/Volumes", "/mnt", "/media", "/opt", "/tmp", "/var", "/private/tmp", "/private/var",
+    ];
     #[cfg(target_os = "macos")]
     const NEVER: &[&str] = &[
         "/", "/Applications", "/Library", "/System", "/Users", "/bin", "/etc", "/private",
-        "/sbin", "/usr", "/var",
+        "/sbin", "/usr", "/cores", "/dev",
     ];
     #[cfg(not(target_os = "macos"))]
     const NEVER: &[&str] = &[
-        "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/opt",
-        "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/usr", "/var",
+        "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/proc",
+        "/root", "/run", "/sbin", "/srv", "/sys", "/usr",
     ];
 
-    if NEVER.iter().any(|p| path == Path::new(p)) {
-        return Err(format!("{} is a system directory", path.display()));
+    // `..` would make every prefix comparison below a lie.
+    if path.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
+        return Err("that path is not in plain form".into());
+    }
+    let names = [path.to_path_buf(), resolved(path)];
+    for p in &names {
+        if NEVER.iter().chain(SHARED).any(|n| p == Path::new(n)) {
+            return Err(format!("{} is a system directory", path.display()));
+        }
+        // The root of a mounted volume: the whole disk, not something on it.
+        if p.parent() == Some(Path::new("/Volumes")) {
+            return Err(format!("{} is a mounted volume", path.display()));
+        }
     }
     if path == root {
         return Err("that is the scan root".into());
@@ -54,15 +78,65 @@ pub fn guard(path: &Path, root: &Path) -> Result<(), String> {
     if root.starts_with(path) {
         return Err(format!("{} contains the scan root", path.display()));
     }
-    if let Some(home) = crate::paths::home()
-        && path == home
-    {
-        return Err("that is your home directory".into());
+    // Whatever the tree says, nothing outside what was scanned is fad's to
+    // touch.
+    if !path.starts_with(root) {
+        return Err(format!("{} is outside the scan root", path.display()));
+    }
+    if let Some(home) = crate::paths::home() {
+        let homes = [home.clone(), std::fs::canonicalize(&home).unwrap_or(home)];
+        if names.iter().any(|p| homes.contains(p)) {
+            return Err("that is your home directory".into());
+        }
     }
     if path.components().count() < 2 {
         return Err("that is too close to the filesystem root".into());
     }
+    if is_mount_point(path) {
+        return Err(format!("{} is a mount point", path.display()));
+    }
     Ok(())
+}
+
+/// `path` as the filesystem resolves it, without resolving its last component
+/// (a symlink being deleted is the link, not what it points at). On macOS the
+/// Data volume's firmlink prefix is then dropped when the remainder exists at
+/// `/`, so `/System/Volumes/Data/Users/x` compares as `/Users/x`.
+fn resolved(path: &Path) -> PathBuf {
+    let base = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            std::fs::canonicalize(parent).map(|p| p.join(name)).unwrap_or_else(|_| path.into())
+        }
+        _ => path.to_path_buf(),
+    };
+    strip_firmlink(&base)
+}
+
+#[cfg(target_os = "macos")]
+fn strip_firmlink(path: &Path) -> PathBuf {
+    if let Ok(rest) = path.strip_prefix("/System/Volumes/Data") {
+        let at_root = Path::new("/").join(rest);
+        if !rest.as_os_str().is_empty() && at_root.symlink_metadata().is_ok() {
+            return at_root;
+        }
+    }
+    path.to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn strip_firmlink(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// A directory on a different device from its parent: something is mounted
+/// there, and deleting it means emptying a whole filesystem.
+fn is_mount_point(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(m), Some(parent)) = (std::fs::symlink_metadata(path), path.parent()) else {
+        return false;
+    };
+    m.is_dir() && std::fs::metadata(parent).is_ok_and(|p| p.dev() != m.dev())
 }
 
 /// Refuse a directory that holds another filesystem or a cloud folder,

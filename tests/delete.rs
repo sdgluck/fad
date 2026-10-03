@@ -113,6 +113,52 @@ fn guard_refuses_the_home_directory() {
     assert!(delete::guard(&home, &home.join("project")).is_err());
 }
 
+/// Scratch roots, mount roots and anything outside the scan are refused, and
+/// so is a path that is only safe-looking because of a `..`.
+#[test]
+fn guard_refuses_mount_roots_scratch_roots_and_the_outside() {
+    for bad in [
+        "/Volumes", "/mnt", "/media", "/opt", "/tmp", "/var", "/private/tmp", "/private/var",
+    ] {
+        assert!(delete::guard(Path::new(bad), Path::new("/")).is_err(), "guard let {bad} through");
+    }
+    assert!(delete::guard(Path::new("/Volumes/Backup"), Path::new("/Volumes")).is_err());
+    assert!(delete::guard(Path::new("/dev"), Path::new("/")).is_err());
+
+    let root = Path::new("/home/someone/dev");
+    assert!(delete::guard(Path::new("/home/someone/other/target"), root).is_err());
+    assert!(delete::guard(&root.join("proj/../../other"), root).is_err());
+    assert!(delete::guard(&root.join("proj/target"), root).is_ok());
+}
+
+/// On macOS the Data volume is reachable under its firmlink root too, and
+/// `/System/Volumes/Data/Users` is `/Users` by another name.
+#[cfg(target_os = "macos")]
+#[test]
+fn guard_sees_through_the_data_volume_firmlink() {
+    let data = Path::new("/System/Volumes/Data");
+    for bad in ["Users", "Applications", "Library", "private/var"] {
+        assert!(delete::guard(&data.join(bad), data).is_err(), "guard let {bad} through");
+    }
+}
+
+/// `$HOME` reached by another name — a symlink, or `/var` for `/private/var`
+/// — is still the home directory.
+#[test]
+fn guard_refuses_the_home_directory_by_any_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let _env = common::env_lock();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+    common::isolate(&dir.path().join("link"));
+
+    assert!(delete::guard(&real, dir.path()).is_err(), "the real home got through");
+    let canonical = std::fs::canonicalize(&real).unwrap();
+    let croot = std::fs::canonicalize(dir.path()).unwrap();
+    assert!(delete::guard(&canonical, &croot).is_err(), "the canonical home got through");
+}
+
 /// `u` reaches the top of the stack; the journal keeps twenty. Reaching past
 /// the top has to restore the batch you picked and leave the others alone.
 #[test]
