@@ -469,6 +469,14 @@ fn read_at(path: &Path) -> Vec<Batch> {
     batches
 }
 
+/// Is there anything at all at `path`? Not `Path::exists`, which follows a
+/// symlink and calls a dangling one absent — so a trashed dangling link read
+/// as already emptied, and a dangling link at the restore destination read as
+/// a free slot that the restore then replaced.
+fn present(path: &Path) -> bool {
+    path.symlink_metadata().is_ok()
+}
+
 impl Batch {
     pub fn bytes(&self) -> u64 {
         self.entries.iter().map(|e| e.bytes).sum()
@@ -479,7 +487,7 @@ impl Batch {
     pub fn recoverable(&self) -> (usize, u64) {
         self.entries
             .iter()
-            .filter(|e| e.to.exists())
+            .filter(|e| present(&e.to))
             .fold((0, 0), |(n, b), e| (n + 1, b + e.bytes))
     }
 }
@@ -497,7 +505,7 @@ pub fn trashed_entries() -> Vec<(PathBuf, PathBuf, u64)> {
     read_journal()
         .iter()
         .flat_map(|b| b.entries.iter())
-        .filter(|e| trash::is_trash_path(&e.to) && e.to.exists())
+        .filter(|e| trash::is_trash_path(&e.to) && present(&e.to))
         .map(|e| (e.to.clone(), e.from.clone(), e.bytes))
         .collect()
 }
@@ -558,7 +566,7 @@ pub fn undo_batch(id: u64) -> Result<UndoReport, String> {
                 continue;
             }
         }
-        if e.from.exists() {
+        if present(&e.from) {
             report.skipped.push((e.from.clone(), "something is there now".into()));
             continue;
         }

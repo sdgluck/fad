@@ -300,3 +300,60 @@ fn a_journal_from_before_ids_still_works() {
     assert_eq!(r.restored, 1);
     assert!(from.exists());
 }
+
+/// A dangling symlink is something. `Path::exists` says otherwise, so undo
+/// used to treat the slot as free and `rename` replaced the link.
+#[test]
+fn undo_does_not_replace_a_dangling_symlink() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let (from, to) = fake_trashed(dir.path(), "config", 8);
+    delete::Recorder::new().record(&from, &to, 8).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &from).unwrap();
+
+    let report = delete::undo_last().unwrap();
+    assert_eq!(report.restored, 0);
+    assert_eq!(report.skipped.len(), 1);
+    assert!(from.symlink_metadata().unwrap().file_type().is_symlink(), "the link was replaced");
+    assert!(to.exists(), "the trashed item moved anyway");
+}
+
+/// The restore itself refuses to land on anything, so something arriving
+/// between the check and the move is not replaced either.
+#[test]
+fn restore_never_replaces_what_is_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, trashed) = fake_trashed(dir.path(), "a.txt", 4);
+    let dest = dir.path().join("a.txt");
+    std::fs::write(&dest, b"arrived meanwhile").unwrap();
+
+    let err = fad::trash::restore(&trashed, &dest).expect_err("restored over a file");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&dest).unwrap(), b"arrived meanwhile");
+    assert!(trashed.exists());
+
+    // And over a dangling symlink.
+    std::fs::remove_file(&dest).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &dest).unwrap();
+    assert!(fad::trash::restore(&trashed, &dest).is_err(), "restored over a dangling link");
+    assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+}
+
+/// A trashed dangling symlink is still in the trash, and still recoverable.
+#[test]
+fn a_trashed_dangling_symlink_is_still_recoverable() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    std::fs::create_dir_all(dir.path().join(".Trash")).unwrap();
+    let to = dir.path().join(".Trash/link");
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &to).unwrap();
+    delete::Recorder::new().record(&dir.path().join("link"), &to, 0).unwrap();
+
+    assert_eq!(delete::still_in_trash().0, 1, "a dangling link read as already emptied");
+    let report = delete::undo_last().unwrap();
+    assert_eq!(report.restored, 1, "{:?}", report.skipped);
+}
