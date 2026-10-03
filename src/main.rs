@@ -191,16 +191,7 @@ fn main() {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let opts = ScanOpts { cross_device: args.cross_device, cloud: args.cloud };
-    let (mut tree, scan) = match Scan::start(&root, opts.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("fad: {}: {e}", root.display());
-            std::process::exit(1);
-        }
-    };
-
-    // Asking the tools has nothing to do with the walk, so it does not wait for
+    // Asking the tools has nothing to do with the walk, so it does not start
     // one. `--tools --json` on a big home directory should not cost a scan it
     // will not print.
     if args.tools && (args.json || args.yes) {
@@ -213,11 +204,21 @@ fn main() {
         });
     }
 
+    let opts = ScanOpts { cross_device: args.cross_device, cloud: args.cloud };
+    let (mut tree, scan) = match Scan::start(&root, opts.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("fad: {}: {e}", root.display());
+            std::process::exit(1);
+        }
+    };
+
     // Ahead of --json, because --since has a JSON shape of its own: a list of
     // changes, which is the whole question being asked. Below it, that shape
     // was unreachable and `--since --json` quietly printed a plain tree dump.
     if args.since {
         scan.finish(&mut tree);
+        require_readable_root(&tree);
         // Read before writing, since the write replaces it.
         let previous = fad::cache::load(tree.root_path(), tree.scan_opts());
         // Leave this walk behind as the new baseline, or a script that runs
@@ -250,9 +251,13 @@ fn main() {
 
     if args.json {
         scan.finish(&mut tree);
+        require_readable_root(&tree);
         tree.sort_all_by_size(args.apparent);
         if args.reclaim {
             print_reclaim_json(&tree, &args);
+            // The reclaimable set is drawn from the same scan, and is short by
+            // the same omissions.
+            warn_omissions(&tree);
         } else {
             print_json(&tree, &args);
         }
@@ -261,6 +266,7 @@ fn main() {
 
     if args.reclaim && args.yes {
         scan.finish(&mut tree);
+        require_readable_root(&tree);
         std::process::exit(reclaim_now(&tree, &args));
     }
 
@@ -346,6 +352,24 @@ function fad-cd --description 'run fad and cd to where you left the cursor'
 end
 "#;
     println!("{}", if shell == Shell::Fish { fish } else { sh });
+}
+
+/// A root that could not be read has no numbers to report. Printing
+/// `"bytes": 0` for it — and exiting 0 — told a script the directory was
+/// empty, which is the one thing nobody knows about it.
+fn require_readable_root(tree: &Tree) {
+    let root = tree.node(tree.root());
+    if root.flags & fad::tree::flags::UNREADABLE == 0 || !root.children.is_empty() {
+        return;
+    }
+    let why = tree
+        .unreadable_why
+        .iter()
+        .find(|(id, _)| *id == tree.root())
+        .map(|(_, k)| fad::tree::unreadable_reason(*k))
+        .unwrap_or_else(|| "could not be read".into());
+    eprintln!("fad: {}: {why}", display_path(tree.root_path()));
+    std::process::exit(1);
 }
 
 fn print_json(tree: &Tree, args: &Args) {

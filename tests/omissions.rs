@@ -375,3 +375,54 @@ fn a_tree_deeper_than_path_max_is_walked_to_the_bottom() {
     assert_eq!(r.file_count, 1, "never reached the bottom");
     assert!(r.total_bytes >= 256 * 1024);
 }
+
+fn fad_json(root: &Path, extra: &[&str]) -> std::process::Output {
+    let cache = tempfile::tempdir().unwrap();
+    std::process::Command::new(env!("CARGO_BIN_EXE_fad"))
+        .arg(root)
+        .args(extra)
+        .env("FAD_CACHE_DIR", cache.path())
+        .output()
+        .unwrap()
+}
+
+/// A root that cannot be read has no size to report. It used to print
+/// `"bytes": 0` and exit 0 — an empty directory, as far as a script could tell.
+#[test]
+fn an_unreadable_root_is_an_error_not_zero_bytes() {
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    for mode in [0o000, 0o644] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        mk(&root, "inside.bin", 4096);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+        let json = fad_json(&root, &["--json"]);
+        let since = fad_json(&root, &["--since"]);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for out in [json, since] {
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "mode {mode:o}: {err}");
+            assert!(out.stdout.is_empty(), "mode {mode:o} printed a report");
+            assert!(err.to_lowercase().contains("permission denied"), "mode {mode:o}: {err}");
+        }
+    }
+}
+
+/// Every kind of omission reaches `--json`'s stderr, not only the ones with a
+/// flag to fix them.
+#[cfg(target_os = "linux")]
+#[test]
+fn json_lists_entries_it_cannot_name() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir"));
+    std::fs::create_dir(&bad).unwrap();
+    let out = fad_json(dir.path(), &["--json"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("not valid UTF-8") && err.contains("bad"), "{err}");
+}

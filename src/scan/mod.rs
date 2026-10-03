@@ -44,6 +44,11 @@ impl Scan {
             ));
         }
 
+        // Opened once up front, so a root that cannot be read at all is an
+        // error here — before a UI opens on it or a report prints 0 B for it —
+        // rather than one unreadable directory among the results.
+        drop(std::fs::read_dir(&root)?);
+
         let mut tree = Tree::new(root.clone(), &root_meta);
         tree.set_scan_opts(opts.clone());
         // Bounded so a slow consumer applies backpressure instead of letting the
