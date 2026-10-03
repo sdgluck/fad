@@ -795,7 +795,7 @@ fn toggle_dupes(app: &mut App) {
         return;
     }
     if app.scanning() {
-        app.status = Some("still scanning \u{2014} duplicates need the whole tree".into());
+        app.status = Some("still scanning \u{2014} the hunt starts when the scan finishes".into());
         return;
     }
     app.start_dupe_hunt();

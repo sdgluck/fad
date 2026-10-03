@@ -753,15 +753,26 @@ impl App {
         }
 
         self.scan = None;
+        // `d` pressed mid-scan opens the view and waits, because hashing half
+        // a tree finds half the duplicates. The view being up with no report
+        // and no hunt is that request; it used to be forgotten, so the view
+        // sat empty after the walk finished until `d` was pressed twice more.
+        // Read before `adopt`, which takes the view down with the old tree.
+        let hunt_wanted = self.dupe_view && self.dupes.is_none() && self.dupes_rx.is_none();
         if let Some(fresh) = self.pending.take() {
             self.adopt(fresh);
-            return true;
+        } else {
+            // The walk is done, so anything it has not found by now is not there.
+            self.resolve_restage();
+            let gone = std::mem::take(&mut self.restage).len();
+            self.report_dropped(gone);
+            self.dirty = true;
         }
-        // The walk is done, so anything it has not found by now is not there.
-        self.resolve_restage();
-        let gone = std::mem::take(&mut self.restage).len();
-        self.report_dropped(gone);
-        self.dirty = true;
+        if hunt_wanted {
+            self.show_view(Some(View::Dupes));
+            self.start_dupe_hunt();
+            self.status = Some("scan finished \u{2014} hashing candidates\u{2026}".into());
+        }
         true
     }
 

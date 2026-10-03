@@ -528,3 +528,41 @@ fn a_file_batch_stops_between_entries() {
         assert!(p.exists(), "{} went although it was never attempted", p.display());
     }
 }
+
+// ------------------------------------------------- a hunt asked for too early
+
+/// `d` mid-scan opens the view and waits for the whole tree. The request used
+/// to be forgotten: the walk finished and the view sat empty.
+#[test]
+fn a_duplicate_hunt_asked_for_mid_scan_starts_when_the_scan_finishes() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    std::fs::write(dir.path().join("copy.mov"), vec![1u8; 9 * 1024 * 1024]).unwrap();
+
+    let mut app = app_for(dir.path());
+    assert!(app.scanning());
+    // What `d` does while scanning: the view goes up, and no hunt starts.
+    app.toggle_view(fad::app::View::Dupes);
+    assert!(!app.dupe_hunt_running());
+
+    while app.scanning() {
+        app.poll_scan();
+    }
+    assert!(app.dupe_view, "the view the user asked for was taken down");
+    assert!(app.dupe_hunt_running() || app.dupes.is_some(), "the hunt never started");
+    wait_for(|| {
+        app.poll_dupes();
+        app.dupes.is_some()
+    });
+    assert!(!app.dupes.as_ref().unwrap().groups.is_empty(), "the copy was not found");
+}
+
+/// Not asked for, not started: a finished walk alone is no reason to hash.
+#[test]
+fn a_finished_scan_does_not_start_a_hunt_nobody_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let app = settled(dir.path());
+    assert!(!app.dupe_hunt_running());
+    assert!(app.dupes.is_none());
+}
