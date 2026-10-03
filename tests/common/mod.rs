@@ -33,3 +33,12 @@ pub fn isolate(dir: &Path) {
         std::env::set_var("FAD_CACHE_DIR", dir.join("cache/fad"));
     }
 }
+
+/// A directory the presets call a cache on this platform, for fixtures that
+/// need one reclaimable category to exist. `Library/Caches` is the macOS app
+/// cache; Linux has no name-only equivalent (its `.cache` has to be the home
+/// directory's own), so it gets npm's, which every platform recognises.
+#[cfg(target_os = "macos")]
+pub const CACHE_DIR: &str = "Library/Caches";
+#[cfg(not(target_os = "macos"))]
+pub const CACHE_DIR: &str = ".npm/_cacache";

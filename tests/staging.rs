@@ -9,6 +9,8 @@ use fad::scan::Scan;
 use fad::scan::walk::ScanOpts;
 use fad::tree::Tree;
 
+mod common;
+
 fn fixture(root: &Path) {
     let mk = |rel: &str, size: usize| {
         let p = root.join(rel);
@@ -18,7 +20,7 @@ fn fixture(root: &Path) {
     mk("dev/fad/target/debug/huge.rlib", 6 * 1024 * 1024);
     mk("dev/fad/src/main.rs", 4 * 1024);
     mk("Movies/holiday.mov", 9 * 1024 * 1024);
-    mk("Library/Caches/big.cache", 3 * 1024 * 1024);
+    mk(&format!("{}/big.cache", common::CACHE_DIR), 3 * 1024 * 1024);
 }
 
 fn scanned(root: &Path) -> Tree {
@@ -213,7 +215,7 @@ fn the_basket_groups_the_batch_and_accounts_for_all_of_it() {
     let mut app = app_for(dir.path());
 
     let target = find(&app.tree, "dev/fad/target");
-    let caches = find(&app.tree, "Library/Caches");
+    let caches = find(&app.tree, common::CACHE_DIR);
     let movies = find(&app.tree, "Movies/holiday.mov");
     for id in [target, caches, movies] {
         app.stage(id);
@@ -236,7 +238,7 @@ fn the_basket_groups_the_batch_and_accounts_for_all_of_it() {
             _ => None,
         })
         .collect();
-    // An app cache, and two things the presets know nothing about — `target`
+    // A cache, and two things the presets know nothing about — `target`
     // has no `Cargo.toml` beside it, so it is not a build directory. Two
     // headings, and the subtotals have to add up to the batch.
     assert_eq!(groups.len(), 2, "expected one heading per category present");

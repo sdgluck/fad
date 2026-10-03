@@ -20,7 +20,7 @@ fn fixture(root: &Path) {
     mk("dev/fad/target/debug/huge.rlib", 6 * 1024 * 1024);
     mk("dev/fad/src/main.rs", 4 * 1024);
     mk("Movies/holiday.mov", 9 * 1024 * 1024);
-    mk("Library/Caches/big.cache", 3 * 1024 * 1024);
+    mk(&format!("{}/big.cache", common::CACHE_DIR), 3 * 1024 * 1024);
 }
 
 fn app_for(root: &Path) -> App {

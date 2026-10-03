@@ -23,7 +23,7 @@ fn fixture(root: &Path) {
     mk("dev/fad/target/debug/huge.rlib", 6 * 1024 * 1024);
     mk("dev/fad/src/main.rs", 4 * 1024);
     mk("Movies/holiday.mov", 9 * 1024 * 1024);
-    mk("Library/Caches/big.cache", 3 * 1024 * 1024);
+    mk(&format!("{}/big.cache", common::CACHE_DIR), 3 * 1024 * 1024);
 }
 
 fn scanned(root: &Path) -> Tree {
@@ -274,12 +274,12 @@ fn a_rescan_keeps_the_staged_batch_and_reports_what_vanished() {
     for rel in keep {
         app.stage(find(&app.tree, rel));
     }
-    let doomed = find(&app.tree, "Library/Caches/big.cache");
+    let doomed = find(&app.tree, &format!("{}/big.cache", common::CACHE_DIR));
     app.stage(doomed);
     let want: Vec<_> = keep.iter().map(|r| app.tree.root_path().join(r)).collect();
 
     // Gone from disk behind fad's back, which is what R is for.
-    std::fs::remove_file(dir.path().join("Library/Caches/big.cache")).unwrap();
+    std::fs::remove_file(dir.path().join(common::CACHE_DIR).join("big.cache")).unwrap();
 
     app.restart_scan().unwrap();
     while app.scanning() {
@@ -598,8 +598,10 @@ fn t_without_docker_does_not_claim_to_ask_docker() {
     assert!(!fad::tools::Source::Docker.installed());
     let mut app = settled(dir.path());
     app.start_tool_probe();
+    // Saying there is no docker to ask is fine — on a machine with nothing
+    // installed that is the answer. Claiming to be asking it is not.
     let status = app.status.clone().unwrap_or_default();
-    assert!(!status.contains("docker"), "{status}");
+    assert!(!status.contains("asking docker"), "{status}");
     unsafe {
         std::env::remove_var("FAD_DOCKER_BIN");
         std::env::remove_var("FAD_PODMAN_BIN");
@@ -615,7 +617,7 @@ fn the_confirm_keys_survive_a_small_terminal() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path());
     let mut app = settled(dir.path());
-    for rel in ["Movies", "dev/fad/target", "Library/Caches", "dev/fad/src"] {
+    for rel in ["Movies", "dev/fad/target", common::CACHE_DIR, "dev/fad/src"] {
         app.stage(find(&app.tree, rel));
     }
     app.review_batch();

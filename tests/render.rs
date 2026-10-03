@@ -456,18 +456,24 @@ fn a_short_pane_cuts_the_breakdowns_and_says_it_cut_them() {
     app.cursor = 0;
     app.rebuild_rows();
 
-    let out = render(&mut app, 100, 22);
+    // Short enough that the list is cut whether the root's path takes one
+    // line or two: macOS temp paths wrap in this pane and Linux's `/tmp` ones
+    // do not, which is a row's difference in how much of the list fits.
+    let out = render(&mut app, 100, 21);
     println!("{out}");
     assert!(out.contains("on disk"), "the size was clipped:\n{out}");
     assert!(out.contains("where it goes"), "the overview was clipped:\n{out}");
-    assert!(out.contains("top 5 of 6"), "a cut list claimed to be whole:\n{out}");
+    assert!(
+        out.contains("by extension \u{b7} top ") && out.contains(" of 6"),
+        "a cut list claimed to be whole:\n{out}"
+    );
     // Nothing may spill past the pane into the staged box below it.
     assert!(out.contains("staged"), "the staged box was pushed off:\n{out}");
 
     // With the room for it, the same list is whole and says nothing about tops.
     let tall = render(&mut app, 100, 40);
     assert!(tall.contains("by extension"), "no breakdown:\n{tall}");
-    assert!(!tall.contains("top 5 of 6"), "a whole list claimed to be cut:\n{tall}");
+    assert!(!tall.contains("by extension \u{b7} top "), "a whole list claimed to be cut:\n{tall}");
 }
 
 /// The screen between a keystroke and the last recoverable copy of something.
