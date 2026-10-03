@@ -341,6 +341,36 @@ fn restore_never_replaces_what_is_there() {
     assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
 }
 
+/// An item that could not come back this time stays in the batch so it can
+/// be tried again; the batch goes only once it is empty.
+#[test]
+fn an_item_that_could_not_be_restored_can_be_retried() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let mut rec = delete::Recorder::new();
+    let (a_from, a_to) = fake_trashed(dir.path(), "a", 4);
+    let (b_from, b_to) = fake_trashed(dir.path(), "b", 4);
+    rec.record(&a_from, &a_to, 4).unwrap();
+    rec.record(&b_from, &b_to, 4).unwrap();
+    std::fs::write(&b_from, b"in the way").unwrap();
+
+    let report = delete::undo_last().unwrap();
+    assert_eq!(report.restored, 1);
+    assert_eq!(report.skipped.len(), 1);
+    let j = delete::read_journal();
+    assert_eq!(j.len(), 1, "the batch was dropped with an item still to restore");
+    assert_eq!(j[0].entries.len(), 1);
+    assert_eq!(j[0].entries[0].from, b_from, "the wrong entry was kept");
+
+    std::fs::remove_file(&b_from).unwrap();
+    let report = delete::undo_last().unwrap();
+    assert_eq!(report.restored, 1, "{:?}", report.skipped);
+    assert!(b_from.exists());
+    assert!(delete::read_journal().is_empty(), "an empty batch stayed in the journal");
+}
+
 /// A trashed dangling symlink is still in the trash, and still recoverable.
 #[test]
 fn a_trashed_dangling_symlink_is_still_recoverable() {

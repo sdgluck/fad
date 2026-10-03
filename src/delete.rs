@@ -550,10 +550,15 @@ pub fn undo_batch(id: u64) -> Result<UndoReport, String> {
         .iter()
         .position(|b| b.id == id)
         .ok_or("that batch is no longer in the undo history")?;
-    let batch = batches.remove(index);
+    let entries = std::mem::take(&mut batches[index].entries);
 
     let mut report = UndoReport { restored: 0, bytes: 0, skipped: Vec::new() };
-    for e in &batch.entries {
+    // What could not come back this time but might next time: the original
+    // path is occupied, or the move failed. Those stay in the batch so `u`
+    // can be pressed again once the way is clear. What is gone from the trash
+    // or was replaced there can never come back, and is let go.
+    let mut retry = Vec::new();
+    for e in entries {
         // Putting back whatever is at the recorded path now would move some
         // other trashed thing into a place the user never had it. An entry
         // from before identities were kept is let through: a restore moves
@@ -568,6 +573,7 @@ pub fn undo_batch(id: u64) -> Result<UndoReport, String> {
         }
         if present(&e.from) {
             report.skipped.push((e.from.clone(), "something is there now".into()));
+            retry.push(e);
             continue;
         }
         match trash::restore(&e.to, &e.from) {
@@ -575,12 +581,20 @@ pub fn undo_batch(id: u64) -> Result<UndoReport, String> {
                 report.restored += 1;
                 report.bytes += e.bytes;
             }
-            Err(err) => report.skipped.push((e.from.clone(), err.to_string())),
+            Err(err) => {
+                report.skipped.push((e.from.clone(), err.to_string()));
+                retry.push(e);
+            }
         }
     }
 
-    // The batch is consumed whether or not every item came back; leaving it
-    // would offer to restore the same things again.
+    // Only what came back leaves the batch, and the batch leaves the journal
+    // only once nothing in it is left to try.
+    if retry.is_empty() {
+        batches.remove(index);
+    } else {
+        batches[index].entries = retry;
+    }
     rewrite(&path, &batches).map_err(|e| format!("could not update the undo journal: {e}"))?;
     Ok(report)
 }
