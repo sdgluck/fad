@@ -219,6 +219,14 @@ Having proved which tool made it, `fad` can also say what puts it back, so the
 detail pane shows `cargo build` or `npm install` rather than a generic promise
 that your next build will handle it.
 
+A few rules need more than a sibling. Of `~/.gradle` only `caches`,
+`wrapper/dists` and `daemon` are offered — the rest holds `gradle.properties`
+and `init.d` — plus a project's own `.gradle` beside its build script. `vendor`
+counts beside a `composer.json`, or beside a `go.mod` when `go mod vendor` left
+its `modules.txt`; for Ruby only Bundler's `vendor/bundle` is offered, never a
+Rails app's hand-vendored `vendor/`. On Linux, `.cache` means `~/.cache` and no
+other.
+
 `fad --reclaim --json` prints the same set for a script, each entry carrying its
 path, its size, and that restore command:
 
@@ -269,8 +277,16 @@ because there is no longer anything to reclaim by deleting either half of it.
 Nothing is staged, nothing goes to the trash, and this does not pass through the
 basket — nothing is being removed. Each replacement is built beside its target
 and renamed into place, so an interruption leaves either the old file or the new
-one and never half of either, and the destination keeps its own permissions and
-its own modification time: only where its bytes live is different.
+one and never half of either, and the destination keeps its own permissions,
+modification time and extended attributes (Finder tags, resource fork,
+`user.*`): only where its bytes live is different.
+
+Each copy's identity — inode, size, and modification and change times to the
+nanosecond — is recorded when it is hashed, and a copy that has changed since in
+any way is refused rather than replaced, including an edit that put its old
+modification time back. A copy with other hard links is refused too: replacing
+one name frees nothing. The space reported is what the replaced file had
+allocated at that moment.
 
 Where the filesystem has no clone operation — ext4, HFS+, a network mount — `L`
 says so and does nothing. There is deliberately no fallback to a hard link: a
@@ -404,7 +420,10 @@ eval "$(fad --init zsh)"                # completions, and a fad-cd that does th
 `--reclaim --yes` is deliberately narrow. It only ever considers entries the
 built-in rules recognise, it honours your ignore list and the same guard the UI
 uses, and it prints every path before touching it. It trashes by default;
-`--permanent` is the flag that makes it irreversible.
+`--permanent` is the flag that makes it irreversible. VM and disk images are
+listed in `r` but never chosen by `--yes`: nothing rebuilds a VM's disk, so one
+is only ever staged by hand. Nor is anything the scan could not see all of — an
+unreadable corner, another filesystem or a cloud folder inside it.
 
 `--max` takes candidates largest first and *skips* anything that would push the
 batch over the cap rather than stopping there — otherwise a 2G cap could reclaim
@@ -532,7 +551,17 @@ landed because it wrote it down, and everything else in your trash was put there
 by someone else for reasons `fad` does not know. Every path is checked to be
 inside a real trash directory before anything is removed, because the alternative
 — a hand-edited or corrupted journal pointing at a live file — is the one
-mistake this tool cannot take back.
+mistake this tool cannot take back. The journal also records what each item
+*was* when it landed (device, inode, type, size), and an item that has since been
+replaced by something else of the same name is left alone and reported. An item
+trashed by an older `fad`, which did not record that, cannot be checked and is
+left for you to empty yourself.
+
+Each item is journalled the moment it lands, so a `fad` killed mid-batch still
+has undo for what it already moved, and two `fad`s writing at once lock the
+journal rather than losing each other's batches. Undo never restores over
+anything already at the original path; what it cannot put back stays in the
+batch to try again.
 
 The screen before it says all three things that change:
 
@@ -558,7 +587,15 @@ the deletion ever took place.
 
 These paths are always refused: `/`, your home directory, system directories
 (`/System` and `/Users` on macOS; `/usr`, `/etc`, `/home` and friends on Linux),
-the scan root, and any parent of the scan root.
+mount and scratch roots (`/Volumes` and each `/Volumes/<disk>`, `/mnt`,
+`/media`, `/opt`, `/tmp`, `/var`, `/private/var`), any mount point, the scan
+root, any parent of the scan root, and anything outside it. Each is checked
+under every name the path has — through symlinks, and on macOS through the
+`/System/Volumes/Data` firmlink — so `$HOME` behind a symlink is still `$HOME`.
+
+A directory is walked before it is deleted or trashed, and refused whole if
+anything under it is another filesystem, a cloud provider's synced folder, or a
+directory `fad` cannot read: nothing in it is touched.
 
 ## Ignoring things
 
