@@ -258,3 +258,99 @@ fn stage_all_skips_the_hazards_and_counts_them() {
     app.stage_all(group);
     assert!(app.staged.is_empty(), "a second A did not undo the first");
 }
+
+// ------------------------------------------------ the batch across a tree swap
+
+/// `R` used to clear the batch. It now carries it across as paths, re-stages
+/// each one as the new walk finds it, and drops — out loud — whatever the walk
+/// never finds.
+#[test]
+fn a_rescan_keeps_the_staged_batch_and_reports_what_vanished() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = settled(dir.path());
+
+    let keep = ["Movies", "dev/fad/target"];
+    for rel in keep {
+        app.stage(find(&app.tree, rel));
+    }
+    let doomed = find(&app.tree, "Library/Caches/big.cache");
+    app.stage(doomed);
+    let want: Vec<_> = keep.iter().map(|r| app.tree.root_path().join(r)).collect();
+
+    // Gone from disk behind fad's back, which is what R is for.
+    std::fs::remove_file(dir.path().join("Library/Caches/big.cache")).unwrap();
+
+    app.restart_scan().unwrap();
+    while app.scanning() {
+        app.poll_scan();
+    }
+
+    let mut got: Vec<_> = app.batch_items().into_iter().map(|(p, _)| p).collect();
+    got.sort();
+    let mut want = want;
+    want.sort();
+    assert_eq!(got, want, "the batch did not survive the rescan");
+    let status = app.status.clone().unwrap_or_default();
+    assert!(status.contains("1 staged item is gone"), "{status}");
+}
+
+/// A tree of the same root with padding entries ahead of the real ones, so no
+/// path keeps the arena index it has in a plain scan.
+fn shifted_snapshot(root: &Path) -> Tree {
+    use fad::scan::meta::{Kind, Meta};
+    use fad::scan::walk::{Batch, Entry};
+
+    let dir_meta = Meta { blocks: 0, len: 0, mtime: 0, dev: 1, ino: 0, nlink: 1, kind: Kind::Dir };
+    let real = scanned(root);
+    let mut tree = Tree::new(real.root_path().to_path_buf(), &dir_meta);
+    let mut entries: Vec<Entry> = (0..4)
+        .map(|i| Entry { name: format!("pad-{i}").into(), meta: dir_meta, descend: None, skip: None })
+        .collect();
+    for c in &real.node(real.root()).children {
+        entries.push(Entry {
+            name: real.node(*c).name.to_string().into(),
+            meta: dir_meta,
+            descend: None,
+            skip: None,
+        });
+    }
+    tree.apply(Batch { parent: 0, entries, unreadable: None });
+    tree
+}
+
+/// Staging against a snapshot is fine; committing from one is deleting by
+/// sizes that may be days old. The confirm step waits for the live walk, and
+/// the batch is re-resolved against the live tree when it lands.
+#[test]
+fn a_batch_staged_on_a_snapshot_waits_for_the_live_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    assert!(app.install_snapshot(shifted_snapshot(dir.path())).is_ok());
+    assert!(app.from_cache);
+
+    let movies = find(&app.tree, "Movies");
+    assert!(app.stage(movies));
+    let path = app.tree.path(movies);
+    app.mode = Mode::Basket;
+
+    app.open_confirm();
+    assert_eq!(app.mode, Mode::Basket, "the confirm step opened on a snapshot");
+    let status = app.status.clone().unwrap_or_default();
+    assert!(status.contains("wait for the scan to finish"), "{status}");
+    // And commit refuses on its own account, however it was reached.
+    app.commit();
+    assert!(app.job.is_none(), "a batch was committed from a snapshot");
+
+    while app.scanning() {
+        app.poll_scan();
+    }
+    assert!(!app.from_cache);
+    let live = app.tree.find_path(&path).unwrap();
+    assert!(app.staged.contains(&live), "the batch was not re-resolved against the live tree");
+    assert_eq!(app.staged.len(), 1);
+
+    app.open_confirm();
+    assert_eq!(app.mode, Mode::Confirm);
+}

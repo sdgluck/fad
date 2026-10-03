@@ -324,10 +324,7 @@ fn basket_key(app: &mut App, k: KeyEvent) {
             app.mode = Mode::Normal;
             app.status = Some("batch cleared".into());
         }
-        KeyCode::Enter | KeyCode::Char('y') => {
-            app.review_batch();
-            app.mode = Mode::Confirm;
-        }
+        KeyCode::Enter | KeyCode::Char('y') => app.open_confirm(),
         _ => {}
     }
     app.mark_dirty();

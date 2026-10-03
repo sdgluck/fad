@@ -120,6 +120,21 @@ impl Panel {
     }
 }
 
+/// A gap in seconds as someone would say it: "40 seconds ago", "3 days ago".
+/// The same buckets as the detail pane's `ago_in_words`, so a snapshot's age
+/// reads the same in the status line as it does beside the growth figure.
+fn ago(secs: u64) -> String {
+    let (n, unit) = match secs {
+        s if s < 90 => (s, "second"),
+        s if s < 90 * 60 => (s / 60, "minute"),
+        s if s < 36 * 3600 => (s / 3600, "hour"),
+        s if s < 60 * 86400 => (s / 86400, "day"),
+        s if s < 2 * 365 * 86400 => (s / (30 * 86400), "month"),
+        s => (s / (365 * 86400), "year"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -309,7 +324,7 @@ pub enum View {
     Tools,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Mode {
     Normal,
     /// Typing into the fuzzy filter.
@@ -421,6 +436,13 @@ pub struct App {
     pub from_cache: bool,
     /// The fresh tree being built while a snapshot is displayed.
     pending: Option<Tree>,
+    /// Staged paths carried across `R`, waiting for the new walk to reach
+    /// them. Node ids die with the tree they index, so the batch survives a
+    /// rescan as paths and is re-resolved as the walk finds each one; whatever
+    /// is still here when the walk finishes is gone from disk.
+    restage: Vec<PathBuf>,
+    /// How many of `restage` the new walk found and then refused to stage.
+    restage_refused: usize,
     /// A snapshot being read from disk. Deserialising a few million nodes takes
     /// over a second, and the live scan paints a useful first screen in tens of
     /// milliseconds — so the snapshot must never be on the startup path. It
@@ -559,14 +581,14 @@ impl App {
         // anything staged in the second before the snapshot landed has to be
         // re-resolved by path — exactly as `adopt` does on the way back. Keeping
         // the raw ids would silently re-point the batch at unrelated files.
-        let staged: Vec<PathBuf> = self.staged.iter().map(|id| self.tree.path(*id)).collect();
+        let staged = self.staged_paths();
 
         // The tree being filled becomes the pending one; the snapshot goes on screen.
         let live = std::mem::replace(&mut self.tree, snapshot);
         self.pending = Some(live);
         self.from_cache = true;
         self.expanded = HashSet::from([self.tree.root()]);
-        self.staged = staged.iter().filter_map(|p| self.tree.find_path(p)).collect();
+        self.restage_from(staged);
         self.refused.clear();
         self.breakdown = None;
         self.invalidate_dupes();
@@ -633,6 +655,8 @@ impl App {
             reclaim_cats: Vec::new(),
             from_cache: false,
             pending: None,
+            restage: Vec::new(),
+            restage_refused: 0,
             snapshot_rx: None,
             previous: None,
             previous_at: None,
@@ -666,9 +690,18 @@ impl App {
 
     /// Throw the tree away and walk again. Used after an undo, and whenever the
     /// filesystem has moved on underneath us.
+    ///
+    /// The staged batch survives it. Clearing it made `R` — the key the help
+    /// suggests whenever the numbers look stale — silently throw away a
+    /// half-hour of careful staging. It is carried as paths and re-staged as
+    /// the new walk finds each one (see `restage`); anything the walk never
+    /// finds is dropped when it finishes, and the status line says how many.
     pub fn restart_scan(&mut self) -> std::io::Result<()> {
         let root = self.tree.root_path().to_path_buf();
         let (tree, scan) = Scan::start(&root, self.opts.clone())?;
+        // Including anything still waiting from an `R` before this one.
+        let mut carried = self.staged_paths();
+        carried.append(&mut self.restage);
         self.tree = tree;
         self.scan = Some(scan);
         // The half-built tree from the previous scan must go with it. Left in
@@ -680,6 +713,7 @@ impl App {
         self.from_cache = false;
         self.snapshot_rx = None;
         self.staged.clear();
+        self.restage = carried;
         self.refused.clear();
         // `staged_tools` deliberately survives this. Rescanning the filesystem
         // says nothing about Docker's image store, and a `ToolKey` is not an
@@ -713,6 +747,7 @@ impl App {
             let visible = n > 0 && self.pending.is_none();
             if visible {
                 self.dirty = true;
+                self.resolve_restage();
             }
             return visible || snapshot_arrived;
         }
@@ -722,8 +757,72 @@ impl App {
             self.adopt(fresh);
             return true;
         }
+        // The walk is done, so anything it has not found by now is not there.
+        self.resolve_restage();
+        let gone = std::mem::take(&mut self.restage).len();
+        self.report_dropped(gone);
         self.dirty = true;
         true
+    }
+
+    /// The staged batch as paths, which is the only form that survives a tree
+    /// swap.
+    fn staged_paths(&self) -> Vec<PathBuf> {
+        self.staged.iter().map(|id| self.tree.path(*id)).collect()
+    }
+
+    /// Replace the batch with these paths, resolved against the tree now on
+    /// screen. Returns how many could not be staged.
+    ///
+    /// Through `stage`, not straight into the set, so the new tree's view of
+    /// each path is the one that counts: a directory that has acquired a mount
+    /// point since it was staged is refused here, not carried through on the
+    /// strength of what an older walk said about it.
+    fn restage_from(&mut self, paths: Vec<PathBuf>) -> usize {
+        self.staged.clear();
+        let status = self.status.take();
+        let mut dropped = 0;
+        for p in paths {
+            match self.tree.find_path(&p) {
+                Some(id) if self.stage(id) => {}
+                _ => dropped += 1,
+            }
+        }
+        self.status = status;
+        dropped
+    }
+
+    /// Stage whatever the running walk has reached of the batch `R` carried.
+    /// The rest waits for a later batch of entries, or for the walk to end.
+    fn resolve_restage(&mut self) {
+        if self.restage.is_empty() {
+            return;
+        }
+        let status = self.status.take();
+        let waiting = std::mem::take(&mut self.restage);
+        for p in waiting {
+            match self.tree.find_path(&p) {
+                // Refused by the fresh walk's view of it: dropped, and counted
+                // as gone at the end like anything else that did not come back.
+                Some(id) if !self.stage(id) => self.restage_refused += 1,
+                Some(_) => {}
+                None => self.restage.push(p),
+            }
+        }
+        self.status = status;
+    }
+
+    /// Say that part of the batch did not survive a tree swap. Silence here
+    /// would leave the user confirming a batch smaller than the one they built
+    /// without knowing it.
+    fn report_dropped(&mut self, gone: usize) {
+        let n = gone + std::mem::take(&mut self.restage_refused);
+        if n > 0 {
+            self.status = Some(format!(
+                "{n} staged item{} gone or no longer safe to delete \u{2014} dropped from the batch",
+                if n == 1 { " is" } else { "s are" }
+            ));
+        }
     }
 
     /// Replace the displayed tree, carrying the user's place across. Node ids
@@ -731,7 +830,7 @@ impl App {
     fn adopt(&mut self, fresh: Tree) {
         let selected = self.selected().map(|id| self.tree.path(id));
         let expanded: Vec<PathBuf> = self.expanded.iter().map(|id| self.tree.path(*id)).collect();
-        let staged: Vec<PathBuf> = self.staged.iter().map(|id| self.tree.path(*id)).collect();
+        let staged = self.staged_paths();
 
         // The tree coming off screen is the previous scan, which is exactly
         // what the growth comparison wants.
@@ -742,9 +841,12 @@ impl App {
 
         self.expanded = expanded.iter().filter_map(|p| self.tree.find_path(p)).collect();
         self.expanded.insert(self.tree.root());
-        // Anything staged that the fresh walk cannot find is gone already;
-        // silently dropping it is right, quietly keeping a dead id is not.
-        self.staged = staged.iter().filter_map(|p| self.tree.find_path(p)).collect();
+        // Anything staged that the fresh walk cannot find is gone already, and
+        // dropping it is right — but saying so is too: the batch was staged
+        // against last-known sizes, and the one the user confirms should not
+        // quietly be a different one.
+        let gone = self.restage_from(staged);
+        self.report_dropped(gone);
 
         self.dirty = true;
         self.rebuild_rows();
@@ -2170,6 +2272,43 @@ impl App {
         ids.iter().map(|id| (self.tree.path(*id), self.tree.size(*id, false))).collect()
     }
 
+    /// Why the batch cannot go to the confirm step yet, if it cannot.
+    ///
+    /// A snapshot on screen is the last scan's tree, not this one's. Staging
+    /// against it is fine — it is the whole point of showing it — but
+    /// committing from it is deleting by sizes that may be days old, against
+    /// paths the live walk has not yet confirmed still exist or still hold
+    /// what they held. The wait is short, and `adopt` re-resolves the batch
+    /// against the live tree the moment it lands.
+    pub fn commit_blocked(&self) -> Option<String> {
+        if self.from_cache {
+            let age = self
+                .previous_at
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| format!("from {}", ago(d.as_secs())))
+                .unwrap_or_else(|| "from the last scan".into());
+            return Some(format!("wait for the scan to finish \u{2014} these sizes are {age}"));
+        }
+        if !self.restage.is_empty() {
+            let n = self.restage.len();
+            return Some(format!(
+                "wait for the rescan to finish \u{2014} {n} staged item{} not found yet",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+        None
+    }
+
+    /// Move from the basket to the confirm step, or say why not.
+    pub fn open_confirm(&mut self) {
+        if let Some(why) = self.commit_blocked() {
+            self.status = Some(why);
+            return;
+        }
+        self.review_batch();
+        self.mode = Mode::Confirm;
+    }
+
     /// Start the batch.
     ///
     /// Up to two jobs, because the two halves are not the same operation and
@@ -2177,6 +2316,14 @@ impl App {
     /// back, tool resources are handed to the daemon that owns them and are
     /// gone. `Mode::Deleting` polls both.
     pub fn commit(&mut self) {
+        // Checked here as well as at `open_confirm`: the snapshot cannot come
+        // back once the live tree is up, but this is the last line before a
+        // delete and should not rely on how the screen in front of it opened.
+        if let Some(why) = self.commit_blocked() {
+            self.status = Some(why);
+            self.mode = Mode::Basket;
+            return;
+        }
         let items = self.batch_items();
         let tools = self.tool_batch_items();
         if items.is_empty() && tools.is_empty() {
