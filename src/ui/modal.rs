@@ -204,7 +204,7 @@ pub fn draw_empty_trash(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Only fad's own entries, and the screen says so rather than leaving the
     // user to wonder what happened to the rest of their trash.
     let mut biggest = entries;
-    biggest.sort_by(|a, b| b.2.cmp(&a.2));
+    biggest.sort_by_key(|e| std::cmp::Reverse(e.2));
     for (_, from, bytes) in biggest.iter().take(6) {
         lines.push(Line::from(vec![
             Span::styled(format!("{:>8}  ", human(*bytes)), theme.emphasis),
@@ -314,7 +314,7 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    lines.push(Line::from(progress_bar(done, total, 44)));
+    lines.push(progress_bar(done, total, 44));
     lines.push(Line::from(""));
 
     let finished = app.batch_finished();
@@ -348,7 +348,7 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 fn progress_bar(done: usize, total: usize, width: usize) -> Line<'static> {
-    let filled = if total == 0 { width } else { done * width / total };
+    let filled = (done * width).checked_div(total).unwrap_or(width);
     Line::from(vec![
         Span::from("\u{2588}".repeat(filled)).cyan(),
         Span::from("\u{2591}".repeat(width - filled)).dark_gray(),

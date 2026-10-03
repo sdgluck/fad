@@ -377,8 +377,7 @@ pub(crate) fn tail(stderr: &str) -> String {
     stderr
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .next_back()
+        .rfind(|l| !l.is_empty())
         .unwrap_or("failed")
         .to_string()
 }
@@ -610,11 +609,12 @@ pub fn freed(report: &Report, staged: &std::collections::BTreeSet<ToolKey>) -> F
         // item already sized at what pruning gives back, and its kind total
         // includes the in-use cache that pruning leaves alone — taking the
         // total there would promise storage that is not going anywhere.
-        if items.len() == held && items.iter().any(|r| r.shared() > 0) {
-            if let Some((size, _)) = sr.and_then(|s| s.total(kind)) {
-                total += size;
-                continue;
-            }
+        if items.len() == held
+            && items.iter().any(|r| r.shared() > 0)
+            && let Some((size, _)) = sr.and_then(|s| s.total(kind))
+        {
+            total += size;
+            continue;
         }
 
         total += items.iter().map(|r| r.bytes).sum::<u64>();

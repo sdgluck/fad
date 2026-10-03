@@ -66,7 +66,8 @@ fn a_sharing_subset_is_a_floor_and_says_so() {
 
     // And that is more than their own bytes summed, which is the shared base
     // being released rather than double-counted.
-    assert!(3_995_000_000u64 > 759_000_000u64 + 759_200_000u64);
+    let own: u64 = both.iter().map(|k| r.get(k).unwrap().bytes).sum();
+    assert!(fad::tools::freed(&r, &both).bytes() > own, "the shared base was not released");
 }
 
 #[test]

@@ -534,7 +534,7 @@ impl App {
             // dropped, because `growth` has nothing else to measure against and
             // the detail pane would otherwise never show a comparison at all.
             Err(snapshot) => {
-                self.previous = Some(snapshot);
+                self.previous = Some(*snapshot);
                 false
             }
         }
@@ -548,9 +548,12 @@ impl App {
     /// is too late to display is still exactly what the growth comparison
     /// wants, and taking it by value with nothing to return was how that got
     /// thrown away.
-    pub fn install_snapshot(&mut self, snapshot: Tree) -> Result<(), Tree> {
+    ///
+    /// Boxed on the way back because a `Tree` is a couple of hundred bytes of
+    /// header, and every `Ok` would otherwise pay to carry room for one.
+    pub fn install_snapshot(&mut self, snapshot: Tree) -> Result<(), Box<Tree>> {
         if self.scan.is_none() || self.pending.is_some() {
-            return Err(snapshot);
+            return Err(Box::new(snapshot));
         }
         // Node ids are arena indices and mean nothing in the other tree, so
         // anything staged in the second before the snapshot landed has to be
@@ -745,10 +748,10 @@ impl App {
 
         self.dirty = true;
         self.rebuild_rows();
-        if let Some(id) = selected.as_ref().and_then(|p| self.tree.find_path(p)) {
-            if let Some(i) = self.rows.iter().position(|r| r.id == id) {
-                self.cursor = i;
-            }
+        if let Some(id) = selected.as_ref().and_then(|p| self.tree.find_path(p))
+            && let Some(i) = self.rows.iter().position(|r| r.id == id)
+        {
+            self.cursor = i;
         }
     }
 
@@ -832,10 +835,10 @@ impl App {
             self.push_row(root, 0, max);
         }
 
-        if let Some(key) = anchor {
-            if let Some(i) = self.rows.iter().position(|r| (r.id, r.header, r.tool) == key) {
-                self.cursor = i;
-            }
+        if let Some(key) = anchor
+            && let Some(i) = self.rows.iter().position(|r| (r.id, r.header, r.tool) == key)
+        {
+            self.cursor = i;
         }
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
     }
@@ -1092,7 +1095,7 @@ impl App {
             .filter_map(|k| report.get(k))
             .map(|r| (r.key(), r.name.clone(), r.bytes))
             .collect();
-        v.sort_by(|a, b| b.2.cmp(&a.2));
+        v.sort_by_key(|item| Reverse(item.2));
         v
     }
 
@@ -1776,7 +1779,7 @@ impl App {
             .into_iter()
             .map(|Reverse((bytes, id))| FileRow { name: self.tree.node(id).name.to_string(), bytes })
             .collect();
-        biggest.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
+        biggest.sort_unstable_by_key(|f| Reverse(f.bytes));
 
         // Not from the walk: one level down is exact whatever the budget did,
         // and this is the block that answers "where is it".
@@ -1789,14 +1792,14 @@ impl App {
                 bytes: self.tree.size(*c, self.apparent),
             })
             .collect();
-        children.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
+        children.sort_unstable_by_key(|c| Reverse(c.bytes));
         children.truncate(3);
 
         let mut items: Vec<ExtRow> = by_ext
             .into_iter()
             .map(|(ext, (bytes, count))| ExtRow { ext: ext.to_string(), bytes, count })
             .collect();
-        items.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
+        items.sort_unstable_by_key(|e| Reverse(e.bytes));
         // The extension list has the lower half of the pane to itself now that
         // `S` cycles the breakdowns, so it can afford more than the six it got
         // when it shared the space with the age histogram. The renderer trims
