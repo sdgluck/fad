@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// Environment variables are process-global, and `cargo test` runs a binary's
 /// tests on several threads at once. Any test that points `HOME`,
-/// `XDG_DATA_HOME`, `FAD_STATE_DIR` or `FAD_CACHE_DIR` at a scratch directory
+/// `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `FAD_STATE_DIR`, `FAD_CONFIG_DIR` or `FAD_CACHE_DIR` at a scratch directory
 /// must hold this for its whole body, or it will be reading another test's
 /// scratch directory halfway through.
 pub fn env_lock() -> MutexGuard<'static, ()> {
@@ -24,6 +24,11 @@ pub fn isolate(dir: &Path) {
         std::env::set_var("HOME", dir);
         std::env::set_var("XDG_DATA_HOME", dir.join("share"));
         std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+        // The ignore list lives under the config directory, and a user who
+        // sets XDG_CONFIG_HOME would otherwise have every test's scratch paths
+        // appended to their real one.
+        std::env::set_var("XDG_CONFIG_HOME", dir.join("config"));
+        std::env::set_var("FAD_CONFIG_DIR", dir.join("config/fad"));
         std::env::set_var("FAD_STATE_DIR", dir.join("state"));
         std::env::set_var("FAD_CACHE_DIR", dir.join("cache/fad"));
     }
