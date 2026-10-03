@@ -73,3 +73,72 @@ fn the_man_page_covers_the_flags() {
         assert!(text.contains(flag), "the man page does not document {flag}");
     }
 }
+
+/// Run fad on an empty scratch directory with no terminal and its cache in
+/// scratch too. Every combination below must be refused before anything runs.
+fn refused(args: &[&str]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let out = fad()
+        .arg(dir.path())
+        .args(args)
+        .env("FAD_CACHE_DIR", dir.path().join("cache"))
+        .env("FAD_STATE_DIR", dir.path().join("state"))
+        .env("FAD_CONFIG_DIR", dir.path().join("config"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(2), "{args:?} was not refused: {err}");
+    err
+}
+
+/// A modifier without the thing it modifies was silently ignored: `--dry-run`
+/// alone opened the UI, which reads as a promise not kept.
+#[test]
+fn flags_that_only_mean_something_together_are_refused_apart() {
+    for alone in [&["--dry-run"][..], &["--permanent"], &["--max", "1G"]] {
+        let err = refused(alone);
+        assert!(err.contains("--yes"), "{alone:?}: {err}");
+    }
+    let err = refused(&["--yes"]);
+    assert!(err.contains("--reclaim") || err.contains("--tools"), "{err}");
+    refused(&["--print-path", "--json"]);
+    for with in ["--reclaim", "--tools", "--yes"] {
+        refused(&["--since", with]);
+    }
+}
+
+/// Tool removals are permanent whatever the flags say; `--permanent` with them
+/// is refused with the reason rather than a bare "cannot be used with".
+#[test]
+fn permanent_with_tools_says_why() {
+    let err = refused(&["--tools", "--yes", "--permanent"]);
+    assert!(err.contains("always permanent"), "{err}");
+}
+
+#[test]
+fn the_help_says_where_the_report_flags_apply() {
+    let out = fad().arg("--help").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let min = text.split("--min-size").nth(1).unwrap();
+    assert!(min.contains("--since") && min.contains("--tools --yes"), "{min}");
+    let max = text.split("--max").nth(1).unwrap();
+    assert!(max.contains("--tools --yes"), "{max}");
+}
+
+/// No terminal: say what to use instead, not "Device not configured".
+#[test]
+fn without_a_terminal_the_ui_says_what_to_use_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = fad()
+        .arg(dir.path())
+        .env("FAD_CACHE_DIR", dir.path().join("cache"))
+        .env("FAD_STATE_DIR", dir.path().join("state"))
+        .env("FAD_CONFIG_DIR", dir.path().join("config"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("needs a terminal") && err.contains("--json"), "{err}");
+}

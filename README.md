@@ -104,20 +104,27 @@ In the confirmation screen: `D` toggles between trash and permanent delete,
 --reclaim         open in the reclaimable view; with --json, print that set
 --tools           open in the tool storage view; with --json, print that report
 --yes             with --reclaim or --tools, act instead of opening the UI
---max 10G         with --yes, stop once this much is staged
---dry-run         with --yes, print what would go and remove nothing
+--max 10G         with --yes (either kind), skip anything that would go over this
+--dry-run         with --yes (either kind), print what would go and remove nothing
 --permanent       with --reclaim --yes, delete outright instead of trashing
 --since           print what changed since the last saved scan of this root
 --print-path      print the selected path on exit, for `cd "$(fad --print-path)"`
 --json            dump the ranked tree as JSON instead of opening the UI
---min-size 100M   hide entries below a threshold (--json)
---depth N         how deep to print (--json, default 2)
+--min-size 100M   leave out smaller entries (--json, --since, --reclaim/--tools --yes)
+--depth N         how deep to report (--json and --since, default 2)
 --init zsh        print shell integration: completions and a `fad-cd` function
 --man             print this tool's man page, in roff
 --no-mouse        do not capture the mouse, so text selection keeps working
 --no-cache        ignore any snapshot and always walk from scratch
 --clear-cache     delete every saved snapshot and exit
 ```
+
+Combinations that would quietly do something other than what they say are
+refused: `--dry-run`, `--permanent` and `--max` need `--yes`; `--yes` needs
+`--reclaim` or `--tools`; `--permanent` does not go with `--tools`, whose
+removals are always permanent; `--since` stands alone; and `--print-path` and
+`--json` both want standard output. Without a terminal, the interactive view
+says so and points at the flags that need none.
 
 ## Where the size is
 

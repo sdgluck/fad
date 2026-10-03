@@ -11,8 +11,13 @@ use fad::presets::Category;
 use fad::tree::{NodeId, Tree};
 
 /// Find and delete what is eating your disk.
+///
+/// The flags that act without a person watching are tied together in the
+/// parser rather than checked by hand: a `--dry-run` that was silently ignored
+/// because `--yes` was missing reads as a promise it did not keep.
 #[derive(Parser, Debug)]
 #[command(name = "fad", version, about)]
+#[command(group(clap::ArgGroup::new("act").args(["reclaim", "tools"]).multiple(true)))]
 struct Args {
     /// Directory to scan.
     #[arg(default_value = None)]
@@ -31,11 +36,14 @@ struct Args {
     #[arg(long)]
     apparent: bool,
 
-    /// Hide entries below this size, e.g. 100M, 2G.
+    /// Leave out entries below this size, e.g. 100M, 2G (powers of 1024).
+    /// Applies to --json, --since, --reclaim --yes and --tools --yes; the
+    /// interactive view shows everything.
     #[arg(long, value_parser = parse_size, default_value = "0")]
     min_size: u64,
 
-    /// How deep to print. Only meaningful with --json.
+    /// How many levels deep to report. Applies to --json and --since; the
+    /// interactive view opens as deep as you go.
     #[arg(long, default_value_t = 2)]
     depth: usize,
 
@@ -65,32 +73,33 @@ struct Args {
     clear_cache: bool,
 
     /// Print the selected path to stdout on exit, so `cd "$(fad --print-path)"`
-    /// works.
-    #[arg(long)]
+    /// works. Quitting with ctrl-c prints nothing and exits 1.
+    #[arg(long, conflicts_with = "json")]
     print_path: bool,
 
     /// With --reclaim or --tools, act instead of opening the UI. With --tools
     /// it only ever touches resources the tool itself reports as unused, and
     /// removal there is permanent: there is no trash for `docker image rm`.
-    #[arg(long)]
+    #[arg(long, requires = "act")]
     yes: bool,
 
-    /// With --reclaim --yes, stop once this much has been staged, largest
-    /// first. e.g. 10G.
-    #[arg(long, value_parser = parse_size)]
+    /// With --reclaim --yes or --tools --yes, take candidates largest first
+    /// and skip any that would go over this much, e.g. 10G.
+    #[arg(long, value_parser = parse_size, requires = "yes")]
     max: Option<u64>,
 
-    /// With --reclaim --yes, print what would go and delete nothing.
-    #[arg(long)]
+    /// With --reclaim --yes or --tools --yes, print what would go and remove
+    /// nothing.
+    #[arg(long, requires = "yes")]
     dry_run: bool,
 
     /// With --reclaim --yes, delete permanently instead of trashing.
-    #[arg(long)]
+    #[arg(long, requires = "yes")]
     permanent: bool,
 
     /// Print what changed since the last saved scan of this root, largest
-    /// change first.
-    #[arg(long)]
+    /// change first: growth, new entries and removed ones.
+    #[arg(long, conflicts_with_all = ["reclaim", "tools", "yes"])]
     since: bool,
 
     /// Print shell integration for your shell and exit: completions, and a
@@ -155,6 +164,17 @@ fn parse_size(s: &str) -> Result<u64, String> {
 
 fn main() {
     let args = Args::parse();
+    // Not a plain `conflicts_with`: the generic message would say the two
+    // cannot be combined and not why, and the why is the thing to know.
+    if args.permanent && args.tools {
+        Args::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--permanent does not apply to --tools: what --tools --yes removes \
+                 never goes to a trash, so it is always permanent",
+            )
+            .exit();
+    }
 
     if let Some(shell) = args.init {
         print_init(shell);
@@ -285,6 +305,10 @@ fn main() {
         app.load_snapshot_async();
     }
     let save = !args.no_cache;
+    if let Err(why) = check_terminal(args.print_path) {
+        eprintln!("fad: {why}");
+        std::process::exit(1);
+    }
     // With --print-path the shell is reading stdout, so the interface has to go
     // somewhere else. See `run::Screen`.
     match run::run(app, args.print_path) {
@@ -308,11 +332,33 @@ fn main() {
                 println!("{}", p.display());
             }
         }
+        Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+            eprintln!("fad: {NEEDS_TERMINAL}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("fad: {e}");
             std::process::exit(1);
         }
     }
+}
+
+const NEEDS_TERMINAL: &str = "fad needs a terminal for the interactive view; \
+     use --json, --since, or --reclaim/--tools --yes";
+
+/// Whether there is a terminal to draw on and read keys from. Without one,
+/// the first raw-mode call fails with ENXIO and the user is told "Device not
+/// configured (os error 6)", which says nothing about what to do instead.
+///
+/// Keys come from the controlling terminal; the screen goes to stdout, or to
+/// the terminal itself under `--print-path` (see `run::Screen`).
+fn check_terminal(print_path: bool) -> Result<(), &'static str> {
+    use std::io::IsTerminal;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok();
+    if !tty || (!print_path && !std::io::stdout().is_terminal()) {
+        return Err(NEEDS_TERMINAL);
+    }
+    Ok(())
 }
 
 /// Everything the shell needs: completions from the parser itself, and the

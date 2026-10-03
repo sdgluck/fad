@@ -314,6 +314,8 @@ fn json_names_a_partly_unreadable_directory() {
         .arg(dir.path())
         .arg("--json")
         .env("FAD_CACHE_DIR", dir.path().join("cache"))
+        .env("FAD_STATE_DIR", dir.path().join("state"))
+        .env("FAD_CONFIG_DIR", dir.path().join("config"))
         .output()
         .unwrap();
     std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -382,6 +384,8 @@ fn fad_json(root: &Path, extra: &[&str]) -> std::process::Output {
         .arg(root)
         .args(extra)
         .env("FAD_CACHE_DIR", cache.path())
+        .env("FAD_STATE_DIR", cache.path().join("state"))
+        .env("FAD_CONFIG_DIR", cache.path().join("config"))
         .output()
         .unwrap()
 }

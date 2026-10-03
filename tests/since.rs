@@ -10,6 +10,8 @@ fn fad(dir: &std::path::Path, cache: &std::path::Path, args: &[&str]) -> (String
         .arg(dir)
         .args(args)
         .env("FAD_CACHE_DIR", cache)
+        .env("FAD_STATE_DIR", cache.join("state"))
+        .env("FAD_CONFIG_DIR", cache.join("config"))
         .output()
         .unwrap();
     (
