@@ -672,6 +672,21 @@ fn a_deep_row_stays_inside_the_pane() {
     size_column_holds_a_size(&mut app, 80, 40, &["est.bin", "d29"]);
 }
 
+/// The root always shows, so a filter that matches nothing leaves one row, not
+/// none. That row on its own has to say why it is alone.
+#[test]
+fn a_filter_that_matches_nothing_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    app.filter = "zzqqxx".into();
+    app.mark_dirty();
+
+    let out = render(&mut app, 100, 20);
+    println!("{out}");
+    assert!(out.contains("nothing matches \"zzqqxx\""), "no explanation for the empty tree:\n{out}");
+}
+
 /// A kept filter is as easy to forget as an age filter, and has to be as
 /// visible: rows missing with no reason on screen read as a bug.
 #[test]

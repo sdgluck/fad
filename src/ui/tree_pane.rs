@@ -61,6 +61,15 @@ pub fn draw(f: &mut Frame, app: &mut App, theme: &Theme, area: Rect) {
     for i in app.offset..(app.offset + height).min(app.rows.len()) {
         lines.push(row_line(app, theme, i, inner.width as usize));
     }
+    // The tree always shows its root, so a filter that matches nothing leaves
+    // one row rather than none — and a lone root with no children under it
+    // read as an empty directory, never as "your filter hid everything".
+    if app.view().is_none()
+        && app.rows.len() == 1
+        && (!app.filter.is_empty() || app.age_filter != crate::app::AgeFilter::All)
+    {
+        lines.push(Line::from(Span::styled(empty_reason(app), theme.dim)));
+    }
     let list = Rect { height: list_h, ..inner };
     // Remembered for hit-testing: a click is a terminal coordinate and means
     // nothing without the rectangle the rows were last drawn into.
