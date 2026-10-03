@@ -6,6 +6,7 @@
 //! `package.json`. Name-only matching would eventually stage someone's photos.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 #[derive(
     Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -42,6 +43,17 @@ impl Category {
         }
     }
 
+    /// Offered, but never chosen without a person looking at it.
+    ///
+    /// A disk image is the one category where the rule can be right about
+    /// what the file *is* and still wrong about whether it can go: a VM's disk
+    /// is its whole machine, nothing rebuilds it, and `.img` is also installer
+    /// media and forensic captures. The reclaimable view lists them so they can
+    /// be staged one at a time; `--reclaim --yes` leaves them alone.
+    pub fn manual_only(self) -> bool {
+        matches!(self, Category::VmImage)
+    }
+
     pub fn all() -> [Category; 4] {
         [Category::VmImage, Category::BuildArtifact, Category::PackageCache, Category::AppCache]
     }
@@ -63,7 +75,6 @@ const BUILD_DIRS: &[(&str, &[&str], &str)] = &[
     ("venv", &["pyproject.toml", "requirements.txt", "setup.py"], "python -m venv venv"),
     ("Pods", &["Podfile"], "pod install"),
     ("vendor", &["composer.json"], "composer install"),
-    ("vendor", &["Gemfile"], "bundle install"),
     ("_build", &["dune-project"], "dune build"),
     ("_build", &["rebar.config"], "rebar3 compile"),
     ("dist-newstyle", &["cabal.project"], "cabal build"),
@@ -78,7 +89,6 @@ const BUILD_DIRS: &[(&str, &[&str], &str)] = &[
 /// on its own.
 const ALWAYS: &[(&str, Category)] = &[
     ("_cacache", Category::PackageCache),
-    (".gradle", Category::PackageCache),
     ("registry", Category::PackageCache),
     ("toolchains", Category::PackageCache),
     #[cfg(target_os = "macos")]
@@ -124,25 +134,104 @@ const AMBIGUOUS_IMAGE_EXTS: &[&str] = &["raw", "img"];
 const AMBIGUOUS_IMAGE_FLOOR: u64 = 1 << 30;
 
 /// The command that rebuilds this directory, for the entries we can name one
-/// for. Same sibling test as `classify`, so the answer is the tool that
-/// actually made it rather than a guess from the directory's name.
-pub fn rebuild_command(name: &str, siblings: &HashSet<&str>) -> Option<&'static str> {
+/// for. Same tests as `classify`, so the answer is the tool that actually made
+/// it rather than a guess from the directory's name.
+pub fn rebuild_command(name: &str, parent_path: &Path, siblings: &HashSet<&str>) -> Option<&'static str> {
+    let parent_name = parent_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if let Some((_, cmd)) = proven(name, parent_name, parent_path, siblings) {
+        return cmd;
+    }
     BUILD_DIRS
         .iter()
         .find(|(dir, markers, _)| *dir == name && markers.iter().any(|m| siblings.contains(m)))
         .map(|(_, _, cmd)| *cmd)
 }
 
-/// Classify one entry, given its length and the names of everything beside it
-/// in the same directory. `parent_name` disambiguates the generic names: a
-/// `registry` directory only means Cargo's inside `.cargo`. `len` is `st_size`,
-/// and corroborates the two ambiguous image extensions; see
+/// Is `dir` the user's home directory, by any name?
+///
+/// Compared resolved on both sides: a basename match — the old test for the
+/// XDG cache root — took any `.cache` whose parent happened to share the home
+/// directory's name, and a path match without resolving would miss `$HOME`
+/// behind a symlink.
+fn is_home(dir: &Path) -> bool {
+    let Some(home) = crate::paths::home() else { return false };
+    if dir == home {
+        return true;
+    }
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(&home)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+const GRADLE_MARKERS: &[&str] =
+    &["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"];
+
+/// The entries whose proof needs more than a sibling: where they sit, or what
+/// is inside them. Returns the category and, where there is one, the command
+/// that puts it back.
+///
+/// Each of these replaces a name-and-sibling rule that matched too much:
+///
+/// - `.gradle` matched anywhere, including `~/.gradle` itself, which holds
+///   `gradle.properties` and `init.d` — credentials and build configuration,
+///   not cache. Now only the three regenerable directories under `~/.gradle`,
+///   and a project's own `.gradle` beside its build script.
+/// - `vendor` beside a `Gemfile` matched a Rails app's `vendor/`, which holds
+///   hand-vendored code that nothing regenerates. Bundler's output is
+///   `vendor/bundle`, and only that is offered. Go's `vendor/` is regenerable
+///   only when `go mod vendor` made it, which leaves `modules.txt` inside.
+fn proven(
+    name: &str,
+    parent_name: &str,
+    parent_path: &Path,
+    siblings: &HashSet<&str>,
+) -> Option<(Category, Option<&'static str>)> {
+    let grandparent = parent_path.parent();
+    match name {
+        ".gradle" if GRADLE_MARKERS.iter().any(|m| siblings.contains(m)) && !is_home(parent_path) => {
+            Some((Category::BuildArtifact, Some("./gradlew build")))
+        }
+        "caches" | "daemon" if parent_name == ".gradle" && grandparent.is_some_and(is_home) => {
+            Some((Category::PackageCache, None))
+        }
+        "dists"
+            if parent_name == "wrapper"
+                && grandparent.is_some_and(|g| {
+                    g.file_name().is_some_and(|n| n == ".gradle") && g.parent().is_some_and(is_home)
+                }) =>
+        {
+            Some((Category::PackageCache, Some("./gradlew --version")))
+        }
+        "vendor"
+            if siblings.contains("go.mod")
+                && parent_path.join("vendor/modules.txt").symlink_metadata().is_ok() =>
+        {
+            Some((Category::BuildArtifact, Some("go mod vendor")))
+        }
+        "bundle"
+            if parent_name == "vendor"
+                && grandparent.is_some_and(|g| g.join("Gemfile").symlink_metadata().is_ok()) =>
+        {
+            Some((Category::BuildArtifact, Some("bundle install")))
+        }
+        _ => None,
+    }
+}
+
+/// Classify one entry, given its length, the directory it sits in, and the
+/// names of everything beside it there. `parent_name` disambiguates the generic
+/// names: a `registry` directory only means Cargo's inside `.cargo`.
+/// `parent_path` places the few rules that are about one particular directory,
+/// such as the XDG cache root; it is only touched for those names. `len` is
+/// `st_size`, and corroborates the two ambiguous image extensions; see
 /// [`AMBIGUOUS_IMAGE_EXTS`].
 pub fn classify(
     name: &str,
     is_dir: bool,
     len: u64,
     parent_name: &str,
+    parent_path: &Path,
     siblings: &HashSet<&str>,
 ) -> Option<Category> {
     if !is_dir {
@@ -161,6 +250,9 @@ pub fn classify(
         return None;
     }
 
+    if let Some((cat, _)) = proven(name, parent_name, parent_path, siblings) {
+        return Some(cat);
+    }
     for (dir, markers, _) in BUILD_DIRS {
         if name == *dir && markers.iter().any(|m| siblings.contains(m)) {
             return Some(Category::BuildArtifact);
@@ -176,11 +268,12 @@ pub fn classify(
             "registry" | "toolchains" => matches!(parent_name, ".cargo" | ".rustup"),
             "Caches" => parent_name == "Library",
             "repository" => parent_name == ".m2",
-            // Only the XDG cache root itself, not every `.cache` in a project.
-            ".cache" => crate::paths::home().is_some_and(|h| {
-                h.file_name().is_some_and(|n| n == parent_name)
-            }),
-            "thumbnails" => parent_name == ".cache",
+            // Only the XDG cache root itself, not every `.cache` in a project
+            // or under a directory that merely shares the home's name.
+            ".cache" => is_home(parent_path),
+            "thumbnails" => {
+                parent_name == ".cache" && parent_path.parent().is_some_and(is_home)
+            }
             _ => true,
         };
         if ok {

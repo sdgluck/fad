@@ -88,6 +88,20 @@ pub fn candidates(
     items
 }
 
+/// What `--reclaim --yes` may take with nobody watching: `candidates`, less
+/// every category that has to be chosen by hand (`Category::manual_only`).
+pub fn auto_candidates(
+    tree: &Tree,
+    apparent: bool,
+    min_size: u64,
+    ignore: &Rules,
+) -> Vec<(NodeId, u64)> {
+    candidates(tree, apparent, min_size, ignore)
+        .into_iter()
+        .filter(|(id, _)| !tree.node(*id).preset.is_some_and(|c| c.manual_only()))
+        .collect()
+}
+
 /// Take from `items` until `max` is reached, largest first.
 ///
 /// Anything that would take the batch over the cap is skipped rather than

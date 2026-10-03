@@ -4,10 +4,13 @@
 use std::path::Path;
 
 use fad::ignore::Rules;
+use fad::presets::Category;
 use fad::reclaim;
 use fad::scan::Scan;
 use fad::scan::walk::ScanOpts;
 use fad::tree::Tree;
+
+mod common;
 
 fn fixture(root: &Path) {
     let mk = |rel: &str, size: usize| {
@@ -81,6 +84,114 @@ fn the_cap_skips_what_would_overshoot_rather_than_stopping() {
     assert!(total <= 4 * 1024 * 1024, "the cap was exceeded");
 
     assert_eq!(reclaim::under_cap(items, None).len(), 2, "no cap means take everything");
+}
+
+fn mk(root: &Path, rel: &str) {
+    let p = root.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, b"x").unwrap();
+}
+
+fn preset(tree: &Tree, rel: &str) -> Option<Category> {
+    let id = tree
+        .find_path(&tree.root_path().join(rel))
+        .unwrap_or_else(|| panic!("no node for {rel}"));
+    tree.node(id).preset
+}
+
+/// `~/.gradle` holds `gradle.properties` and `init.d` — credentials and build
+/// configuration. Only its regenerable parts are offered, and a project's own
+/// `.gradle` only beside its build script.
+#[test]
+fn only_the_regenerable_parts_of_gradle_are_offered() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    common::isolate(&home);
+    for rel in [
+        ".gradle/gradle.properties",
+        ".gradle/init.d/repos.gradle",
+        ".gradle/caches/modules-2/x.jar",
+        ".gradle/wrapper/dists/gradle-8/x.zip",
+        ".gradle/daemon/8.0/log",
+        "app/build.gradle.kts",
+        "app/.gradle/8.0/x.bin",
+        "notes/.gradle/x.bin",
+    ] {
+        mk(&home, rel);
+    }
+    let tree = scanned(&home);
+
+    assert_eq!(preset(&tree, ".gradle"), None, "~/.gradle itself was offered");
+    assert_eq!(preset(&tree, ".gradle/init.d"), None);
+    assert_eq!(preset(&tree, ".gradle/caches"), Some(Category::PackageCache));
+    assert_eq!(preset(&tree, ".gradle/wrapper/dists"), Some(Category::PackageCache));
+    assert_eq!(preset(&tree, ".gradle/daemon"), Some(Category::PackageCache));
+    assert_eq!(preset(&tree, "app/.gradle"), Some(Category::BuildArtifact));
+    assert_eq!(preset(&tree, "notes/.gradle"), None, "a .gradle with no build script beside it");
+}
+
+/// A Rails app's `vendor/` is hand-vendored code; Bundler's output is
+/// `vendor/bundle`. Go's `vendor/` counts only when `go mod vendor` made it.
+#[test]
+fn vendor_is_only_offered_where_a_tool_regenerates_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for rel in [
+        "php/composer.json",
+        "php/vendor/autoload.php",
+        "rails/Gemfile",
+        "rails/vendor/plugins/ours.rb",
+        "rails/vendor/bundle/ruby/gem.rb",
+        "go/go.mod",
+        "go/vendor/modules.txt",
+        "handgo/go.mod",
+        "handgo/vendor/lib.go",
+    ] {
+        mk(root, rel);
+    }
+    let tree = scanned(root);
+
+    assert_eq!(preset(&tree, "php/vendor"), Some(Category::BuildArtifact));
+    assert_eq!(preset(&tree, "rails/vendor"), None, "a Rails app's vendor/ was offered");
+    assert_eq!(preset(&tree, "rails/vendor/bundle"), Some(Category::BuildArtifact));
+    assert_eq!(preset(&tree, "go/vendor"), Some(Category::BuildArtifact));
+    assert_eq!(preset(&tree, "handgo/vendor"), None, "a Go vendor/ without modules.txt");
+    let bundle = tree.find_path(&tree.root_path().join("rails/vendor/bundle")).unwrap();
+    assert_eq!(tree.rebuild_command(bundle), Some("bundle install"));
+}
+
+/// Disk images are listed for a person to choose, never taken by
+/// `--reclaim --yes`.
+#[test]
+fn disk_images_are_offered_but_never_chosen_unattended() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    std::fs::write(dir.path().join("box.qcow2"), vec![0u8; 1024]).unwrap();
+    let tree = scanned(dir.path());
+
+    let all = names(&tree, &reclaim::candidates(&tree, false, 0, &Rules::default()));
+    assert!(all.iter().any(|n| n == "box.qcow2"), "the image is not in the view: {all:?}");
+    let auto = names(&tree, &reclaim::auto_candidates(&tree, false, 0, &Rules::default()));
+    assert!(!auto.iter().any(|n| n == "box.qcow2"), "chosen unattended: {auto:?}");
+    assert!(auto.iter().any(|n| n == "proj/target"), "the rest went too: {auto:?}");
+}
+
+/// The XDG cache root is `~/.cache`, not any `.cache` whose parent happens to
+/// share the home directory's name.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn only_the_home_cache_root_is_the_cache_root() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("someone");
+    common::isolate(&home);
+    mk(&home, ".cache/pip/x");
+    mk(dir.path(), "backup/someone/.cache/x");
+    let tree = scanned(dir.path());
+
+    assert_eq!(preset(&tree, "someone/.cache"), Some(Category::AppCache));
+    assert_eq!(preset(&tree, "backup/someone/.cache"), None, "matched on the basename");
 }
 
 /// A build directory the scan could not see all of is not handed to an
