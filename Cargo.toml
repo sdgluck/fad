@@ -2,6 +2,14 @@
 name = "fad"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Find and destroy: a terminal UI for finding what is using your disk and deleting it"
+license = "MIT"
+repository = "https://github.com/sdgluck/fad"
+readme = "README.md"
+keywords = ["disk", "du", "tui", "cleanup", "storage"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = [".github/", ".claude/"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }

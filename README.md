@@ -36,9 +36,13 @@ Runs on macOS and Linux.
 
 ## Install
 
+Needs Rust 1.88 or newer.
+
 ```sh
-cargo install --path .
+cargo install --git https://github.com/sdgluck/fad
 ```
+
+or, from a checkout, `cargo install --path .`.
 
 ## Use
 
@@ -697,8 +701,13 @@ output in `tests/fixtures`, and `FAD_DOCKER_BIN` / `FAD_PODMAN_BIN` /
 `FAD_TMUTIL_BIN` point the probe at a stub when one is wanted. The suite passes
 on a machine with no container runtime installed.
 
-Tests that redirect `HOME`, `XDG_DATA_HOME`, `FAD_STATE_DIR` or `FAD_CACHE_DIR`
-must hold `common::env_lock()` for their whole body — environment variables are
+Tests that redirect `HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`,
+`FAD_STATE_DIR`, `FAD_CONFIG_DIR` or `FAD_CACHE_DIR` must hold
+`common::env_lock()` for their whole body — environment variables are
 process-global and `cargo test` runs a binary's tests on several threads at
-once. They use `common::isolate()` so a test run can never read or consume the
-real user's trash, cache, or undo history.
+once. They use `common::isolate()` so a test run can never read or write the
+real user's trash, cache, ignore list, or undo history.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
