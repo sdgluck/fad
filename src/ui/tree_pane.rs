@@ -325,34 +325,34 @@ fn banner_lines(app: &App, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     // The one thing a size in this view cannot say for itself: whether removing
     // it gives the user's disk anything back, and whether the tree has counted
     // it already.
-    if app.tools_view {
-        if let Some(report) = app.tools.as_ref() {
-            for sr in &report.sources {
-                for (i, note) in sr.backing.notes().iter().enumerate() {
-                    // The tool's name once, on the first line only; the rest
-                    // are continuations of the same warning.
-                    // A tight prefix on purpose: every character here is one
-                    // the warning itself does not get.
-                    let lead =
-                        if i == 0 { format!(" \u{26a0} {}: ", sr.source.label()) } else { "   ".into() };
-                    out.push(Line::from(Span::styled(
-                        truncate_end(&format!("{lead}{note}"), width),
-                        theme.warn,
-                    )));
-                }
-                if sr.backing.notes().is_empty() {
-                    continue;
-                }
-                if app.tool_in_tree(sr.backing.disk().map(|p| p.as_path())) {
-                    out.push(Line::from(Span::styled(
-                        truncate_end(
-                            " \u{26a0} that file is under the scan root, so the tree above \
-                              already counts it \u{2014} these are not two separate piles",
-                            width,
-                        ),
-                        theme.warn,
-                    )));
-                }
+    if app.tools_view
+        && let Some(report) = app.tools.as_ref()
+    {
+        for sr in &report.sources {
+            for (i, note) in sr.backing.notes().iter().enumerate() {
+                // The tool's name once, on the first line only; the rest
+                // are continuations of the same warning.
+                // A tight prefix on purpose: every character here is one
+                // the warning itself does not get.
+                let lead =
+                    if i == 0 { format!(" \u{26a0} {}: ", sr.source.label()) } else { "   ".into() };
+                out.push(Line::from(Span::styled(
+                    truncate_end(&format!("{lead}{note}"), width),
+                    theme.warn,
+                )));
+            }
+            if sr.backing.notes().is_empty() {
+                continue;
+            }
+            if app.tool_in_tree(sr.backing.disk().map(|p| p.as_path())) {
+                out.push(Line::from(Span::styled(
+                    truncate_end(
+                        " \u{26a0} that file is under the scan root, so the tree above \
+                          already counts it \u{2014} these are not two separate piles",
+                        width,
+                    ),
+                    theme.warn,
+                )));
             }
         }
     }

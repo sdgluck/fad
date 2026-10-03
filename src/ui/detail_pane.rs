@@ -246,6 +246,10 @@ fn group_heading_detail(app: &App, theme: &Theme, heading: crate::app::Heading) 
     Some(lines)
 }
 
+/// One breakdown laid out: its label, how much of it was cut to fit (shown of
+/// total), and its rows.
+type Section = (String, Option<(usize, usize)>, Vec<Line<'static>>);
+
 fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -427,7 +431,7 @@ fn draw_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // The pane does not scroll, so the overview is built first and these last:
     // the breakdowns are the half that gives way, never the path or the size.
     let mut room = (inner.height as usize).saturating_sub(rows_used(&lines, inner.width));
-    let mut sections: Vec<(String, Option<(usize, usize)>, Vec<Line<'static>>)> = Vec::new();
+    let mut sections: Vec<Section> = Vec::new();
     let mut whole = true;
     if let Some(b) = b {
         for panel in app.panel.rotation() {

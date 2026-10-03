@@ -1080,17 +1080,17 @@ fn toggle_stage(app: &mut App) {
     }
     // A tool row is not a tree node, and the daemon's own answer decides
     // whether it can go at all.
-    if let Some(row) = app.rows.get(app.cursor).copied() {
-        if row.tool.is_some() {
-            let Some(r) = app.tool_of(&row) else { return };
-            if let Some(why) = r.blocked.clone() {
-                app.status = Some(format!("{} \u{2014} {why}", r.name));
-                return;
-            }
-            let key = r.key();
-            app.toggle_tool_stage(key);
+    if let Some(row) = app.rows.get(app.cursor).copied()
+        && row.tool.is_some()
+    {
+        let Some(r) = app.tool_of(&row) else { return };
+        if let Some(why) = r.blocked.clone() {
+            app.status = Some(format!("{} \u{2014} {why}", r.name));
             return;
         }
+        let key = r.key();
+        app.toggle_tool_stage(key);
+        return;
     }
     let Some(id) = app.selected() else { return };
     if id == app.tree.root() {
