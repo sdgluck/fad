@@ -41,6 +41,9 @@ pub struct Job {
     rx: Receiver<Msg>,
     pub total: usize,
     pub done: Vec<Outcome>,
+    /// What the tools' own totals fell by, when they could be read both before
+    /// and after. `None` once finished means the figure is `expected`, an
+    /// estimate, and must be shown as one.
     pub measured: Option<u64>,
     /// True once the worker has hung up, whether or not it measured.
     finished: bool,
@@ -75,6 +78,12 @@ impl Job {
         self.finished
     }
 
+    /// Every removal has been tried and the job is re-asking the tools for
+    /// their totals.
+    pub fn measuring(&self) -> bool {
+        !self.finished && self.done.len() == self.total
+    }
+
     /// What we expected to free, until the measurement lands.
     pub fn expected(&self) -> u64 {
         self.done.iter().filter(|o| o.result.is_ok()).map(|o| o.bytes).sum()
@@ -88,7 +97,8 @@ impl Job {
 fn run_batch(items: Vec<(ToolKey, String, u64)>, tx: Sender<Msg>) {
     // Which tools this batch touches, so only those get re-measured.
     let sources: BTreeSet<Source> = items.iter().map(|(k, _, _)| k.source).collect();
-    let before: Vec<(Source, u64)> = sources.iter().map(|s| (*s, store_bytes(*s))).collect();
+    let before: Vec<(Source, Option<u64>)> =
+        sources.iter().map(|s| (*s, store_bytes(*s))).collect();
 
     for (key, label, bytes) in items {
         let result = super::remove(&key);
@@ -99,19 +109,27 @@ fn run_batch(items: Vec<(ToolKey, String, u64)>, tx: Sender<Msg>) {
         }
     }
 
-    let after: u64 = before.iter().map(|(s, _)| store_bytes(*s)).sum();
-    let was: u64 = before.iter().map(|(_, b)| *b).sum();
+    // Measured only when every tool the batch touched answered both times.
+    // A store that could not be sized is unknown, not empty: reading it as
+    // zero turned a slow `df` before the batch into "freed 0, measured", and a
+    // slow one after into the whole store "freed". Without both ends the job
+    // sends nothing, and the estimate stands, labelled as one.
+    let Some(was) = before.iter().map(|(_, b)| *b).sum::<Option<u64>>() else { return };
+    let Some(after) = before.iter().map(|(s, _)| store_bytes(*s)).sum::<Option<u64>>() else {
+        return;
+    };
     let _ = tx.send(Msg::Measured(was.saturating_sub(after)));
 }
 
-/// Everything a tool says its store costs right now.
-fn store_bytes(source: Source) -> u64 {
+/// Everything a tool says its store costs right now, or `None` when it would
+/// not say.
+fn store_bytes(source: Source) -> Option<u64> {
     match source {
-        Source::Docker | Source::Podman => docker::measure(source)
-            .map(|t| t.iter().map(|(_, size, _)| *size).sum())
-            .unwrap_or(0),
+        Source::Docker | Source::Podman => {
+            docker::measure(source).map(|t| t.iter().map(|(_, size, _)| *size).sum())
+        }
         // Snapshots have no size to measure; a batch of them reports what it
         // expected and says as much.
-        Source::Snapshots => 0,
+        Source::Snapshots => None,
     }
 }

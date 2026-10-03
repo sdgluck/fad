@@ -322,10 +322,13 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         done += job.done.len();
         // Once the measurement lands it replaces the estimate outright. The
         // predicted figure was bounds; this one is the tools' own totals before
-        // and after, which is the only number here that was not a guess.
+        // and after, which is the only number here that was not a guess. When
+        // a tool would not answer one end of that, the estimate is all there
+        // is, and it says so rather than passing for a measurement.
         let (amount, label) = match job.measured {
             Some(b) => (human(b), " freed, measured"),
-            None if job.is_finished() => (human(job.expected()), " freed, measuring…"),
+            None if job.is_finished() => (human(job.expected()), " freed (estimated)"),
+            None if job.measuring() => (human(job.expected()), " freed so far, measuring\u{2026}"),
             None => (human(job.expected()), " freed so far"),
         };
         lines.push(Line::from(vec![

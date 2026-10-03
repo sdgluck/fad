@@ -11,7 +11,6 @@
 //! not a failed probe.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use serde_json::Value;
 
@@ -446,7 +445,7 @@ pub fn measure(source: Source) -> Option<Vec<(Kind, u64, u64)>> {
     let out = exec::run(
         &source.bin(),
         &["system", "df", "--format", "{{json .}}"],
-        Duration::from_secs(10),
+        super::MEASURE_TIMEOUT,
     )
     .ok()?;
     let t = parse_totals(&out);

@@ -63,13 +63,15 @@ fn a_batch_runs_the_right_command_for_every_kind() {
     assert!(lines.contains(&"volume rm small"), "{lines:?}");
     assert!(lines.contains(&"builder prune --force"), "{lines:?}");
 
-    // The batch is bracketed by the daemon's own totals, before and after.
-    // That is what makes the figure reported at the end measured rather than
-    // predicted — and with a stub that reports nothing, it comes out as zero
-    // rather than as the estimate.
+    // The batch opens with the daemon's own totals, which is what makes a
+    // figure reported at the end measured rather than predicted. With a stub
+    // that reports nothing there is no measurement at all — so no point asking
+    // a second time either. It used to come out as zero, which the modal then
+    // printed as "0 freed, measured"; unknown is not empty.
     assert_eq!(lines.first(), Some(&"system df --format {{json .}}"));
-    assert_eq!(lines.last(), Some(&"system df --format {{json .}}"));
-    assert_eq!(job.measured, Some(0));
+    assert_eq!(lines.iter().filter(|l| l.starts_with("system df")).count(), 1, "{lines:?}");
+    assert_eq!(job.measured, None);
+    assert_eq!(job.expected(), 1010, "the estimate is all there is, and it has to be there");
 
     unsafe { std::env::remove_var("FAD_DOCKER_BIN") };
 }
@@ -158,4 +160,56 @@ fn the_batch_a_staged_set_produces_is_biggest_first() {
 
     let names: Vec<String> = app.tool_batch_items().into_iter().map(|(_, n, _)| n).collect();
     assert_eq!(names, vec!["big", "mid", "small"]);
+}
+
+/// When the daemon answers both ends, the figure is the difference between its
+/// own totals — not the estimate, however different the estimate was.
+#[test]
+fn a_store_measured_at_both_ends_reports_the_difference() {
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("seen");
+    let body = format!(
+        r#"if [ "$1" = system ]; then
+  if [ -f {seen} ]; then
+    echo '{{"Reclaimable":"0B","Size":"3.236GB","Type":"Images"}}'
+  else
+    touch {seen}
+    echo '{{"Reclaimable":"759MB","Size":"3.995GB","Type":"Images"}}'
+  fi
+fi"#,
+        seen = seen.display()
+    );
+    let bin = stub(dir.path(), &body);
+    unsafe { std::env::set_var("FAD_DOCKER_BIN", &bin) };
+
+    let job = drain(Job::start(vec![(key(Kind::Image, "sha256:abc"), "old".into(), 5)]));
+    assert_eq!(job.measured, Some(759_000_000));
+
+    unsafe { std::env::remove_var("FAD_DOCKER_BIN") };
+}
+
+/// A daemon that answers before the batch and not after has not freed its
+/// whole store. That used to be the reading: the missing answer was zero.
+#[test]
+fn a_store_that_stops_answering_is_estimated_not_emptied() {
+    let _lock = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("seen");
+    let body = format!(
+        r#"if [ "$1" = system ]; then
+  if [ -f {seen} ]; then exit 1; fi
+  touch {seen}
+  echo '{{"Reclaimable":"759MB","Size":"3.995GB","Type":"Images"}}'
+fi"#,
+        seen = seen.display()
+    );
+    let bin = stub(dir.path(), &body);
+    unsafe { std::env::set_var("FAD_DOCKER_BIN", &bin) };
+
+    let job = drain(Job::start(vec![(key(Kind::Image, "sha256:abc"), "old".into(), 5)]));
+    assert_eq!(job.measured, None, "an unanswered df was read as an empty store");
+    assert_eq!(job.expected(), 5);
+
+    unsafe { std::env::remove_var("FAD_DOCKER_BIN") };
 }

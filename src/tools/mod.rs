@@ -45,6 +45,15 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(45);
 /// seconds against a healthy daemon on this machine. It gets the same budget as
 /// anything else that has to wait for the daemon to think.
 pub const INFO_TIMEOUT: Duration = PROBE_TIMEOUT;
+/// Re-asking `system df` after a batch, to measure what it freed.
+///
+/// This was ten seconds while the probe two constants up waits forty-five for
+/// the very same command, measured at just under sixteen against a healthy
+/// daemon. So on exactly the machines where the measurement mattered — a busy
+/// store, a big batch — it timed out every time, and the timeout was read as
+/// zero. A minute: the batch is already done, the modal says it is measuring,
+/// and a figure that arrives late beats one that never does.
+pub const MEASURE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Removal is real work and is allowed to take longer.
 pub const REMOVE_TIMEOUT: Duration = Duration::from_secs(30);
 
