@@ -449,7 +449,7 @@ fn main() {
     }
 }
 
-const NEEDS_TERMINAL: &str = "fad needs a terminal for the interactive view; \
+const NEEDS_TERMINAL: &str = "the interactive view needs a terminal; \
      use --json, --since, or --reclaim/--tools --yes";
 
 /// Whether there is a terminal to draw on and read keys from. Without one,
