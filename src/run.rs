@@ -1,6 +1,7 @@
 //! Terminal setup, the event loop, and what each key does.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,8 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 
 use crate::app::{AgeFilter, App, Heading, Mode, View};
@@ -212,6 +214,34 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Hand the terminal to another full-screen program, and take it back.
+    ///
+    /// Leaves the alternate screen rather than drawing over it, so the child
+    /// starts on the user's own screen and whatever it leaves there is not
+    /// mixed into ours. `TAKEN` is down for the duration: a panic while the
+    /// child runs must not try to restore a terminal that is the child's.
+    fn suspend<T>(&mut self, f: impl FnOnce() -> T) -> io::Result<T> {
+        TAKEN.store(false, Ordering::SeqCst);
+        restore(self.terminal.backend_mut(), self.mouse);
+        let out = f();
+        enable_raw_mode()?;
+        TAKEN.store(true, Ordering::SeqCst);
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen, Clear(ClearType::All))?;
+        if self.mouse {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)?;
+        }
+        // Ratatui only ever sends what changed since its last frame, and its
+        // last frame is no longer what is on the screen: without this the next
+        // draw paints a few changed cells onto a blank page. An empty frame
+        // makes its idea of the screen blank too, so the next one is drawn in
+        // full. Not `Terminal::clear`, which asks the terminal where its cursor
+        // is and ends the session if the answer is slow to come back.
+        self.terminal.draw(|_| {})?;
+        Ok(out)
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if TAKEN.swap(false, Ordering::SeqCst) {
@@ -238,7 +268,6 @@ pub fn run(mut app: App, keep_stdout_clean: bool) -> io::Result<Outcome> {
 }
 
 fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
-    let terminal = &mut session.terminal;
     let mut last_draw = Instant::now() - SCAN_TICK;
     loop {
         // Left set for `run` to find: the flag is all a handler could do, and
@@ -257,7 +286,7 @@ fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
         let tick = if app.scanning() { SCAN_TICK } else { IDLE_TICK };
         if last_draw.elapsed() >= tick {
             app.rebuild_rows();
-            terminal.draw(|f| ui::draw(f, app))?;
+            session.terminal.draw(|f| ui::draw(f, app))?;
             last_draw = Instant::now();
         }
 
@@ -274,15 +303,24 @@ fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            match ev {
+            let effect = match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
-                Event::Mouse(m) => on_mouse(app, m),
-                Event::Resize(_, _) => app.mark_dirty(),
-                _ => {}
+                Event::Mouse(m) => {
+                    on_mouse(app, m);
+                    None
+                }
+                Event::Resize(_, _) => {
+                    app.mark_dirty();
+                    None
+                }
+                _ => None,
+            };
+            if let Some(Effect::Edit(path)) = effect {
+                edit(session, app, &path)?;
             }
             // Respond to input immediately rather than at the next tick.
             app.rebuild_rows();
-            terminal.draw(|f| ui::draw(f, app))?;
+            session.terminal.draw(|f| ui::draw(f, app))?;
             last_draw = Instant::now();
         }
 
@@ -292,22 +330,26 @@ fn event_loop(session: &mut Session, app: &mut App) -> io::Result<()> {
     }
 }
 
+/// What a key asks of the terminal itself, which the key handler cannot do: it
+/// sees the app and nothing else, and that is what keeps it testable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Effect {
+    /// Hand the terminal to the user's editor on this path, and take it back.
+    Edit(PathBuf),
+}
+
 /// One key, in whatever mode the app is in. Public so the tests can drive the
 /// real key handling rather than a copy of it.
-pub fn on_key(app: &mut App, k: KeyEvent) {
+pub fn on_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
     // Ctrl-c means "stop what I am doing" in every mode. At the top level that
     // is quitting; inside a prompt or an overlay it is backing out of it —
-    // never typing a `c` into the filter or the search.
-    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-        match app.mode {
-            Mode::Normal => {}
-            Mode::Deleting => {
-                app.cancel_deleting();
-                app.mark_dirty();
-                return;
-            }
-            _ => return on_key(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        }
+    // never typing a `c` into the filter or the search — and while a batch is
+    // going it is the same as esc there: stop after this item.
+    if k.code == KeyCode::Char('c')
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && app.mode != Mode::Normal
+    {
+        return on_key(app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     }
     match app.mode {
         Mode::Filter => filter_key(app, k),
@@ -322,8 +364,9 @@ pub fn on_key(app: &mut App, k: KeyEvent) {
         Mode::Confirm => confirm_key(app, k),
         Mode::EmptyTrash => empty_key(app, k),
         Mode::Deleting => deleting_key(app, k),
-        Mode::Normal => normal_key(app, k),
+        Mode::Normal => return normal_key(app, k),
     }
+    None
 }
 
 /// Clicks and the wheel. A modal owns the screen while it is up, so the mouse
@@ -602,7 +645,8 @@ fn search_key(app: &mut App, k: KeyEvent) {
     app.mark_dirty();
 }
 
-fn normal_key(app: &mut App, k: KeyEvent) {
+fn normal_key(app: &mut App, k: KeyEvent) -> Option<Effect> {
+    let mut effect = None;
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     app.status = None;
     // The key after "N staged items will be forgotten" answers that and does
@@ -613,7 +657,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             app.should_quit = true;
         }
         app.mark_dirty();
-        return;
+        return None;
     }
     match k.code {
         KeyCode::Char('q') => request_quit(app),
@@ -676,7 +720,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
             app.status = Some(format!("showing {}", app.age_filter.label()));
         }
         KeyCode::Char('o') => reveal(app),
-        KeyCode::Char('e') => open_editor(app),
+        KeyCode::Char('e') => effect = editor_target(app).map(Effect::Edit),
         KeyCode::Char('y') => copy_path(app),
         KeyCode::Char('i') => ignore_selected(app),
         // The banners say how many; this says which, and what would fix each.
@@ -699,6 +743,7 @@ fn normal_key(app: &mut App, k: KeyEvent) {
         _ => {}
     }
     app.mark_dirty();
+    effect
 }
 
 /// Quit, unless that would throw a batch away without a word. Staging can be
@@ -748,19 +793,63 @@ fn reveal(app: &mut App) {
     }
 }
 
-fn open_editor(app: &mut App) {
-    let Some(id) = app.selected() else { return };
-    let path = app.tree.path(id);
-    let Some(editor) = std::env::var_os("EDITOR") else {
-        app.status = Some("$EDITOR is not set".into());
-        return;
-    };
-    // The TUI owns the terminal; handing it to a full-screen editor and taking
-    // it back cleanly is a bigger job than it looks, so open detached instead.
-    match std::process::Command::new(&editor).arg(&path).spawn() {
-        Ok(_) => app.status = Some(format!("opened in {}", editor.to_string_lossy())),
-        Err(e) => app.status = Some(format!("could not run $EDITOR: {e}")),
-    }
+/// The path `e` would open, if the cursor is on one.
+fn editor_target(app: &mut App) -> Option<PathBuf> {
+    let id = app.selected()?;
+    Some(app.tree.path(id))
+}
+
+/// The editor the user asked for, the way every other terminal program picks
+/// one: `$EDITOR`, then `$VISUAL`, then `vi`, which POSIX promises is there.
+fn editor() -> String {
+    ["EDITOR", "VISUAL"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find(|e| !e.trim().is_empty())
+        .unwrap_or_else(|| "vi".into())
+}
+
+/// Run the editor in the foreground, with the terminal handed over to it.
+///
+/// It used to be spawned detached on top of the running interface, which a
+/// terminal editor cannot survive — two programs drawing on one screen and both
+/// reading the keyboard. Now the session steps aside for the length of the
+/// edit, and comes back with a full redraw.
+///
+/// Through `sh` rather than exec'd directly, because `$EDITOR` is a command
+/// line and not a program name: `code -w` and `emacsclient -t` are both normal
+/// values, and only word splitting turns them into something runnable. The path
+/// goes in as `$1`, never spliced into the script, so nothing in a filename is
+/// ever read as shell.
+fn edit(session: &mut Session, app: &mut App, path: &std::path::Path) -> io::Result<()> {
+    let editor = editor();
+    let ran = session.suspend(|| {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("$EDITOR \"$1\"").arg("sh").arg(path).env("EDITOR", &editor);
+        // Under `--print-path` our stdout is a pipe into the shell's command
+        // substitution. The editor gets the terminal instead, or its screen
+        // would end up in the path the shell is about to `cd` to.
+        if KEEP_STDOUT_CLEAN.load(Ordering::SeqCst) {
+            let tty = || std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+            if let (Ok(i), Ok(o)) = (tty(), tty()) {
+                cmd.stdin(i).stdout(o);
+            }
+        }
+        cmd.status()
+    })?;
+    // A ctrl-c typed at an editor that leaves the terminal cooked reaches the
+    // whole foreground group, us included. It was the editor's, not ours.
+    let _ = SIGNAL.compare_exchange(libc::SIGINT, 0, Ordering::SeqCst, Ordering::SeqCst);
+    app.status = Some(match ran {
+        Ok(s) if s.success() => format!("back from {editor}"),
+        Ok(s) => match s.code() {
+            Some(code) => format!("{editor} exited with status {code}"),
+            None => format!("{editor} was killed by a signal"),
+        },
+        Err(e) => format!("could not run {editor}: {e}"),
+    });
+    app.mark_dirty();
+    Ok(())
 }
 
 /// Add the selection to the persistent ignore list. Deliberately the whole

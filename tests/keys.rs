@@ -167,6 +167,20 @@ fn ctrl_c_in_a_prompt_cancels_it_instead_of_typing_c() {
     assert!(!app.should_quit);
 }
 
+/// `e` hands the terminal to the editor, which the key handler cannot do on
+/// its own: it asks the event loop to, naming the file under the cursor.
+#[test]
+fn e_asks_for_the_editor_on_the_selected_path() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = app_for(dir.path());
+    let movies = find(&app, "Movies");
+    app.cursor = app.rows.iter().position(|r| r.id == movies).unwrap();
+
+    let effect = fad::run::on_key(&mut app, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+    assert_eq!(effect, Some(fad::run::Effect::Edit(app.tree.path(movies))));
+}
+
 #[test]
 fn esc_closes_an_overlay_without_quitting() {
     let dir = tempfile::tempdir().unwrap();
