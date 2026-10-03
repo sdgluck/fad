@@ -143,7 +143,7 @@ fn any_remembered_batch_can_be_put_back() {
     assert_eq!(trashed, 3 * 1024, "the trash total has to cover every batch");
 
     // The oldest, not the newest.
-    let report = delete::undo_batch(0).expect("undo failed");
+    let report = delete::undo_batch(before[0].id).expect("undo failed");
     assert_eq!(report.restored, 1);
     assert!(dir.path().join("first").exists(), "the chosen batch did not come back");
     assert!(!dir.path().join("third").exists(), "an untouched batch was restored too");
@@ -154,4 +154,149 @@ fn any_remembered_batch_can_be_put_back() {
         after.iter().all(|b| b.entries.iter().all(|e| !e.from.ends_with("first"))),
         "the restored batch is still on offer"
     );
+}
+
+// ------------------------------------------------------------ journal plumbing
+//
+// These drive the journal through `Recorder` with "trashed" items that live in
+// a `.Trash` directory inside the scratch tree, so nothing here goes near the
+// real Trash.
+
+/// A file at `dir/name` "trashed" into `dir/.Trash/name`, the way a trash
+/// implementation would leave it. Returns (original, trashed).
+fn fake_trashed(dir: &Path, name: &str, len: usize) -> (PathBuf, PathBuf) {
+    let trash = dir.join(".Trash");
+    std::fs::create_dir_all(&trash).unwrap();
+    let from = dir.join(name);
+    let to = trash.join(name);
+    std::fs::write(&to, vec![3u8; len]).unwrap();
+    (from, to)
+}
+
+/// Each entry is in the journal as soon as it is recorded, not when the batch
+/// ends — a fad killed mid-batch still has undo for what it already moved.
+#[test]
+fn entries_are_journalled_as_they_land() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let mut rec = delete::Recorder::new();
+    let (a_from, a_to) = fake_trashed(dir.path(), "a", 10);
+    rec.record(&a_from, &a_to, 10).unwrap();
+    let j = delete::read_journal();
+    assert_eq!(j.len(), 1);
+    assert_eq!(j[0].entries.len(), 1, "the first entry was not written straight away");
+
+    let (b_from, b_to) = fake_trashed(dir.path(), "b", 20);
+    rec.record(&b_from, &b_to, 20).unwrap();
+    let j = delete::read_journal();
+    assert_eq!(j.len(), 1, "a second entry started a second batch");
+    assert_eq!(j[0].entries.len(), 2);
+    assert_eq!(j[0].bytes(), 30);
+}
+
+/// Two instances writing at once must not lose each other's batches: every
+/// read-modify-write is under a lock.
+#[test]
+fn concurrent_writers_do_not_lose_batches() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let handles: Vec<_> = (0..8)
+        .map(|t| {
+            let base = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let mut rec = delete::Recorder::new();
+                for i in 0..5 {
+                    let from = base.join(format!("t{t}-{i}"));
+                    let to = base.join(".Trash").join(format!("t{t}-{i}"));
+                    rec.record(&from, &to, 1).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let j = delete::read_journal();
+    assert_eq!(j.len(), 8, "batches were lost");
+    assert!(j.iter().all(|b| b.entries.len() == 5), "entries were lost");
+    let mut ids: Vec<u64> = j.iter().map(|b| b.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 8, "two batches share an id");
+}
+
+/// Trimming keeps the newest twenty, and the rewrite leaves nothing behind.
+#[test]
+fn the_journal_is_trimmed_and_rewritten_cleanly() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    for i in 0..25 {
+        let p = dir.path().join(format!("f{i}"));
+        delete::Recorder::new().record(&p, &dir.path().join(".Trash/x"), i).unwrap();
+    }
+    let j = delete::read_journal();
+    assert_eq!(j.len(), 20);
+    assert_eq!(j.last().unwrap().entries[0].bytes, 24, "the newest batch was trimmed");
+    let stray: Vec<_> = std::fs::read_dir(dir.path().join("state"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(stray.is_empty(), "temporary journal files left behind: {stray:?}");
+}
+
+/// The history screen can be stale by the time `U` lands. Restoring by id
+/// still restores the batch that was under the cursor.
+#[test]
+fn a_batch_is_restored_by_id_from_a_stale_list() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    for name in ["one", "two", "three"] {
+        let (from, to) = fake_trashed(dir.path(), name, 8);
+        delete::Recorder::new().record(&from, &to, 8).unwrap();
+    }
+    let stale = delete::read_journal();
+
+    // Something else restores the oldest batch; positions shift under `stale`.
+    delete::undo_batch(stale[0].id).unwrap();
+    // `three` was at position 2 — now out of range by position, still there by id.
+    let r = delete::undo_batch(stale[2].id).expect("the stale id did not resolve");
+    assert_eq!(r.restored, 1);
+    assert!(dir.path().join("three").exists());
+    assert!(!dir.path().join("two").exists(), "the wrong batch came back");
+}
+
+/// A journal written before batches carried ids still reads, and its batches
+/// can still be put back.
+#[test]
+fn a_journal_from_before_ids_still_works() {
+    let _env = common::env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    common::isolate(dir.path());
+
+    let (from, to) = fake_trashed(dir.path(), "old", 4);
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    let line = serde_json::json!({
+        "at": 1,
+        "entries": [{ "from": from, "to": to, "bytes": 4 }],
+    });
+    std::fs::write(dir.path().join("state/undo.jsonl"), format!("{line}\n")).unwrap();
+
+    let j = delete::read_journal();
+    assert_eq!(j.len(), 1);
+    assert_ne!(j[0].id, 0);
+    assert_eq!(delete::read_journal()[0].id, j[0].id, "the derived id is not stable");
+    let r = delete::undo_batch(j[0].id).unwrap();
+    assert_eq!(r.restored, 1);
+    assert!(from.exists());
 }

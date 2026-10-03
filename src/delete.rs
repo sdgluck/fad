@@ -152,77 +152,215 @@ impl Job {
 }
 
 fn run_batch(items: Vec<(PathBuf, u64)>, disposal: Disposal, tx: Sender<Outcome>) {
-    let mut journal = Vec::new();
+    let mut journal = Recorder::new();
     for (path, bytes) in items {
         let result = match disposal {
             Disposal::Trash => trash::trash(&path).map(Some).map_err(|e| e.to_string()),
             Disposal::Permanent => permanent(&path).map(|_| None).map_err(|e| e.to_string()),
         };
+        // Written down the moment the move lands, not when the batch ends: a
+        // fad killed halfway through a two-hundred-item batch has still moved
+        // the first hundred, and they have to be on the undo list.
         if let Ok(Some(to)) = &result {
-            journal.push((path.clone(), to.clone(), bytes));
+            let _ = journal.record(&path, to, bytes);
         }
         if tx.send(Outcome { path, bytes, result }).is_err() {
             break; // UI is gone; stop rather than keep deleting unobserved
         }
     }
-    if !journal.is_empty() {
-        let _ = write_journal(&journal);
-    }
 }
 
 // ---------------------------------------------------------------- undo journal
+//
+// One JSON line per write. A batch starts as one line and grows by one more
+// line, carrying the same `id`, for every item that lands after the first, so
+// recording an entry is an append rather than a rewrite of the whole file.
+// Reading merges lines by `id`. A journal written before batches had ids is a
+// line per batch, and reads exactly as it always did.
+//
+// Two fad instances can be writing at once — a `--reclaim --yes` from cron and
+// a TUI, say — so every read-modify-write holds an advisory lock on a file
+// beside the journal, and every rewrite goes to a temporary file that is
+// renamed over the journal. A reader never takes the lock: the rename means it
+// sees either the old journal or the new one, and at worst a torn last line
+// from an append in flight, which does not parse and is skipped.
+
+/// How many batches the journal remembers.
+const KEEP: usize = 20;
 
 fn journal_path() -> Option<PathBuf> {
     Some(crate::paths::state_dir()?.join("undo.jsonl"))
 }
 
-/// One committed batch, appended as a single JSON line.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+/// An exclusive `flock` on `undo.lock`, released when dropped.
+///
+/// A separate file rather than the journal itself, because the journal is
+/// replaced by rename: a lock on the old inode would not stop a second writer
+/// that opened the new one.
+struct Lock {
+    _file: std::fs::File,
+}
+
+fn lock() -> io::Result<Lock> {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = crate::paths::state_dir().ok_or_else(|| io::Error::other("no state directory"))?;
+    std::fs::create_dir_all(&dir)?;
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("undo.lock"))?;
+    // SAFETY: a descriptor this function owns, for the life of the `Lock`.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Lock { _file: f })
+}
+
+/// One committed batch.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Batch {
+    /// What `undo_batch` is asked for. Stable across rewrites, unlike a
+    /// position in the list: the history screen can be open while another
+    /// batch lands or is put back, and an index read off it would then name a
+    /// different batch than the one under the cursor. Zero in a journal from
+    /// before ids, until `read_journal` gives it one.
+    #[serde(default)]
+    pub id: u64,
     pub at: u64,
     pub entries: Vec<Entry>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct Entry {
     pub from: PathBuf,
     pub to: PathBuf,
     pub bytes: u64,
 }
 
-fn write_journal(items: &[(PathBuf, PathBuf, u64)]) -> io::Result<()> {
-    use std::io::Write;
-
-    const KEEP: usize = 20;
-
-    let Some(path) = journal_path() else {
-        return Ok(());
-    };
-    std::fs::create_dir_all(path.parent().unwrap())?;
-
-    let batch = Batch {
-        at: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
-        entries: items
-            .iter()
-            .map(|(from, to, bytes)| Entry { from: from.clone(), to: to.clone(), bytes: *bytes })
-            .collect(),
-    };
-
-    let mut batches = read_journal();
-    batches.push(batch);
-    // Rewrite rather than append, so trimming is the same operation as writing.
-    let start = batches.len().saturating_sub(KEEP);
-    let mut f = std::fs::File::create(&path)?;
-    for b in &batches[start..] {
-        writeln!(f, "{}", serde_json::to_string(b)?)?;
-    }
-    Ok(())
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// A batch id nothing else will have: the clock to the nanosecond, mixed with
+/// the process id so two instances starting in the same tick still differ.
+fn new_id() -> u64 {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    ((nanos as u64) ^ (u64::from(std::process::id()) << 40)) | 1
+}
+
+/// An id for a batch written before batches had them, derived from what it
+/// holds so it comes out the same on every read.
+fn legacy_id(b: &Batch) -> u64 {
+    let mut h = crate::hash::Sha256::default();
+    h.update(&b.at.to_le_bytes());
+    for e in &b.entries {
+        h.update(e.to.as_os_str().as_encoded_bytes());
+        h.update(&[0]);
+    }
+    let d = h.finish();
+    u64::from_le_bytes(d[..8].try_into().unwrap()) | 1
+}
+
+/// Records one batch into the journal, an entry at a time, as it happens.
+///
+/// Public so the journal's behaviour can be tested without moving anything
+/// into a real trash; `Job` is the only other user.
+pub struct Recorder {
+    id: u64,
+    at: u64,
+    started: bool,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Recorder::new()
+    }
+}
+
+impl Recorder {
+    pub fn new() -> Recorder {
+        Recorder { id: new_id(), at: now(), started: false }
+    }
+
+    /// Remember that `from` now lives at `to`.
+    ///
+    /// The first entry starts the batch, and that is also when the journal is
+    /// trimmed back to the last `KEEP` batches — a full rewrite, so it goes
+    /// through a temporary file. Every later entry is a single appended line.
+    pub fn record(&mut self, from: &Path, to: &Path, bytes: u64) -> io::Result<()> {
+        use std::io::Write;
+
+        let Some(path) = journal_path() else { return Ok(()) };
+        let _lock = lock()?;
+        let line = Batch {
+            id: self.id,
+            at: self.at,
+            entries: vec![Entry { from: from.to_path_buf(), to: to.to_path_buf(), bytes }],
+        };
+        if !self.started {
+            let mut batches = read_at(&path);
+            let start = batches.len().saturating_sub(KEEP - 1);
+            batches.drain(..start);
+            batches.push(line);
+            rewrite(&path, &batches)?;
+            self.started = true;
+            return Ok(());
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        // One `write` of the whole line, so a reader racing it sees all of it
+        // or a torn tail it will skip, never half an entry glued to the next.
+        f.write_all(format!("{}\n", serde_json::to_string(&line)?).as_bytes())
+    }
+}
+
+/// Replace the journal with `batches`, atomically: written beside it under a
+/// temporary name, flushed, and renamed over it. A crash part-way leaves the
+/// old journal whole, where truncating it in place would have left half of it.
+fn rewrite(path: &Path, batches: &[Batch]) -> io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().ok_or_else(|| io::Error::other("journal has no directory"))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".undo.jsonl.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        let mut text = String::new();
+        for b in batches {
+            text.push_str(&serde_json::to_string(b)?);
+            text.push('\n');
+        }
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Every remembered batch, oldest first, with an entry-per-line batch put
+/// back together and every batch given an id.
 pub fn read_journal() -> Vec<Batch> {
-    let Some(path) = journal_path() else { return Vec::new() };
+    journal_path().map(|p| read_at(&p)).unwrap_or_default()
+}
+
+fn read_at(path: &Path) -> Vec<Batch> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
-    text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    let mut batches: Vec<Batch> = Vec::new();
+    for line in text.lines() {
+        let Ok(mut b) = serde_json::from_str::<Batch>(line) else { continue };
+        if b.id == 0 {
+            b.id = legacy_id(&b);
+        }
+        match batches.iter_mut().find(|x| x.id == b.id) {
+            Some(existing) => existing.entries.append(&mut b.entries),
+            None => batches.push(b),
+        }
+    }
+    batches
 }
 
 impl Batch {
@@ -280,18 +418,24 @@ pub struct UndoReport {
 
 /// Move the most recent trashed batch back where it came from.
 pub fn undo_last() -> Result<UndoReport, String> {
-    let n = read_journal().len();
-    undo_batch(n.checked_sub(1).ok_or("nothing to undo")?)
+    let id = read_journal().last().map(|b| b.id).ok_or("nothing to undo")?;
+    undo_batch(id)
 }
 
-/// Put one batch back, by its index in `read_journal`. The journal is a stack
-/// of the last twenty commits, and there is no reason the only one you can
-/// reach is the top of it.
-pub fn undo_batch(index: usize) -> Result<UndoReport, String> {
-    let mut batches = read_journal();
-    if index >= batches.len() {
-        return Err("nothing to undo".into());
-    }
+/// Put one batch back, by its id. The journal is a stack of the last twenty
+/// commits, and there is no reason the only one you can reach is the top of
+/// it — but it is a stack other things push onto and pop from while the
+/// history screen is open, so the batch is named by id rather than position.
+pub fn undo_batch(id: u64) -> Result<UndoReport, String> {
+    let path = journal_path().ok_or("nothing to undo")?;
+    // Held across the whole read-restore-rewrite, so a batch landing from
+    // another instance meanwhile is not lost when this one writes back.
+    let _lock = lock().map_err(|e| format!("could not lock the undo journal: {e}"))?;
+    let mut batches = read_at(&path);
+    let index = batches
+        .iter()
+        .position(|b| b.id == id)
+        .ok_or("that batch is no longer in the undo history")?;
     let batch = batches.remove(index);
 
     let mut report = UndoReport { restored: 0, bytes: 0, skipped: Vec::new() };
@@ -315,13 +459,6 @@ pub fn undo_batch(index: usize) -> Result<UndoReport, String> {
 
     // The batch is consumed whether or not every item came back; leaving it
     // would offer to restore the same things again.
-    if let Some(path) = journal_path() {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::File::create(&path) {
-            for b in &batches {
-                let _ = writeln!(f, "{}", serde_json::to_string(b).unwrap_or_default());
-            }
-        }
-    }
+    rewrite(&path, &batches).map_err(|e| format!("could not update the undo journal: {e}"))?;
     Ok(report)
 }
