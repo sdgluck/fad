@@ -51,19 +51,13 @@ pub struct Batch {
     pub unreadable: Option<std::io::ErrorKind>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScanOpts {
     /// Follow mount points into other filesystems.
     pub cross_device: bool,
     /// Descend into cloud-provider folders. Off by default: enumerating one can
     /// stall for minutes on a provider that answers over the network.
     pub cloud: bool,
-}
-
-impl Default for ScanOpts {
-    fn default() -> Self {
-        ScanOpts { cross_device: false, cloud: false }
-    }
 }
 
 /// What the walk has got through so far. Shared with the UI, which is the

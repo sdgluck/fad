@@ -250,10 +250,8 @@ fn main() {
             }
             // Last, and on stdout alone, so it is the only thing a shell
             // substitution picks up.
-            if args.print_path {
-                if let Some(p) = outcome.selected {
-                    println!("{}", p.display());
-                }
+            if let (true, Some(p)) = (args.print_path, outcome.selected) {
+                println!("{}", p.display());
             }
         }
         Err(e) => {

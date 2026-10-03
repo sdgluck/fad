@@ -169,6 +169,12 @@ impl Tree {
         self.nodes.len()
     }
 
+    /// Never true of a real tree, which always holds its root; here because a
+    /// public `len` without it is a lint, and a lint is noise in every review.
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
     pub fn root_path(&self) -> &Path {
         &self.root_path
     }
