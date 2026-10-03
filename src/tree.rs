@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::presets::{self, Category};
 use crate::scan::meta::{Kind, Meta};
-use crate::scan::walk::{Batch, ROOT_ID, ScanId, Skip};
+use crate::scan::walk::{Batch, ROOT_ID, ScanId, ScanOpts, Skip};
 
 pub type NodeId = u32;
 
@@ -156,6 +156,12 @@ pub struct Tree {
     /// Directories we stopped at, so the UI can say so rather than quietly
     /// under-reporting. Paths are kept for the "rescan including these" action.
     pub skipped: Vec<(NodeId, Skip)>,
+    /// The options the walk ran with. A snapshot's numbers mean something
+    /// different with and without `--cross-device` or `--cloud`, so it is
+    /// only comparable to a scan that used the same ones.
+    scan_opts: ScanOpts,
+    /// When the walk that built this tree finished, if it has.
+    completed_at: Option<std::time::SystemTime>,
 }
 
 impl Tree {
@@ -196,6 +202,8 @@ impl Tree {
             unreadable_why: Vec::new(),
             reclaimable: Vec::new(),
             skipped: Vec::new(),
+            scan_opts: ScanOpts::default(),
+            completed_at: None,
         }
     }
 
@@ -215,6 +223,26 @@ impl Tree {
     /// public `len` without it is a lint, and a lint is noise in every review.
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    pub fn scan_opts(&self) -> &ScanOpts {
+        &self.scan_opts
+    }
+
+    pub fn set_scan_opts(&mut self, opts: ScanOpts) {
+        self.scan_opts = opts;
+    }
+
+    /// When the walk finished. This, not when the snapshot happened to be
+    /// written, is what "since" measures from: the TUI saves on the way out,
+    /// and a session left open all afternoon would otherwise make its
+    /// baseline look hours newer than the numbers in it.
+    pub fn completed_at(&self) -> Option<std::time::SystemTime> {
+        self.completed_at
+    }
+
+    pub fn mark_complete(&mut self, at: std::time::SystemTime) {
+        self.completed_at = Some(at);
     }
 
     pub fn root_path(&self) -> &Path {
@@ -705,7 +733,13 @@ impl Tree {
 /// handful of large allocations and a memcpy.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Snapshot {
-    root_path: PathBuf,
+    /// Raw bytes rather than `PathBuf`: serde writes a path as a string and
+    /// refuses one that is not UTF-8, which on Linux a scan root can be.
+    root_path: Vec<u8>,
+    cross_device: bool,
+    cloud: bool,
+    /// When the walk finished, as seconds and nanoseconds since the epoch.
+    completed_at: (u64, u32),
     /// Every name concatenated; `name_len` slices it back apart in node order.
     names: String,
     name_len: Vec<u32>,
@@ -727,9 +761,30 @@ pub struct Snapshot {
     unreadable_count: u64,
     reclaimable: Vec<u32>,
     skipped: Vec<(u32, u8)>,
+    unreadable_why: Vec<(u32, u8)>,
+    /// `(node, dev, ino, nlink)` for every multiply-linked file, so a tree
+    /// loaded from disk still knows which links share storage when one of
+    /// them is removed.
+    links: Vec<(u32, u64, u64, u64)>,
 }
 
 const NO_PARENT: u32 = u32::MAX;
+
+fn why_to_u8(k: std::io::ErrorKind) -> u8 {
+    match k {
+        std::io::ErrorKind::PermissionDenied => 1,
+        std::io::ErrorKind::InvalidFilename => 2,
+        _ => 0,
+    }
+}
+
+fn why_from_u8(v: u8) -> std::io::ErrorKind {
+    match v {
+        1 => std::io::ErrorKind::PermissionDenied,
+        2 => std::io::ErrorKind::InvalidFilename,
+        _ => std::io::ErrorKind::Other,
+    }
+}
 
 fn kind_to_u8(k: Kind) -> u8 {
     match k {
@@ -801,8 +856,17 @@ impl Tree {
             }
         }
         let live = |id: &NodeId| remap[*id as usize] != NO_PARENT;
+        use std::os::unix::ffi::OsStrExt;
+        let done = self
+            .completed_at
+            .unwrap_or_else(std::time::SystemTime::now)
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         let mut snap = Snapshot {
-            root_path: self.root_path.clone(),
+            root_path: self.root_path.as_os_str().as_bytes().to_vec(),
+            cross_device: self.scan_opts.cross_device,
+            cloud: self.scan_opts.cloud,
+            completed_at: (done.as_secs(), done.subsec_nanos()),
             names: String::with_capacity(n * 12),
             name_len: Vec::with_capacity(n),
             parent: Vec::with_capacity(n),
@@ -831,6 +895,21 @@ impl Tree {
                 .iter()
                 .filter(|(id, _)| live(id))
                 .map(|(id, s)| (remap[*id as usize], skip_to_u8(*s)))
+                .collect(),
+            unreadable_why: self
+                .unreadable_why
+                .iter()
+                .filter(|(id, _)| live(id))
+                .map(|(id, k)| (remap[*id as usize], why_to_u8(*k)))
+                .collect(),
+            links: self
+                .link_of
+                .iter()
+                .filter(|(id, _)| live(id))
+                .filter_map(|(id, key)| {
+                    let set = self.links.get(key)?;
+                    Some((remap[*id as usize], key.0, key.1, set.nlink))
+                })
                 .collect(),
         };
         for node in self.nodes.iter().filter(|n| n.flags & flags::DELETED == 0) {
@@ -918,16 +997,47 @@ impl Tree {
             });
         }
 
+        // Rebuilt from the members: the one not marked as a copy is the one
+        // carrying the bytes.
+        let mut links: HashMap<(u64, u64), LinkSet> = HashMap::new();
+        let mut link_of = HashMap::new();
+        for (id, dev, ino, nlink) in s.links {
+            if id as usize >= n || id == 0 {
+                return None;
+            }
+            link_of.insert(id, (dev, ino));
+            let set = links.entry((dev, ino)).or_insert(LinkSet {
+                nlink,
+                members: Vec::new(),
+                winner: id,
+                removed: 0,
+            });
+            set.members.push(id);
+            if nodes[id as usize].flags & flags::HARDLINK_DUPE == 0 {
+                set.winner = id;
+            }
+        }
+
+        use std::os::unix::ffi::OsStringExt;
+        let completed_at = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::new(s.completed_at.0, s.completed_at.1.min(999_999_999)))?;
         Some(Tree {
             nodes,
             root: 0,
-            root_path: s.root_path,
+            root_path: PathBuf::from(std::ffi::OsString::from_vec(s.root_path)),
             by_scan_id: HashMap::new(),
             orphans: Vec::new(),
-            links: HashMap::new(),
-            link_of: HashMap::new(),
+            links,
+            link_of,
             unreadable_count: s.unreadable_count,
-            unreadable_why: Vec::new(),
+            unreadable_why: s
+                .unreadable_why
+                .into_iter()
+                .filter(|(i, _)| (*i as usize) < n)
+                .map(|(i, v)| (i, why_from_u8(v)))
+                .collect(),
+            scan_opts: ScanOpts { cross_device: s.cross_device, cloud: s.cloud },
+            completed_at: Some(completed_at),
             reclaimable: s.reclaimable.into_iter().filter(|i| (*i as usize) < n).collect(),
             skipped: s
                 .skipped

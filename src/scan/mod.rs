@@ -44,7 +44,8 @@ impl Scan {
             ));
         }
 
-        let tree = Tree::new(root.clone(), &root_meta);
+        let mut tree = Tree::new(root.clone(), &root_meta);
+        tree.set_scan_opts(opts.clone());
         // Bounded so a slow consumer applies backpressure instead of letting the
         // walker buffer an entire filesystem in memory.
         let (tx, rx) = crossbeam_channel::bounded(1024);
@@ -74,6 +75,7 @@ impl Scan {
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.reap();
+                    tree.mark_complete(std::time::SystemTime::now());
                     break;
                 }
             }
@@ -109,5 +111,6 @@ impl Scan {
             tree.apply(batch);
         }
         self.reap();
+        tree.mark_complete(std::time::SystemTime::now());
     }
 }

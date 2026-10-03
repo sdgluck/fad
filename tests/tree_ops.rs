@@ -302,3 +302,19 @@ fn a_link_outside_the_tree_keeps_the_bytes() {
     let mut tree = scan(&root);
     assert_eq!(tree.remove(find(&tree, "inside")), Some(0));
 }
+
+/// A tree loaded from a snapshot is on screen while the fresh walk runs, and
+/// can be deleted from. It has to know its hard links as well as a scanned one.
+#[test]
+fn a_snapshot_remembers_which_links_share_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("a"), vec![1u8; 512 * 1024]).unwrap();
+    std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+    let scanned = scan(root);
+    let mut tree = Tree::from_snapshot(scanned.to_snapshot()).unwrap();
+    let a = find(&tree, "a");
+    let size = tree.node(a).self_bytes;
+    assert_eq!(tree.remove(a), Some(0), "the loaded tree forgot `b` holds the same data");
+    assert_eq!(tree.node(find(&tree, "b")).self_bytes, size);
+}

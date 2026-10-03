@@ -14,13 +14,16 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::scan::walk::ScanOpts;
 use crate::tree::{Snapshot, Tree};
 
 /// Bumped whenever `Node` or `Tree` change shape, or a field changes meaning.
 /// An old snapshot is discarded rather than misread. Version 4 added the
 /// per-subtree newest-mtime rollup that the age histogram reads; version 5 adds
-/// a third `Skip` reason, which an older reader would take for the first one.
-const FORMAT: u32 = 5;
+/// a third `Skip` reason, which an older reader would take for the first one;
+/// version 6 records the scan options and completion time, the reasons
+/// directories were unreadable, the hard-link sets, and the root as raw bytes.
+const FORMAT: u32 = 6;
 const MAGIC: &[u8; 4] = b"fad\0";
 
 fn snapshot_path(root: &Path) -> Option<PathBuf> {
@@ -54,15 +57,22 @@ pub fn save(tree: &Tree) -> io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
-/// The saved tree, and when it was saved. The timestamp is what turns "40G" on
-/// screen into "+12G since Tuesday", which is the more actionable of the two.
-pub fn load(root: &Path) -> Option<(Tree, std::time::SystemTime)> {
+/// The saved tree, and when the walk that produced it finished. The timestamp
+/// is what turns "40G" on screen into "+12G since Tuesday", which is the more
+/// actionable of the two.
+///
+/// Only a snapshot taken with the same options counts. The cache is keyed by
+/// root alone, and `fad --cross-device /` and `fad /` are measuring different
+/// things: comparing one against the other would report a mounted disk as
+/// "+2T since yesterday". `--apparent` needs no such care — every snapshot
+/// holds both allocated and apparent sizes, and the flag only picks which one
+/// is shown.
+pub fn load(root: &Path, opts: &ScanOpts) -> Option<(Tree, std::time::SystemTime)> {
     // Snapshots are keyed by the canonical path, because that is what the scan
     // recorded. Without this, `fad /var/x` and `fad /private/var/x` would each
     // keep their own copy and neither would ever find the other's.
     let root = &std::fs::canonicalize(root).ok()?;
     let path = snapshot_path(root)?;
-    let saved_at = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
     let bytes = std::fs::read(path).ok()?;
     if bytes.len() < 8 || &bytes[..4] != MAGIC {
         return None;
@@ -76,7 +86,11 @@ pub fn load(root: &Path) -> Option<(Tree, std::time::SystemTime)> {
     if tree.root_path() != root.as_path() {
         return None;
     }
-    Some((tree, saved_at))
+    if tree.scan_opts() != opts {
+        return None;
+    }
+    let completed_at = tree.completed_at()?;
+    Some((tree, completed_at))
 }
 
 pub fn clear() -> io::Result<()> {

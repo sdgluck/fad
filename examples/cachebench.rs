@@ -32,7 +32,7 @@ fn main() {
 
     let t = Instant::now();
     let (loaded, _at) =
-        fad::cache::load(&std::fs::canonicalize(&root).unwrap()).expect("load failed");
+        fad::cache::load(&std::fs::canonicalize(&root).unwrap(), tree.scan_opts()).expect("load failed");
     println!("load (total)    {:>7} ms", t.elapsed().as_millis());
 
     assert_eq!(loaded.len(), tree.len(), "node count changed across the round trip");

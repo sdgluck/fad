@@ -608,7 +608,7 @@ fn tools_now(report: &fad::tools::Report, args: &Args) -> i32 {
 /// What changed since the last saved scan of this root. Answers "what did that
 /// install just add?", which no single scan can.
 fn print_since(tree: &Tree, args: &Args) -> i32 {
-    let Some((previous, at)) = fad::cache::load(tree.root_path()) else {
+    let Some((previous, at)) = fad::cache::load(tree.root_path(), tree.scan_opts()) else {
         eprintln!(
             "fad: no saved scan of {} to compare against \u{2014} run fad once first",
             tree.root_path().display()

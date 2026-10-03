@@ -504,9 +504,10 @@ impl App {
     /// live by the time this returns.
     pub fn load_snapshot_async(&mut self) {
         let root = self.tree.root_path().to_path_buf();
+        let opts = self.opts.clone();
         let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send(crate::cache::load(&root));
+            let _ = tx.send(crate::cache::load(&root, &opts));
         });
         self.snapshot_rx = Some(rx);
     }
