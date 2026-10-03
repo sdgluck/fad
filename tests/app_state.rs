@@ -605,3 +605,27 @@ fn t_without_docker_does_not_claim_to_ask_docker() {
         std::env::remove_var("FAD_PODMAN_BIN");
     }
 }
+
+// ------------------------------------------------------- small terminals
+
+/// At 40x10 the confirm popup was clipped from the bottom and lost its keys,
+/// leaving a dialog with no visible way to answer it. The body gives way now.
+#[test]
+fn the_confirm_keys_survive_a_small_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path());
+    let mut app = settled(dir.path());
+    for rel in ["Movies", "dev/fad/target", "Library/Caches", "dev/fad/src"] {
+        app.stage(find(&app.tree, rel));
+    }
+    app.review_batch();
+    app.mode = Mode::Confirm;
+
+    for (w, h) in [(40, 10), (60, 12), (100, 30)] {
+        let out = render(&mut app, w, h);
+        println!("{w}x{h}\n{out}");
+        assert!(out.contains("enter/y"), "{w}x{h} lost enter/y:\n{out}");
+        assert!(out.contains(" D "), "{w}x{h} lost D:\n{out}");
+        assert!(out.contains("esc"), "{w}x{h} lost esc:\n{out}");
+    }
+}

@@ -150,27 +150,29 @@ pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(" enter ", theme.mode_badge),
-        Span::styled(
-            format!(" {}   ", app.disposal.label()),
-            if permanent { theme.staged } else { theme.normal },
-        ),
-        Span::styled(" D ", theme.emphasis),
-        Span::styled(
-            if items.is_empty() {
-                "\u{2014}   "
-            } else if permanent {
-                "back to Trash   "
-            } else {
-                "delete permanently   "
-            },
-            theme.dim,
-        ),
-        Span::styled(" esc ", theme.emphasis),
-        Span::styled("cancel", theme.dim),
-    ]));
+    let footer = vec![
+        vec![
+            Span::styled(" enter/y ", theme.mode_badge),
+            Span::styled(
+                format!(" {}", app.disposal.label()),
+                if permanent { theme.staged } else { theme.normal },
+            ),
+        ],
+        vec![
+            Span::styled(" D ", theme.emphasis),
+            Span::styled(
+                if items.is_empty() {
+                    " \u{2014}"
+                } else if permanent {
+                    " back to Trash"
+                } else {
+                    " delete permanently"
+                },
+                theme.dim,
+            ),
+        ],
+        vec![Span::styled(" esc ", theme.emphasis), Span::styled(" cancel", theme.dim)],
+    ];
 
     let title = if !tools.is_empty() && !items.is_empty() {
         " delete and remove "
@@ -183,7 +185,7 @@ pub fn draw_confirm(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     };
     // Anything unrecoverable in the batch makes the whole frame the warning
     // colour, whichever half it came from.
-    popup(f, theme, area, title, lines, permanent || !tools.is_empty());
+    popup(f, theme, area, title, lines, footer, permanent || !tools.is_empty());
 }
 
 /// Taking the trash out.
@@ -250,14 +252,12 @@ pub fn draw_empty_trash(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         "anything else in your trash is left where it is",
         theme.dim,
     )));
-    lines.push(Line::from(vec![
-        Span::styled(" enter ", theme.mode_badge),
-        Span::styled(" empty the trash   ", theme.normal),
-        Span::styled(" esc ", theme.emphasis),
-        Span::styled("cancel", theme.dim),
-    ]));
+    let footer = vec![
+        vec![Span::styled(" enter ", theme.mode_badge), Span::styled(" empty the trash", theme.normal)],
+        vec![Span::styled(" esc ", theme.emphasis), Span::styled(" cancel", theme.dim)],
+    ];
 
-    popup(f, theme, area, " empty the trash ", lines, true);
+    popup(f, theme, area, " empty the trash ", lines, footer, true);
 }
 
 /// Whether the staged tool bytes actually return to this disk, when they do not
@@ -355,7 +355,6 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 
     lines.push(progress_bar(done, total, 44));
-    lines.push(Line::from(""));
 
     let finished = app.batch_finished();
     let skipped = app.deleting_not_attempted();
@@ -368,32 +367,26 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             theme.warn,
         )));
     }
-    if finished {
+    let footer = if finished {
         let undoable = app
             .job
             .as_ref()
             .is_some_and(|j| j.disposal == Disposal::Trash && j.failures().len() < j.total);
-        lines.push(Line::from(Span::styled(
-            if undoable {
-                "enter to close \u{b7} u puts the trashed files back"
-            } else {
-                "enter to close"
-            },
-            theme.dim,
-        )));
+        let mut v = vec![vec![Span::styled("enter to close", theme.dim)]];
+        if undoable {
+            v.push(vec![Span::styled("\u{b7} u puts the trashed files back", theme.dim)]);
+        }
+        v
     } else if app.deleting_cancelled() {
-        lines.push(Line::from(Span::styled(
-            "stopping after the current item\u{2026}",
-            theme.warn,
-        )));
+        vec![vec![Span::styled("stopping after the current item\u{2026}", theme.warn)]]
     } else {
         // Keys are only taken once the batch is done, so `u` is not offered
         // until then: a hint for a key that does nothing reads as a hang.
-        lines.push(Line::from(Span::styled(
-            "working\u{2026} \u{b7} ctrl-c to stop after the current item",
-            theme.dim,
-        )));
-    }
+        vec![
+            vec![Span::styled("working\u{2026}", theme.dim)],
+            vec![Span::styled("\u{b7} ctrl-c to stop after the current item", theme.dim)],
+        ]
+    };
 
     let title = if app.emptying {
         " emptying the trash "
@@ -404,7 +397,7 @@ pub fn draw_progress(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     } else {
         " deleting "
     };
-    popup(f, theme, area, title, lines, app.tool_job.is_some());
+    popup(f, theme, area, title, lines, footer, app.tool_job.is_some());
 }
 
 fn progress_bar(done: usize, total: usize, width: usize) -> Line<'static> {
@@ -415,23 +408,80 @@ fn progress_bar(done: usize, total: usize, width: usize) -> Line<'static> {
     ])
 }
 
-fn popup(f: &mut Frame, theme: &Theme, area: Rect, title: &str, lines: Vec<Line>, danger: bool) {
+/// Draw a modal: `body` on top, `footer` pinned to the bottom.
+///
+/// The footer is the keys, and it is the one part of a modal that must never
+/// be cut. It used to be the last line of one paragraph, so on a short
+/// terminal the popup was clipped from the bottom and the confirm screen lost
+/// "enter / D / esc" while keeping every path in the batch — a dialog with no
+/// visible way to answer it. Now the body gives way instead, ending in an
+/// ellipsis, and the footer's chunks wrap onto a second line rather than run
+/// off a narrow one.
+fn popup(
+    f: &mut Frame,
+    theme: &Theme,
+    area: Rect,
+    title: &str,
+    mut body: Vec<Line>,
+    footer: Vec<Vec<Span>>,
+    danger: bool,
+) {
     let w = 64u16.min(area.width.saturating_sub(4));
-    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let footer = flow(footer, w.saturating_sub(2) as usize);
+    // One blank line between the two halves when there is room for it.
+    let want = body.len() + 1 + footer.len();
+    let h = (want as u16 + 2).min(area.height.saturating_sub(2));
+    let inner = h.saturating_sub(2) as usize;
+    let room = inner.saturating_sub(footer.len());
+    if body.len() + 1 > room {
+        body.truncate(room.saturating_sub(1));
+        if room > 0 {
+            body.push(Line::from(Span::styled("\u{2026}", theme.dim)));
+        }
+    }
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
         width: w,
         height: h,
     };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if danger { theme.staged } else { theme.border_focus })
+        .title(title.to_string().bold());
+    let inside = block.inner(rect);
     f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(if danger { theme.staged } else { theme.border_focus })
-                .title(title.to_string().bold()),
-        ),
-        rect,
+    f.render_widget(block, rect);
+    let keys = (footer.len() as u16).min(inside.height);
+    let (top, bottom) = (
+        Rect { height: inside.height - keys, ..inside },
+        Rect { y: inside.y + inside.height - keys, height: keys, ..inside },
     );
+    f.render_widget(Paragraph::new(body), top);
+    f.render_widget(Paragraph::new(footer), bottom);
+}
+
+/// Lay chunks of spans out left to right, two spaces apart, starting a new line
+/// whenever the next chunk would not fit. A chunk is never split.
+fn flow(chunks: Vec<Vec<Span>>, width: usize) -> Vec<Line> {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cur: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    for chunk in chunks {
+        let len: usize = chunk.iter().map(|s| s.content.chars().count()).sum();
+        if used > 0 && used + 2 + len > width {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            used = 0;
+        }
+        if used > 0 {
+            cur.push(Span::raw("  "));
+            used += 2;
+        }
+        cur.extend(chunk);
+        used += len;
+    }
+    if !cur.is_empty() {
+        lines.push(Line::from(cur));
+    }
+    lines
 }
