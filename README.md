@@ -465,6 +465,12 @@ shows both.
 A file with several hard links is counted once, against the lexicographically
 first of its paths.
 
+Every unit is a power of 1024, as in `du -h`: `1G` is 2³⁰ bytes, on screen and
+on the command line alike. `--min-size` and `--max` take `K`, `M`, `G`, `T` and
+`P` in any case, with or without `B` or `iB` (`100M`, `100mb` and `100MiB` are
+the same size), and refuse negatives, `nan`, `inf` and unknown units rather
+than guessing.
+
 ## What is not scanned
 
 - **Other filesystems.** Mount points are shown but not entered. `--cross-device`

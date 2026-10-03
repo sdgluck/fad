@@ -117,19 +117,40 @@ enum Shell {
     Fish,
 }
 
+/// A size on the command line: a number, optionally fractional, and an
+/// optional unit — `500`, `1.5G`, `100mb`, `2GiB`.
+///
+/// Every unit is a power of 1024, whichever way it is spelled. That is what
+/// every size fad prints means (`human` is `du -h`'s base-1024 `K`/`M`/`G`), so
+/// `--min-size 1G` hides exactly what shows as under `1.0G`; reading `GB` as
+/// 10^9 would make the same letters mean two sizes 7% apart in one tool.
+///
+/// Refused outright rather than read as something: an empty string, a
+/// negative, `nan` and `inf` (all of which `f64` parses happily, and which
+/// cast to 0 or `u64::MAX` — `--max -5G` was "no limit at all"), anything too
+/// big for a byte count, and an unknown unit.
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
-    let (num, mult) = match s.chars().last() {
-        Some('K') | Some('k') => (&s[..s.len() - 1], 1024u64),
-        Some('M') | Some('m') => (&s[..s.len() - 1], 1024 * 1024),
-        Some('G') | Some('g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        Some('T') | Some('t') => (&s[..s.len() - 1], 1024u64.pow(4)),
-        _ => (s, 1),
+    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+    let (num, unit) = (&s[..split], s[split..].trim());
+    if num.is_empty() {
+        return Err(format!("not a size: {s:?} (expected a number and an optional unit, e.g. 500M)"));
+    }
+    let n: f64 = num.parse().map_err(|_| format!("not a size: {s:?}"))?;
+    let power = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 1,
+        "m" | "mb" | "mib" => 2,
+        "g" | "gb" | "gib" => 3,
+        "t" | "tb" | "tib" => 4,
+        "p" | "pb" | "pib" => 5,
+        _ => return Err(format!("not a size: {s:?} (units are K, M, G, T, P \u{2014} powers of 1024)")),
     };
-    num.trim()
-        .parse::<f64>()
-        .map(|n| (n * mult as f64) as u64)
-        .map_err(|_| format!("not a size: {s}"))
+    let bytes = n * 1024f64.powi(power);
+    if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+        return Err(format!("too large: {s:?}"));
+    }
+    Ok(bytes as u64)
 }
 
 fn main() {
@@ -829,6 +850,34 @@ fn print_json_value(v: &serde_json::Value) {
         Err(e) => {
             eprintln!("fad: could not write the JSON report: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn sizes_take_any_spelling_of_a_binary_unit() {
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size("512"), Ok(512));
+        assert_eq!(parse_size("512b"), Ok(512));
+        for k in ["1k", "1K", "1kb", "1KB", "1KiB", "1kib", " 1 K "] {
+            assert_eq!(parse_size(k), Ok(1024), "{k}");
+        }
+        for g in ["2G", "2g", "2GB", "2GiB", "2gib"] {
+            assert_eq!(parse_size(g), Ok(2 << 30), "{g}");
+        }
+        assert_eq!(parse_size("1.5M"), Ok(3 << 19));
+        assert_eq!(parse_size("1T"), Ok(1 << 40));
+        assert_eq!(parse_size("1PiB"), Ok(1 << 50));
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_read_as_something() {
+        for bad in ["", "  ", "-5G", "-0", "nan", "NaN", "inf", "-inf", "infinity", "G", "1.2.3", "10X", "1e3", "99999999999P"] {
+            assert!(parse_size(bad).is_err(), "accepted {bad:?} as {:?}", parse_size(bad));
         }
     }
 }
