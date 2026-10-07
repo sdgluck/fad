@@ -36,7 +36,19 @@ Runs on macOS and Linux.
 
 ## Install
 
-Requires Rust 1.88 or newer.
+With Homebrew:
+
+```sh
+brew install sdgluck/tap/fad
+```
+
+Or with the install script, which puts a prebuilt binary in `~/.cargo/bin`:
+
+```sh
+curl -LsSf https://github.com/sdgluck/fad/releases/latest/download/fad-installer.sh | sh
+```
+
+Or build it, with Rust 1.88 or newer:
 
 ```sh
 cargo install --git https://github.com/sdgluck/fad
